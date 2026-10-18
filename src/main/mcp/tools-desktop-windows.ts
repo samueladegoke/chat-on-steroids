@@ -149,7 +149,7 @@ function nativeFailure(error: unknown): ToolResult | null {
       recovery = 'Use get_window_state({window,include_text:false}) to inspect the target pixels. An unavailable accessibility provider does not imply screenshots or other tools are disabled.';
       break;
     case 'UIA_PROCESS_CRASH':
-      recovery = "Call get_window_state on the same current window. CoS will use a fresh helper and temporarily disable accessibility for that exact crashed provider identity while preserving safe screenshot/window observation. The semantic input's completion is unknown; do not retry it automatically.";
+      recovery = "Call get_window_state({ window, include_text:false }) to inspect the current window without UI Automation using a fresh helper. If its identity may be stale, use list_windows or get_window to choose a current window first. An unseeded first crash cannot establish a per-window breaker; do not repeat include_text:true blindly. The semantic input's completion is unknown; do not retry it automatically.";
       break;
     default:
       return null;

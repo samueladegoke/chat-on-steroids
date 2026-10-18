@@ -205,6 +205,23 @@ describe('Windows Desktop public registrar', () => {
     expect(native.apis[0].perform_secondary_action).toHaveBeenCalledOnce();
     expect(native.apis[0].get_window_state).not.toHaveBeenCalled();
   });
+  it('directs an unseeded first UIA observation crash to an explicit UI-free recovery', async () => {
+    const api = surface();
+    await api.call('list_windows');
+    native.apis[0].get_window_state.mockRejectedValueOnce(new ComputerError(
+      'UIA_PROCESS_CRASH: Windows UI Automation helper terminated after an access violation at uia.find.traversal.'
+    ));
+
+    const failure = await api.call('get_window_state', { window, include_text: true });
+    expect(failure.isError).toBe(true);
+    expect(failure.structuredContent.error).toMatchObject({ code: 'UIA_PROCESS_CRASH', completed_count: null });
+    expect(failure.structuredContent.error.recovery).toContain('get_window_state({ window, include_text:false })');
+    expect(failure.content[0].text).toContain('get_window_state({ window, include_text:false })');
+    expect(failure.content[0].text).toContain('list_windows');
+    expect(failure.structuredContent.error.recovery).not.toContain('temporarily disable accessibility for that exact crashed provider identity');
+    expect(native.apis[0].get_window_state).toHaveBeenCalledExactlyOnceWith({ window, include_text: true });
+    expect(native.apis[0].activate_window).not.toHaveBeenCalled();
+  });
   it.each([
     ['CAPTURE_FAILED', 'include_screenshot:false'],
     ['WINDOW_NOT_FOUND', 'list_windows'],
