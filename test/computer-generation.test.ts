@@ -64,7 +64,8 @@ const fake = vi.hoisted(() => {
         elements: [{ runtimeKey: 'button', name: 'Example', role: 'Button', enabled: true,
           offscreen: false, bounds: { x: 10, y: 10, width: 20, height: 20 } }],
         cursor: { x: 20, y: 20 },
-        routes: (request.actions ?? []).map(() => 'uia')
+        routes: (request.actions ?? []).map(() => 'uia'),
+        ...(request.__cosRequestId ? { __cosRequestId: request.__cosRequestId } : {})
       };
       if (overrides.focusFailure && request.actions?.some((action: any) => action.type === 'focus')) {
         Object.assign(reply, { ok: false, error_code: 'FOCUS_FAILED', message: 'requested target is not foreground', completed_count: 0, failed_index: 0, routes: [] });
@@ -285,9 +286,13 @@ describe.each(['stdio', 'addon'] as const)('Desktop reply provenance (%s)', (tra
     await expect(computer.act([{ type: 'paste', text: 'must not replace clipboard' }], { window: 77, app: 'fixture.exe' }))
       .rejects.toMatchObject({ completedCount: 0, failedIndex: 0, message: expect.stringMatching(/FOCUS_FAILED/) });
     expect(fake.clipboard.writeText).not.toHaveBeenCalled();
-    expect(fake.requests.filter(request => request.op === 'act')).toEqual([
-      { op: 'act', targetWindow: 77, targetApp: 'fixture.exe', actions: [{ type: 'focus', window: 77 }] }
-    ]);
+    const nativeRequests = fake.requests.filter(request => request.op === 'act');
+    expect(nativeRequests).toHaveLength(1);
+    const { __cosRequestId, ...nativeRequest } = nativeRequests[0]!;
+    expect(__cosRequestId).toMatch(/^[A-Za-z0-9_-]{1,80}$/);
+    expect(nativeRequest).toEqual({
+      op: 'act', targetWindow: 77, targetApp: 'fixture.exe', actions: [{ type: 'focus', window: 77 }]
+    });
   });
 
   it('does not mutate clipboard after a pending ref owner retires during a local wait', async () => {

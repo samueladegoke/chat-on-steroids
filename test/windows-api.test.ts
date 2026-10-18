@@ -45,7 +45,10 @@ describe('Windows Window2 interface', () => {
     Object.assign(result, { uiTruncated: true });
     result.elements[0] = { ...result.elements[0]!, offscreen: true, enabled: false };
     const state = await api.get_window_state({ window, include_text: true });
-    expect(state).toMatchObject({ focused: false, accessibility: { truncated: true } });
+    expect(state).toMatchObject({
+      focused: false,
+      accessibility: { truncated: true, document_text: 'Document', selected_text: 'Doc' }
+    });
     expect(state.accessibility?.tree).toContain('[offscreen]');
     expect(state.accessibility?.tree).toContain('[disabled]');
     // Keep frame ids/dimensions before the possibly long accessibility body.

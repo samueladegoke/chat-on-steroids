@@ -45,12 +45,13 @@ const fake = vi.hoisted(() => {
     child.stdout = new Emitter();
     child.stderr = new Emitter();
     child.stdin = {
-      write(_line: string, _encoding: string, callback: (error?: Error | null) => void) {
+      write(line: string, _encoding: string, callback: (error?: Error | null) => void) {
         callback(null);
+        const request = JSON.parse(line) as { __cosRequestId?: string };
         queueMicrotask(() =>
           child.stdout.emit(
             'data',
-            Buffer.from(`${JSON.stringify(response)}\n`)
+            Buffer.from(`${JSON.stringify({ ...response, __cosRequestId: request.__cosRequestId })}\n`)
           )
         );
         return true;

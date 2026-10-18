@@ -188,11 +188,29 @@ describe('Windows Desktop public registrar', () => {
     expect(native.apis[0].click).toHaveBeenCalledOnce();
     expect(native.apis[0].get_window_state).not.toHaveBeenCalled();
   });
+  it('keeps a semantic-action UIA process crash fail-closed and explicitly non-replayable', async () => {
+    const api = surface();
+    await api.call('list_windows');
+    const error = Object.assign(new ComputerError('PARTIAL_BATCH: completed_count=0 failed_index=0 routes=none. UIA_PROCESS_CRASH: provider access violation'), {
+      completedCount: 0, failedIndex: 0, completedRoutes: []
+    });
+    native.apis[0].perform_secondary_action.mockRejectedValueOnce(error);
+    const failure = await api.call('perform_secondary_action', { window, element_index: 0, action: 'Invoke' });
+    expect(failure.isError).toBe(true);
+    expect(failure.structuredContent.error).toMatchObject({
+      code: 'UIA_PROCESS_CRASH', completed_count: 0, failed_index: 0, completed_routes: []
+    });
+    expect(failure.content[0].text).toContain('fresh helper');
+    expect(failure.content[0].text).toContain('Do not repeat');
+    expect(native.apis[0].perform_secondary_action).toHaveBeenCalledOnce();
+    expect(native.apis[0].get_window_state).not.toHaveBeenCalled();
+  });
   it.each([
     ['CAPTURE_FAILED', 'include_screenshot:false'],
     ['WINDOW_NOT_FOUND', 'list_windows'],
     ['FOCUS_FAILED', 'list_windows'],
-    ['UIA_FAILED', 'include_text:false']
+    ['UIA_FAILED', 'include_text:false'],
+    ['UIA_PROCESS_CRASH', 'fresh helper']
   ])('makes %s recoverable without treating it as disabled tools', async (code, recovery) => {
     const api = surface();
     await api.call('list_windows');

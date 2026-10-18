@@ -99,7 +99,7 @@ Write-Output 'APP_CATALOG_VERIFIED'
   it('resolves and launches an owned executable by path or PATH basename without arguments', async () => {
     expect(await run(String.raw`
 $executable=Join-Path $PSScriptRoot 'cos-owned-app.exe'
-Add-Type -TypeDefinition 'public static class OwnedApp { public static void Main(string[] args) { System.IO.File.WriteAllText(System.IO.Path.Combine(System.AppDomain.CurrentDomain.BaseDirectory,"launched.txt"), args.Length.ToString()); } }' -OutputAssembly $executable -OutputType ConsoleApplication
+Add-Type -TypeDefinition 'public static class OwnedApp { public static void Main(string[] args) { System.Console.WriteLine("CHILD_STDOUT_MUST_NOT_LEAK"); System.Console.Error.WriteLine("CHILD_STDERR_MUST_NOT_LEAK"); System.IO.File.WriteAllText(System.IO.Path.Combine(System.AppDomain.CurrentDomain.BaseDirectory,"launched.txt"), args.Length.ToString()); } }' -OutputAssembly $executable -OutputType ConsoleApplication
 if ((Resolve-AppExecutable $executable) -cne $executable) { throw 'Explicit path did not resolve' }
 $env:PATH=$PSScriptRoot+';'+$env:PATH
 if ((Resolve-AppExecutable 'cos-owned-app.exe') -cne $executable) { throw 'PATH executable did not resolve' }

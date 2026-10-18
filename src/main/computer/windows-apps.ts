@@ -108,6 +108,11 @@ function Start-AppExecutable([string]$path) {
   $start.FileName = $path
   $start.Arguments = ''
   $start.UseShellExecute = $false
+  # Explicit executables must not inherit this long-lived helper's stdin/stdout/stderr pipes.
+  # A console child that inherits them can consume future JSON requests or inject fake replies.
+  # CREATE_NO_WINDOW detaches console stdio while still allowing ordinary GUI executables to
+  # create their own top-level windows; the exact executable path and zero arguments are retained.
+  $start.CreateNoWindow = $true
   $start.WorkingDirectory = [IO.Path]::GetDirectoryName($path)
   $process = [System.Diagnostics.Process]::Start($start)
   if ($null -eq $process) { throw 'APP_LAUNCH_FAILED: Windows did not start the executable' }

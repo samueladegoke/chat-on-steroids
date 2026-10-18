@@ -592,7 +592,26 @@ function Ui-RuntimeKey($element) {
   try { return (@($element.GetRuntimeId()) -join '.') } catch { return '' }
 }
 
+$script:LastUiaStage = ''
+$script:CurrentUiaRequestId = ''
+function Write-UiaStage([string]$stage) {
+  if ([string]::IsNullOrWhiteSpace($script:CurrentUiaRequestId)) { return }
+  if ($script:LastUiaStage -eq $stage) { return }
+  $script:LastUiaStage = $stage
+  try { [Console]::Error.WriteLine("UIA_STAGE:$($script:CurrentUiaRequestId):$stage") } catch { }
+}
+
+function Test-SelectedRangeUnsafe($element) {
+  # Only an explicitly identified non-WPF provider may perform selected-range
+  # GetText. Absent or throwing metadata cannot certify a safe provider.
+  try {
+    $frameworkId = [string]$element.Current.FrameworkId
+    return [string]::IsNullOrWhiteSpace($frameworkId) -or $frameworkId -eq 'WPF'
+  } catch { return $true }
+}
+
 function Get-UiRoot([int64]$id) {
+  Write-UiaStage 'uia.root'
   $root = [System.Windows.Automation.AutomationElement]::FromHandle([IntPtr]$id)
   if ($null -eq $root) { throw "UIA_FAILED: no accessible window with id $id" }
   if ($root.Current.ClassName -ne 'Chrome_WidgetWin_1') { return $root }
@@ -661,11 +680,13 @@ function Resolve-UiElement([int64]$id, [int]$snapshotId, [string]$runtimeKey) {
     throw "UI_ELEMENT_GONE: the referenced UI element is not part of snapshot $snapshotId. Use a ref printed by that snapshot, or observe the window again."
   }
   try {
+    Write-UiaStage 'uia.resolve.root'
     $root = Get-UiRoot $id
   } catch {
     throw "UIA_FAILED: cannot inspect window $id. $($_.Exception.Message)"
   }
   try {
+    Write-UiaStage 'uia.resolve.liveness'
     if ((Ui-RuntimeKey $root) -ne [string]$snapshot.rootRuntimeKey) {
       throw "STALE_UI_SNAPSHOT: window $id no longer has the UIA root from snapshot $snapshotId. Call observe on the window again and use a ref from that reply."
     }
@@ -677,6 +698,7 @@ function Resolve-UiElement([int64]$id, [int]$snapshotId, [string]$runtimeKey) {
     }
     # A live legacy provider is not proof that its old tab is still displayed.
     # Revalidate membership in the same current UI root before semantic input.
+    Write-UiaStage 'uia.resolve.membership'
     $parent = $element
     $walker = [System.Windows.Automation.TreeWalker]::ControlViewWalker
     for ($depth = 0; $depth -le 64 -and $null -ne $parent; $depth++) {
@@ -716,6 +738,7 @@ function Get-UiActions($element, $current) {
 }
 
 function Invoke-UiAction($element, [string]$action) {
+  Write-UiaStage ("uia.action." + $action)
   # Explicit semantic actions never degrade to a click at guessed coordinates.
   $patternId = switch ($action) {
     'invoke' { [System.Windows.Automation.InvokePattern]::Pattern }
@@ -773,9 +796,11 @@ function Act-UiElement($request) {
   }
   $id = [int64]$request.id
   Assert-InputOwner $id $request.ownerWindow $request.targetApp $request.ownerApp
+  Write-UiaStage 'uia.action.resolve'
   $element = Resolve-UiElement $id ([int]$request.snapshotId) ([string]$request.runtimeKey)
   if (-not $element.Current.IsEnabled) { throw "UI_ELEMENT_DISABLED: the referenced element is disabled" }
   if ($action -eq 'set_value') {
+    Write-UiaStage 'uia.action.set_value'
     $pattern = $null
     if (-not $element.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$pattern)) {
       throw "UI_VALUE_UNSUPPORTED: the referenced element does not expose ValuePattern"
@@ -792,14 +817,17 @@ function Act-UiElement($request) {
     $semanticClick = $button -eq 'left' -and $count -eq 1
     $pattern = $null
     if ($semanticClick -and $element.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$pattern)) {
+      Write-UiaStage 'uia.action.invoke'
       Assert-InputOwner $id $request.ownerWindow $request.targetApp $request.ownerApp
       ([System.Windows.Automation.InvokePattern]$pattern).Invoke()
       $route = 'uia'
     } elseif ($semanticClick -and $element.TryGetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern, [ref]$pattern)) {
+      Write-UiaStage 'uia.action.toggle'
       Assert-InputOwner $id $request.ownerWindow $request.targetApp $request.ownerApp
       ([System.Windows.Automation.TogglePattern]$pattern).Toggle()
       $route = 'uia'
     } elseif ($semanticClick -and $element.TryGetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern, [ref]$pattern)) {
+      Write-UiaStage 'uia.action.select'
       Assert-InputOwner $id $request.ownerWindow $request.targetApp $request.ownerApp
       ([System.Windows.Automation.SelectionItemPattern]$pattern).Select()
       $route = 'uia'
@@ -807,6 +835,7 @@ function Act-UiElement($request) {
       # A semantic control without InvokePattern has to fall back to physical input. Make
       # that last resort explicit and safe: the referenced window, not an overlay at the
       # same desktop coordinates, must be foreground before the pointer goes down.
+      Write-UiaStage 'uia.action.bounds'
       Assert-Focused $id
       $r = $element.Current.BoundingRectangle
       if ($r.Width -le 0 -or $r.Height -le 0) { throw "UI_ELEMENT_OFFSCREEN: the referenced element has no clickable bounds" }
@@ -825,6 +854,7 @@ function Act-UiElement($request) {
 function Find-UiElements($request) {
   $id = if ($request.id) { [int64]$request.id } else { [Clf]::ForegroundId() }
   try {
+    Write-UiaStage 'uia.find.root'
     $root = Get-UiRoot $id
   } catch {
     throw "UIA_FAILED: cannot inspect window $id. $($_.Exception.Message)"
@@ -842,9 +872,11 @@ function Find-UiElements($request) {
   $focusedElement = $null
   $textPattern = $null
   $textPriority = 0
+  $skipSelectedRange = $true
   $browserDocument = $root.Current.ClassName -eq 'BrowserRootView'
   $depthLimited = $false
   try {
+    Write-UiaStage 'uia.find.traversal'
     # ControlView avoids the enormous raw Chromium implementation tree. TreeWalker lets the
     # limit bound traversal work as well as output; FindAll(Descendants) materialised the full
     # tree before maxResults could stop it. CacheRequest fetches the projection properties in
@@ -920,7 +952,9 @@ function Find-UiElements($request) {
               try {
                 $candidate = $null
                 if ($element.TryGetCurrentPattern([System.Windows.Automation.TextPattern]::Pattern, [ref]$candidate)) {
+                  $candidateSelectionUnsafe = Test-SelectedRangeUnsafe $element
                   $textPattern = [System.Windows.Automation.TextPattern]$candidate
+                  $skipSelectedRange = $candidateSelectionUnsafe
                   $textPriority = $priority
                 }
               } catch { }
@@ -950,20 +984,27 @@ function Find-UiElements($request) {
   }
   if ($null -ne $textPattern) {
     try {
+      Write-UiaStage 'uia.find.text'
       $budget = 8000
-      $selection = New-Object System.Text.StringBuilder
-      $ranges = @($textPattern.GetSelection())
-      foreach ($range in ($ranges | Select-Object -First 4)) {
-        $remaining = [Math]::Min(2000 - $selection.Length, $budget)
-        if ($remaining -le 0) { break }
-        $part = $range.GetText($remaining)
-        $null = $selection.Append($part)
-        $budget -= $part.Length
+      # WPF TextPattern selected-range GetText can terminate the entire PowerShell
+      # host with an uncatchable provider AV (including WPF editor/document peers).
+      # Preserve document text; keep selected text available for non-WPF providers.
+      if (-not $skipSelectedRange) {
+        $selection = New-Object System.Text.StringBuilder
+        $ranges = @($textPattern.GetSelection())
+        foreach ($range in ($ranges | Select-Object -First 4)) {
+          $remaining = [Math]::Min(2000 - $selection.Length, $budget)
+          if ($remaining -le 0) { break }
+          $part = $range.GetText($remaining)
+          $null = $selection.Append($part)
+          $budget -= $part.Length
+        }
+        $selectedText = $selection.ToString()
       }
-      $selectedText = $selection.ToString()
       $documentText = $textPattern.DocumentRange.GetText($budget)
     } catch { }
   }
+  Write-UiaStage 'uia.find.snapshot'
   $snapshotId = Remember-UiSnapshot $id $root $handles
   return @{
     window = $id
@@ -1096,12 +1137,19 @@ ${WINDOWS_APPS_SCRIPT}
 
 function Handle-Request($request) {
   [Clf]::EnsureDpiAware()
+  # UIA stage evidence belongs to one request only. stdout replies and stderr diagnostics are
+  # independent pipes, so every stage carries the nonce minted by the parent transport for this
+  # exact request. Unknown/malformed request ids deliberately disable UIA crash classification.
+  $candidateRequestId = [string]$request.__cosRequestId
+  $script:CurrentUiaRequestId = if ($candidateRequestId -match '^[A-Za-z0-9_-]{1,80}$') { $candidateRequestId } else { '' }
+  $script:LastUiaStage = ''
   $result = @{ ok = $true }
   switch ($request.op) {
     'warm' {
       # Touch both Win32 and UIA without reading pixels or changing focus. Connector startup
       # can pay Add-Type and provider initialization before the first model-facing action.
       $null = [Clf]::ForegroundId()
+      Write-UiaStage 'uia.warm.root'
       $null = [System.Windows.Automation.AutomationElement]::RootElement.Current.ProcessId
       $result.ready = $true
     }
@@ -1301,8 +1349,11 @@ function Handle-Request($request) {
 
 while (($line = [Console]::In.ReadLine()) -ne $null) {
   if ([string]::IsNullOrWhiteSpace($line)) { continue }
+  $requestId = ''
   try {
     $request = $line | ConvertFrom-Json
+    $candidateRequestId = [string]$request.__cosRequestId
+    if ($candidateRequestId -match '^[A-Za-z0-9_-]{1,80}$') { $requestId = $candidateRequestId }
     $reply = Handle-Request $request
   } catch {
     $message = $_.Exception.Message
@@ -1313,6 +1364,7 @@ while (($line = [Console]::In.ReadLine()) -ne $null) {
     }
     $reply = @{ ok = $false; error_code = $code; message = $message }
   }
+  if (![string]::IsNullOrWhiteSpace($requestId)) { $reply.__cosRequestId = $requestId }
   [Console]::Out.WriteLine(($reply | ConvertTo-Json -Depth 8 -Compress))
   [Console]::Out.Flush()
 }

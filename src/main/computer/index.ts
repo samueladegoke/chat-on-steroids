@@ -14,6 +14,7 @@
  */
 
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { existsSync, promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -32,6 +33,7 @@ export const MAX_SCREENSHOT_WIDTH = 2560;
 const HELPER_TIMEOUT_MS = 30_000;
 const HELPER_STARTUP_GRACE_MS = 10_000;
 const MAX_FRAMES = 16;
+const WINDOWS_UIA_CRASH_BREAKER_MS = 60_000;
 /** Per-image ceiling; the final Desktop tool layer separately measures text + image together. */
 export const MAX_SCREENSHOT_PNG_BYTES = Math.floor((((8 * 1024 * 1024) - (64 * 1024)) * 3) / 4);
 
@@ -72,6 +74,8 @@ export class ComputerError extends Error {
     this.completedRoutes = details.completedRoutes ? [...details.completedRoutes] : null;
   }
 }
+
+class UiaProcessCrashError extends ComputerError {}
 
 export interface Rect {
   x: number;
@@ -208,6 +212,8 @@ interface PendingHelperRequest {
   resolve: (value: Record<string, any>) => void;
   reject: (reason: Error) => void;
   timer: NodeJS.Timeout;
+  /** Windows helper only: transport-owned nonce correlating stderr UIA stages to this request. */
+  requestId?: string;
 }
 
 interface HelperRuntime {
@@ -241,6 +247,8 @@ const helperRetirements = new Set<Promise<void>>();
 // Transport-owned metadata, never accepted from the native protocol. Capture it before
 // resolving a reply: image I/O may yield long enough for another helper to start.
 const helperReplyGeneration = new WeakMap<object, number>();
+const windowsUiaCrashBreakers = new Map<number, { identity: string; until: number; message: string }>();
+const windowsKnownWindowIdentities = new Map<number, string>();
 
 function stampHelperReply(reply: Record<string, any>, generation: number): Record<string, any> {
   helperReplyGeneration.set(reply, generation);
@@ -341,8 +349,97 @@ function readableHelperFailure(stderr: string): string {
     .replace(/^#< CLIXML[\s\S]*/m, '')
     .trim()
     .split(/\r?\n/)
-    .find((line) => line.trim().length > 0);
+    .find((line) => line.trim().length > 0 && !line.startsWith('UIA_STAGE:'));
   return clean?.slice(0, 300) ?? 'the helper process exited unexpectedly';
+}
+
+function windowsUiaAccessViolationStage(stderr: string, requestId: string): string | null {
+  if (!/(?:System\.)?AccessViolationException|Attempted to read or write protected memory|protected memory/i.test(stderr)) {
+    return null;
+  }
+  const stages = [...stderr.matchAll(/UIA_STAGE:([A-Za-z0-9_-]+):([A-Za-z0-9_.-]+)/g)];
+  // stdout replies and stderr diagnostics are independent pipes, so clearing stderr at a request
+  // boundary is not enough provenance: a late stage line from request N can arrive during N+1.
+  // Only a stage carrying the transport-owned nonce for the pending request may classify its AV.
+  return stages.filter((match) => match[1] === requestId).at(-1)?.[2] ?? null;
+}
+
+function windowsHelperProcessFailure(stderr: string, requestId: string): ComputerError {
+  const stage = windowsUiaAccessViolationStage(stderr, requestId);
+  if (stage) {
+    return new UiaProcessCrashError(
+      `UIA_PROCESS_CRASH: Windows UI Automation helper terminated after an access violation at ${stage}.`
+    );
+  }
+  return new ComputerError(`Desktop helper failed: ${readableHelperFailure(stderr)}`);
+}
+
+function windowsUiaCrashUnavailable(error: unknown): { code: string; message: string } | null {
+  // Transport-owned provenance: protocol-visible error_code/message text can never authorize
+  // crash recovery. Only the private error subclass minted after helper exit/retirement does.
+  if (!(error instanceof UiaProcessCrashError)) return null;
+  const message = error.message;
+  const stage = /access violation at ([A-Za-z0-9_.-]+)/i.exec(message)?.[1];
+  return {
+    code: 'UIA_PROCESS_CRASH',
+    message: (
+      `Windows UI Automation crashed${stage ? ` during ${stage}` : ''}. ` +
+      'The window remains available, but accessibility text and semantic controls are temporarily disabled for this exact window.'
+    ).slice(0, 500)
+  };
+}
+
+function windowsWindowIdentity(window: WindowInfo): string {
+  return [
+    window.id,
+    window.processId ?? '',
+    window.app ?? '',
+    window.processPath ?? '',
+    window.appUserModelId ?? '',
+    window.process ?? ''
+  ].join('\u001f');
+}
+
+function rememberWindowsUiaCrashIdentity(
+  windowId: number,
+  identity: string,
+  unavailable: { code: string; message: string }
+): void {
+  windowsUiaCrashBreakers.delete(windowId);
+  windowsUiaCrashBreakers.set(windowId, {
+    identity,
+    until: Date.now() + WINDOWS_UIA_CRASH_BREAKER_MS,
+    message: unavailable.message
+  });
+  while (windowsUiaCrashBreakers.size > 64) {
+    const oldest = windowsUiaCrashBreakers.keys().next().value as number | undefined;
+    if (oldest === undefined) break;
+    windowsUiaCrashBreakers.delete(oldest);
+  }
+}
+
+function rememberWindowsUiaCrash(window: WindowInfo, unavailable: { code: string; message: string }): void {
+  rememberWindowsUiaCrashIdentity(window.id, windowsWindowIdentity(window), unavailable);
+}
+
+function rememberWindowsWindowIdentity(window: WindowInfo): void {
+  windowsKnownWindowIdentities.delete(window.id);
+  windowsKnownWindowIdentities.set(window.id, windowsWindowIdentity(window));
+  while (windowsKnownWindowIdentities.size > 256) {
+    const oldest = windowsKnownWindowIdentities.keys().next().value as number | undefined;
+    if (oldest === undefined) break;
+    windowsKnownWindowIdentities.delete(oldest);
+  }
+}
+
+function activeWindowsUiaCrash(windowId: number): { identity: string; until: number; message: string } | null {
+  const breaker = windowsUiaCrashBreakers.get(windowId);
+  if (!breaker) return null;
+  if (breaker.until <= Date.now()) {
+    windowsUiaCrashBreakers.delete(windowId);
+    return null;
+  }
+  return breaker;
 }
 
 /**
@@ -432,8 +529,7 @@ async function startHelper(): Promise<HelperRuntime> {
             if (
               parsed === null ||
               typeof parsed !== 'object' ||
-              Array.isArray(parsed) ||
-              (((parsed as Record<string, unknown>)['ok'] !== true) && (parsed as Record<string, unknown>)['ok'] !== false)
+              Array.isArray(parsed)
             ) {
               rejectAfterHelperRetirement(
                 runtime,
@@ -443,6 +539,23 @@ async function startHelper(): Promise<HelperRuntime> {
               continue;
             }
             const reply = parsed as Record<string, any>;
+            if (reply['__cosRequestId'] !== pending.requestId) {
+              rejectAfterHelperRetirement(
+                runtime,
+                pending,
+                new ComputerError('The desktop helper returned a response for a different request.')
+              );
+              continue;
+            }
+            delete reply['__cosRequestId'];
+            if (reply['ok'] !== true && reply['ok'] !== false) {
+              rejectAfterHelperRetirement(
+                runtime,
+                pending,
+                new ComputerError('The desktop helper returned a malformed protocol response.')
+              );
+              continue;
+            }
             runtime.ready = true;
             clearTimeout(pending.timer);
             runtime.pending = null;
@@ -484,7 +597,9 @@ async function startHelper(): Promise<HelperRuntime> {
             rejectAfterHelperRetirement(
               runtime,
               pending,
-              new ComputerError(`Desktop helper process error: ${error.message}`)
+              windowsUiaAccessViolationStage(runtime.stderrTail, pending.requestId ?? '')
+                ? windowsHelperProcessFailure(runtime.stderrTail, pending.requestId ?? '')
+                : new ComputerError(`Desktop helper process error: ${error.message}`)
             );
           } else {
             void retireHelper(runtime);
@@ -497,7 +612,7 @@ async function startHelper(): Promise<HelperRuntime> {
           if (pending) {
             clearTimeout(pending.timer);
             runtime.pending = null;
-            pending.reject(new ComputerError(`Desktop helper failed: ${readableHelperFailure(runtime.stderrTail)}`));
+            pending.reject(windowsHelperProcessFailure(runtime.stderrTail, pending.requestId ?? ''));
           }
         });
       });
@@ -755,6 +870,8 @@ export async function stopComputerHelper(): Promise<void> {
   macOSAddonStarting = null;
   uiRefs.clear();
   frames.clear();
+  windowsUiaCrashBreakers.clear();
+  windowsKnownWindowIdentities.clear();
   lastFrame = null;
   if (addonRuntime) {
     const pending = addonRuntime.pending;
@@ -793,13 +910,22 @@ async function sendHelperRequest(request: Record<string, unknown>, expected?: Ex
 
   return new Promise<Record<string, any>>((resolve, reject) => {
     let pending: PendingHelperRequest;
+    // Windows UIA crash provenance crosses independent stdout/stderr pipes, and a launched child
+    // can even inherit the helper's stdio if launch isolation regresses. Give each Windows stdio
+    // request a transport-owned nonce instead of inferring provenance from ordering. macOS's
+    // subprocess helper has a separate protocol and does not participate in Windows UIA recovery.
+    const requestId = process.platform === 'win32' ? randomUUID() : undefined;
     const timer = setTimeout(() => {
       if (runtime.pending !== pending) return;
       rejectAfterHelperRetirement(runtime, pending, new ComputerError('The desktop helper did not answer in time.'));
     }, helperTimeoutMs(request) + (runtime.ready ? 0 : HELPER_STARTUP_GRACE_MS));
-    pending = { resolve, reject, timer };
+    pending = { resolve, reject, timer, requestId };
+    // stderr is diagnostic state for the in-flight request. Do not let a prior request's UIA
+    // stage marker classify a later capture/input process crash as UIA corruption.
+    runtime.stderrTail = '';
     runtime.pending = pending;
-    runtime.child.stdin.write(`${JSON.stringify(request)}\n`, 'utf8', (error) => {
+    const wireRequest = requestId ? { ...request, __cosRequestId: requestId } : request;
+    runtime.child.stdin.write(`${JSON.stringify(wireRequest)}\n`, 'utf8', (error) => {
       if (!error) return;
       if (runtime.pending !== pending) return;
       rejectAfterHelperRetirement(
@@ -939,7 +1065,9 @@ function frameById(id: number | undefined): Frame | null {
 
 export async function listWindows(): Promise<{ windows: WindowInfo[]; screen: Rect }> {
   const reply = await runHelper({ op: 'windows' });
-  return { windows: (reply['windows'] as WindowInfo[]) ?? [], screen: reply['screen'] as Rect };
+  const windows = (reply['windows'] as WindowInfo[]) ?? [];
+  if (process.platform === 'win32') for (const window of windows) rememberWindowsWindowIdentity(window);
+  return { windows, screen: reply['screen'] as Rect };
 }
 
 /** Installed app identities come from the Windows Shell, never model-supplied paths. */
@@ -947,7 +1075,11 @@ export async function listDesktopApps(opts: { match?: string; limit?: number } =
   if (process.platform !== 'win32') throw new ComputerError('APPS_UNSUPPORTED: installed app discovery is currently Windows only.');
   return exclusive(async () => {
     const reply = await runHelper({ op: 'apps', match: opts.match ?? '', limit: Math.min(4096, Math.max(1, opts.limit ?? 60)) });
-    return { apps: Array.isArray(reply['apps']) ? reply['apps'] : [], truncated: reply['truncated'] === true };
+    const apps = Array.isArray(reply['apps']) ? (reply['apps'] as DesktopApp[]) : [];
+    for (const app of apps) {
+      for (const window of app.windows ?? []) rememberWindowsWindowIdentity(window);
+    }
+    return { apps, truncated: reply['truncated'] === true };
   });
 }
 
@@ -960,6 +1092,7 @@ export async function activeWindow(): Promise<{ window: WindowInfo | null; scree
   const reply = await runHelper({ op: 'active' });
   const value = reply['window'];
   const window = value && typeof value === 'object' ? (value as WindowInfo) : null;
+  if (process.platform === 'win32' && window) rememberWindowsWindowIdentity(window);
   return { window, screen: reply['screen'] as Rect };
 }
 
@@ -1094,18 +1227,18 @@ export async function getWindowState(opts: {
   return exclusive(async () => {
     const includeScreenshot = opts.includeScreenshot !== false;
     const includeUi = opts.includeUi !== false;
+    const requestedWindowsIdentity = process.platform === 'win32' && opts.window !== undefined
+      ? windowsKnownWindowIdentities.get(opts.window) ?? null
+      : null;
     const limit = Math.min(MAX_SCREENSHOT_WIDTH, Math.max(320, Math.floor(opts.maxWidth ?? DEFAULT_SCREENSHOT_WIDTH)));
     const dir = includeScreenshot ? await fs.mkdtemp(path.join(os.tmpdir(), 'clf-shot-')) : null;
     const file = dir ? path.join(dir, 'screen.png') : null;
     try {
-      // Target lookup, pixels and UIA are one helper transaction. Besides saving two native
-      // round trips, this is what gives every semantic ref and pixel coordinate one shared
-      // snapshot identity instead of stitching together observations from different moments.
-      const reply = await runHelper({
+      const snapshotRequest = (requestUi: boolean): Record<string, unknown> => ({
         op: 'snapshot',
         ...(opts.window === undefined ? {} : { id: opts.window }),
         includeScreenshot,
-        includeUi,
+        includeUi: requestUi,
         ...(opts.query === undefined ? {} : { query: opts.query }),
         ...(opts.role === undefined ? {} : { role: opts.role }),
         includeRelated: process.platform === 'win32' && opts.includeRelated === true,
@@ -1113,22 +1246,80 @@ export async function getWindowState(opts: {
         maxResults: Math.min(100, Math.max(1, Math.floor(opts.maxElements ?? 60))),
         ...(file ? { file } : {})
       });
+      let reply: Record<string, any> | null = null;
+      let forcedUiUnavailable: { code: string; message: string } | null = null;
+
+      // An access-violating UIA provider can corrupt the PowerShell/.NET helper process.
+      // Do not keep invoking that exact provider in a crash loop. Re-prove the HWND's app/process
+      // identity with a UI-free snapshot; only the same identity inherits the short breaker.
+      if (process.platform === 'win32' && includeUi && opts.window !== undefined) {
+        const breaker = activeWindowsUiaCrash(opts.window);
+        if (breaker) {
+          const candidate = await runHelper(snapshotRequest(false));
+          const candidateWindow = candidate['window'];
+          if (!candidateWindow || typeof candidateWindow !== 'object') {
+            throw new ComputerError('WINDOW_NOT_FOUND: no matching visible window is available');
+          }
+          if (windowsWindowIdentity(candidateWindow as WindowInfo) === breaker.identity) {
+            reply = candidate;
+            forcedUiUnavailable = { code: 'UIA_PROCESS_CRASH', message: breaker.message };
+          } else {
+            windowsUiaCrashBreakers.delete(opts.window);
+          }
+        }
+      }
+
+      // Target lookup, pixels and UIA are one helper transaction. Besides saving two native
+      // round trips, this is what gives every semantic ref and pixel coordinate one shared
+      // snapshot identity instead of stitching together observations from different moments.
+      if (!reply) {
+        try {
+          reply = await runHelper(snapshotRequest(includeUi));
+        } catch (error) {
+          const crash = process.platform === 'win32' && includeUi ? windowsUiaCrashUnavailable(error) : null;
+          if (!crash) throw error;
+
+          // A first direct HWND observation (or an implicit foreground target) may not
+          // have a previously observed native owner. Re-resolving after helper death
+          // cannot prove it is the same process. Fail closed instead of publishing a
+          // replacement owner's pixels/window under the crashed provider's receipt.
+          if (opts.window === undefined || requestedWindowsIdentity === null) throw error;
+
+          // The corrupted helper has already exited/been retired. Start a fresh generation and
+          // retry this observation exactly once without UIA. This preserves truthful pixels and
+          // window metadata while never continuing execution inside the corrupted process.
+          reply = await runHelper(snapshotRequest(false));
+          const safeWindow = reply['window'];
+          if (!safeWindow || typeof safeWindow !== 'object') {
+            throw new ComputerError('WINDOW_NOT_FOUND: no matching visible window is available');
+          }
+          if (windowsWindowIdentity(safeWindow as WindowInfo) !== requestedWindowsIdentity) {
+            throw new ComputerError(
+              'STALE_WINDOW: window identity changed during UIA crash recovery. Get the current window again before observing or acting.'
+            );
+          }
+          forcedUiUnavailable = crash;
+          rememberWindowsUiaCrash(safeWindow as WindowInfo, crash);
+        }
+      }
       const value = reply['window'];
       const window = value && typeof value === 'object' ? (value as WindowInfo) : null;
       if (!window) throw new ComputerError('WINDOW_NOT_FOUND: no matching visible window is available');
+      if (process.platform === 'win32') rememberWindowsWindowIdentity(window);
       const pixelFailure = reply['screenshotUnavailable'] as Record<string, unknown> | undefined;
       const screenshotUnavailable = includeScreenshot && includeUi && pixelFailure?.code === 'CAPTURE_FAILED' && typeof pixelFailure.message === 'string'
         ? { code: 'CAPTURE_FAILED', message: pixelFailure.message.slice(0, 500) } : undefined;
       const shot = file && !screenshotUnavailable ? await screenshotFromReply(reply, file, window.id) : null;
       const frame = shot ? frameById(shot.frameId) : null;
       const unavailableValue = reply['uiUnavailable'];
-      const uiUnavailable =
+      const uiUnavailable = forcedUiUnavailable ?? (
         unavailableValue && typeof unavailableValue === 'object'
           ? {
               code: String((unavailableValue as Record<string, unknown>)['code'] ?? 'UI_UNAVAILABLE'),
               message: String((unavailableValue as Record<string, unknown>)['message'] ?? 'UI controls are unavailable')
             }
-          : null;
+          : null
+      );
       const found = includeUi && uiUnavailable === null
         ? await findUiLocked({ window: window.id, maxResults: opts.maxElements ?? 60 }, frame, reply)
         : { window: window.id, snapshotId: null, elements: [] as UiElementInfo[], accessibility: undefined };
@@ -1578,6 +1769,9 @@ async function actLocked(
   actions: Action[],
   opts: { frameId?: number; window?: number; ownerWindow?: number; app?: string; ownerApp?: string }
 ): Promise<ActionResult> {
+  const requestedWindowsIdentity = process.platform === 'win32' && opts.window !== undefined
+    ? windowsKnownWindowIdentities.get(opts.window) ?? null
+    : null;
   if (process.platform !== 'win32' && actions.some(action => action.type === 'paste' || action.type === 'launch_app' || action.type === 'ui_action')) {
     throw new ComputerError('ACTION_UNSUPPORTED: paste, launch_app and ui_action are currently Windows only.');
   }
@@ -1810,6 +2004,17 @@ async function actLocked(
       }
       completedCount += sending.length;
     } catch (err) {
+      const uiaCrash = windowsUiaCrashUnavailable(err);
+      if (
+        uiaCrash &&
+        process.platform === 'win32' &&
+        opts.window !== undefined &&
+        requestedWindowsIdentity !== null
+      ) {
+        // No input is retried. This only protects the next read-only accessibility observation
+        // from immediately crashing a fresh helper on the same proven provider identity.
+        rememberWindowsUiaCrashIdentity(opts.window, requestedWindowsIdentity, uiaCrash);
+      }
       const partial = err instanceof ComputerError ? (err.completedCount ?? 0) : 0;
       const failedBatchIndex = err instanceof ComputerError ? (err.failedIndex ?? partial) : partial;
       const helperRoutes = err instanceof ComputerError ? err.completedRoutes : null;
