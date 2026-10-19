@@ -285,4 +285,31 @@ describe.runIf(process.platform === 'win32')('Windows UIA access-violation recov
       expect.objectContaining({ op: 'snapshot', includeUi: true })
     ]);
   });
+  it('recovers read-only when a newly discovered HWND owner crashes after breaker replacement', async () => {
+    // Use real list-apps to pin A, then plant its breaker with a native-helper crash.
+    fake.state.identityVersion = 1;
+    await listDesktopApps({ limit: 60 });
+    await getWindowState({ window: 77, includeScreenshot: false, includeUi: true });
+    fake.state.crashNextSnapshot = true;
+    const crashedA = await getWindowState({ window: 77, includeScreenshot: false, includeUi: true });
+    expect(crashedA).toMatchObject({ window: { processId: 1001 }, uiUnavailable: { code: 'UIA_PROCESS_CRASH' } });
+
+    // Reuse the HWND with B. Its *first* UIA observation also crashes. The successful
+    // preflight has proved B's identity; recovering B must not compare against A.
+    fake.state.identityVersion = 2;
+    fake.state.crashNextSnapshot = true;
+    const from = fake.requests.length;
+    const recoveredB = await getWindowState({ window: 77, includeScreenshot: false, includeUi: true });
+    expect(recoveredB).toMatchObject({
+      window: { id: 77, processId: 2002 }, snapshotId: null, elements: [],
+      uiUnavailable: { code: 'UIA_PROCESS_CRASH' }
+    });
+    expect(fake.requests.slice(from).map((r: any) => r.includeUi)).toEqual([false, true, false]);
+
+    // The B breaker must now suppress reentry to B's crashing provider.
+    const before = fake.requests.length;
+    const blockedB = await getWindowState({ window: 77, includeScreenshot: false, includeUi: true });
+    expect(blockedB.uiUnavailable?.code).toBe('UIA_PROCESS_CRASH');
+    expect(fake.requests.slice(before).map((r: any) => r.includeUi)).toEqual([false]);
+  });
 });

@@ -5059,6 +5059,15 @@ preserves a usable screenshot and its explicit diagnostic. Conversely, `CAPTURE_
 requested UIA controls in the same transaction and reports `screenshot_error` with no image/frame
 authority. Screenshot-only requests, stale geometry and identity failures still fail explicitly;
 two failed observation channels are not success. Offscreen/disabled controls are marked.
+Windows UIA crash containment uses request-bound helper stage/nonce evidence; only an
+attributed native provider crash retires the helper generation. A previously seeded
+explicit HWND may recover one read-only, UI-free observation with exact process
+identity; implicit foreground or unseeded observations never recover by guessing.
+A short per-owner circuit breaker suppresses another UIA call to a crashed provider.
+If HWND reuse is proved by a UI-free breaker preflight, the replacement owner is
+the recovery identity for that observation; changing it again during the crash
+fails `STALE_WINDOW`. Semantic input is never replayed. WPF and unidentified
+providers do not expose selected-range text through the unsafe native read.
 
 The Window2 result also retains native `state` (foreground/open/minimized). `get_window_state`
 accepts bounded `query` (name/automation id), `role` and `max_elements` search options. They imply

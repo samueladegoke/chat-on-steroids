@@ -1248,6 +1248,10 @@ export async function getWindowState(opts: {
       });
       let reply: Record<string, any> | null = null;
       let forcedUiUnavailable: { code: string; message: string } | null = null;
+      // A breaker preflight can establish a replacement HWND owner for this observation.
+      // Keep the entry-time identity for the unseeded guard; pin recovery to the newly
+      // proved owner only after a successful UI-free preflight.
+      let recoveryWindowsIdentity = requestedWindowsIdentity;
 
       // An access-violating UIA provider can corrupt the PowerShell/.NET helper process.
       // Do not keep invoking that exact provider in a crash loop. Re-prove the HWND's app/process
@@ -1265,6 +1269,7 @@ export async function getWindowState(opts: {
             forcedUiUnavailable = { code: 'UIA_PROCESS_CRASH', message: breaker.message };
           } else {
             windowsUiaCrashBreakers.delete(opts.window);
+            recoveryWindowsIdentity = windowsWindowIdentity(candidateWindow as WindowInfo);
           }
         }
       }
@@ -1293,7 +1298,7 @@ export async function getWindowState(opts: {
           if (!safeWindow || typeof safeWindow !== 'object') {
             throw new ComputerError('WINDOW_NOT_FOUND: no matching visible window is available');
           }
-          if (windowsWindowIdentity(safeWindow as WindowInfo) !== requestedWindowsIdentity) {
+          if (windowsWindowIdentity(safeWindow as WindowInfo) !== recoveryWindowsIdentity) {
             throw new ComputerError(
               'STALE_WINDOW: window identity changed during UIA crash recovery. Get the current window again before observing or acting.'
             );
