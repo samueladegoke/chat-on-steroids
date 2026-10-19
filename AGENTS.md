@@ -5064,6 +5064,8 @@ attributed native provider crash retires the helper generation. A previously see
 explicit HWND may recover one read-only, UI-free observation with exact process
 identity; implicit foreground or unseeded observations never recover by guessing.
 A short per-owner circuit breaker suppresses another UIA call to a crashed provider.
+A native process-creation FILETIME distinguishes recycled PID/HWND tuples; recovery
+fails closed when this process-incarnation identity cannot be proved.
 If HWND reuse is proved by a UI-free breaker preflight, the replacement owner is
 the recovery identity for that observation; changing it again during the crash
 fails `STALE_WINDOW`. Semantic input is never replayed. WPF and unidentified

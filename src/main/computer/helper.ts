@@ -346,7 +346,7 @@ public static class Clf {
       h.ToInt64().ToString(), sb.ToString().Replace((char)31, ' '), proc,
       r.Left.ToString(), r.Top.ToString(), (r.Right - r.Left).ToString(), (r.Bottom - r.Top).ToString(),
       IsIconic(h) ? "minimized" : (h == GetForegroundWindow() ? "foreground" : "open"),
-      identity[0], pid.ToString(), identity[1], identity[2], dpi.ToString()
+      identity[0], pid.ToString(), identity[1], identity[2], dpi.ToString(), identity[3]
     });
   }
 
@@ -552,6 +552,7 @@ function Convert-WindowRow([string]$line) {
     id = [int64]$f[0]; title = $f[1]; process = $f[2]
     x = [int]$f[3]; y = [int]$f[4]; width = [int]$f[5]; height = [int]$f[6]; state = $f[7]
     app = $f[8]; processId = [uint32]$f[9]; processPath = $f[10]; appUserModelId = $f[11]; dpi = [int]$f[12]
+    processStartTime = if ($f.Count -gt 13) { $f[13] } else { '' }
   }
 }
 

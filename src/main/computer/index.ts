@@ -89,6 +89,8 @@ export interface WindowInfo {
   /** Windows native app identity (AUMID or exact process image path). */
   app?: string;
   processId?: number;
+  /** Native creation FILETIME distinguishes recycled process IDs. */
+  processStartTime?: string;
   processPath?: string;
   appUserModelId?: string;
   dpi?: number;
@@ -396,7 +398,8 @@ function windowsWindowIdentity(window: WindowInfo): string {
     window.app ?? '',
     window.processPath ?? '',
     window.appUserModelId ?? '',
-    window.process ?? ''
+    window.process ?? '',
+    window.processStartTime ?? ''
   ].join('\u001f');
 }
 
@@ -1234,17 +1237,17 @@ export async function getWindowState(opts: {
     const dir = includeScreenshot ? await fs.mkdtemp(path.join(os.tmpdir(), 'clf-shot-')) : null;
     const file = dir ? path.join(dir, 'screen.png') : null;
     try {
-      const snapshotRequest = (requestUi: boolean): Record<string, unknown> => ({
+      const snapshotRequest = (requestUi: boolean, requestScreenshot = includeScreenshot): Record<string, unknown> => ({
         op: 'snapshot',
         ...(opts.window === undefined ? {} : { id: opts.window }),
-        includeScreenshot,
+        includeScreenshot: requestScreenshot,
         includeUi: requestUi,
         ...(opts.query === undefined ? {} : { query: opts.query }),
         ...(opts.role === undefined ? {} : { role: opts.role }),
         includeRelated: process.platform === 'win32' && opts.includeRelated === true,
         maxWidth: limit,
         maxResults: Math.min(100, Math.max(1, Math.floor(opts.maxElements ?? 60))),
-        ...(file ? { file } : {})
+        ...(requestScreenshot && file ? { file } : {})
       });
       let reply: Record<string, any> | null = null;
       let forcedUiUnavailable: { code: string; message: string } | null = null;
@@ -1252,6 +1255,8 @@ export async function getWindowState(opts: {
       // Keep the entry-time identity for the unseeded guard; pin recovery to the newly
       // proved owner only after a successful UI-free preflight.
       let recoveryWindowsIdentity = requestedWindowsIdentity;
+      let recoveryScreenshotFailure: { code: string; message: string } | undefined;
+      const hasIncarnation = (row: WindowInfo): boolean => /^\d{8,20}$/.test(row.processStartTime ?? '');
 
       // An access-violating UIA provider can corrupt the PowerShell/.NET helper process.
       // Do not keep invoking that exact provider in a crash loop. Re-prove the HWND's app/process
@@ -1259,13 +1264,21 @@ export async function getWindowState(opts: {
       if (process.platform === 'win32' && includeUi && opts.window !== undefined) {
         const breaker = activeWindowsUiaCrash(opts.window);
         if (breaker) {
-          const candidate = await runHelper(snapshotRequest(false));
+          // Resolve owner identity without relying on a working compositor.
+          const candidate = await runHelper(snapshotRequest(false, false));
           const candidateWindow = candidate['window'];
           if (!candidateWindow || typeof candidateWindow !== 'object') {
             throw new ComputerError('WINDOW_NOT_FOUND: no matching visible window is available');
           }
+          if (!hasIncarnation(candidateWindow as WindowInfo)) {
+            throw new ComputerError('STALE_WINDOW: native process incarnation is unavailable; refresh window discovery before observing.');
+          }
           if (windowsWindowIdentity(candidateWindow as WindowInfo) === breaker.identity) {
-            reply = candidate;
+            // Retain requested pixels, but reject an owner change after the identity preflight.
+            reply = includeScreenshot ? await runHelper(snapshotRequest(false)) : candidate;
+            if (windowsWindowIdentity(reply['window'] as WindowInfo) !== breaker.identity) {
+              throw new ComputerError('STALE_WINDOW: window identity changed during UIA breaker observation.');
+            }
             forcedUiUnavailable = { code: 'UIA_PROCESS_CRASH', message: breaker.message };
           } else {
             windowsUiaCrashBreakers.delete(opts.window);
@@ -1288,17 +1301,26 @@ export async function getWindowState(opts: {
           // have a previously observed native owner. Re-resolving after helper death
           // cannot prove it is the same process. Fail closed instead of publishing a
           // replacement owner's pixels/window under the crashed provider's receipt.
-          if (opts.window === undefined || requestedWindowsIdentity === null) throw error;
+          if (opts.window === undefined || requestedWindowsIdentity === null ||
+              !/^\d{8,20}$/.test(requestedWindowsIdentity.split('\u001f').at(-1) ?? '')) throw error;
 
           // The corrupted helper has already exited/been retired. Start a fresh generation and
           // retry this observation exactly once without UIA. This preserves truthful pixels and
           // window metadata while never continuing execution inside the corrupted process.
-          reply = await runHelper(snapshotRequest(false));
+          try {
+            reply = await runHelper(snapshotRequest(false));
+          } catch (captureError) {
+            // A compositor failure must not erase the original provider crash.
+            if (!includeScreenshot || !String(captureError).includes('CAPTURE_FAILED')) throw captureError;
+            recoveryScreenshotFailure = { code: 'CAPTURE_FAILED', message: String(captureError).slice(0, 500) };
+            reply = await runHelper(snapshotRequest(false, false));
+          }
           const safeWindow = reply['window'];
           if (!safeWindow || typeof safeWindow !== 'object') {
             throw new ComputerError('WINDOW_NOT_FOUND: no matching visible window is available');
           }
-          if (windowsWindowIdentity(safeWindow as WindowInfo) !== recoveryWindowsIdentity) {
+          if (!hasIncarnation(safeWindow as WindowInfo) ||
+              windowsWindowIdentity(safeWindow as WindowInfo) !== recoveryWindowsIdentity) {
             throw new ComputerError(
               'STALE_WINDOW: window identity changed during UIA crash recovery. Get the current window again before observing or acting.'
             );
@@ -1312,8 +1334,8 @@ export async function getWindowState(opts: {
       if (!window) throw new ComputerError('WINDOW_NOT_FOUND: no matching visible window is available');
       if (process.platform === 'win32') rememberWindowsWindowIdentity(window);
       const pixelFailure = reply['screenshotUnavailable'] as Record<string, unknown> | undefined;
-      const screenshotUnavailable = includeScreenshot && includeUi && pixelFailure?.code === 'CAPTURE_FAILED' && typeof pixelFailure.message === 'string'
-        ? { code: 'CAPTURE_FAILED', message: pixelFailure.message.slice(0, 500) } : undefined;
+      const screenshotUnavailable = recoveryScreenshotFailure ?? (includeScreenshot && includeUi && pixelFailure?.code === 'CAPTURE_FAILED' && typeof pixelFailure.message === 'string'
+        ? { code: 'CAPTURE_FAILED', message: pixelFailure.message.slice(0, 500) } : undefined);
       const shot = file && !screenshotUnavailable ? await screenshotFromReply(reply, file, window.id) : null;
       const frame = shot ? frameById(shot.frameId) : null;
       const unavailableValue = reply['uiUnavailable'];

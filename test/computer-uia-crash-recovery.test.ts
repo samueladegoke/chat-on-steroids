@@ -27,6 +27,9 @@ const fake = vi.hoisted(() => {
   const requests: any[] = [];
   const state = {
     identityVersion: 1,
+    incarnationVersion: 1,
+    captureNextUiFree: false,
+    captureCombined: false,
     crashNextAct: false,
     crashNextSnapshot: false,
     changeIdentityOnSnapshotCrash: false
@@ -41,7 +44,7 @@ const fake = vi.hoisted(() => {
     child.stdin = {
       write(line: string, _encoding: string, callback: (error?: Error | null) => void) {
         callback(null);
-        const request = JSON.parse(line) as { op: string; id?: number; includeUi?: boolean; __cosRequestId?: string };
+        const request = JSON.parse(line) as { op: string; id?: number; includeUi?: boolean; includeScreenshot?: boolean; __cosRequestId?: string };
         const requestId = request.__cosRequestId ?? '';
         if (!requestId) throw new Error('missing transport request nonce');
         requests.push({ childIndex, ...request });
@@ -53,6 +56,13 @@ const fake = vi.hoisted(() => {
             message: 'System.AccessViolationException: provider reported protected memory without terminating',
             __cosRequestId: requestId
           };
+          queueMicrotask(() => child.stdout.emit('data', Buffer.from(`${JSON.stringify(reply)}\n`)));
+          return true;
+        }
+
+        if (request.op === 'snapshot' && request.includeUi === false && request.includeScreenshot === true && state.captureNextUiFree) {
+          state.captureNextUiFree = false;
+          const reply = { ok: false, error_code: 'CAPTURE_FAILED', message: 'CAPTURE_FAILED: compositor surface unavailable', __cosRequestId: requestId };
           queueMicrotask(() => child.stdout.emit('data', Buffer.from(`${JSON.stringify(reply)}\n`)));
           return true;
         }
@@ -112,6 +122,7 @@ const fake = vi.hoisted(() => {
           id: 77,
           app: 'C:\\Apps\\fixture.exe',
           processId: state.identityVersion === 1 ? 1001 : 2002,
+          processStartTime: (133000000000000000n + BigInt(state.identityVersion * 100 + state.incarnationVersion)).toString(),
           processPath: 'C:\\Apps\\fixture.exe',
           appUserModelId: '',
           title: 'Crash-prone fixture',
@@ -145,7 +156,8 @@ const fake = vi.hoisted(() => {
                 bounds: { x: 10, y: 10, width: 80, height: 30 }
               }],
               visited: 1,
-              truncated: false
+              truncated: false,
+              ...(state.captureCombined && request.includeScreenshot ? { screenshotUnavailable: { code: 'CAPTURE_FAILED', message: 'CAPTURE_FAILED: compositor missing' } } : {})
               }
             : { ok: true, __cosRequestId: requestId, window };
         queueMicrotask(() => child.stdout.emit('data', Buffer.from(`${JSON.stringify(reply)}\n`)));
@@ -312,4 +324,52 @@ describe.runIf(process.platform === 'win32')('Windows UIA access-violation recov
     expect(blockedB.uiUnavailable?.code).toBe('UIA_PROCESS_CRASH');
     expect(fake.requests.slice(before).map((r: any) => r.includeUi)).toEqual([false]);
   });
+  it('distinguishes process incarnation reuse and retains UIA when replacement pixels fail', async () => {
+    fake.state.identityVersion = 1;
+    fake.state.incarnationVersion = 1;
+    await listDesktopApps({ limit: 60 });
+    fake.state.crashNextSnapshot = true;
+    const crashA = await getWindowState({ window: 77, includeScreenshot: false, includeUi: true });
+    expect(crashA.uiUnavailable?.code).toBe('UIA_PROCESS_CRASH');
+
+    // B reuses A's numeric HWND, PID and executable path, but has another creation FILETIME.
+    fake.state.incarnationVersion = 2;
+    fake.state.captureNextUiFree = true;
+    fake.state.captureCombined = true;
+    const from = fake.requests.length;
+    const replacement = await getWindowState({ window: 77, includeScreenshot: true, includeUi: true });
+    expect(replacement.window.processId).toBe(1001);
+    expect(replacement.window.processStartTime).toBe((133000000000000102n).toString());
+    expect(replacement.elements[0]?.name).toBe('Recovered button');
+    expect(replacement.uiUnavailable).toBeNull();
+    expect(replacement.screenshotUnavailable?.code).toBe('CAPTURE_FAILED');
+    expect(fake.requests.slice(from).map((x: any) => [x.includeUi, x.includeScreenshot])).toEqual([
+      [false, false], [true, true]
+    ]);
+    fake.state.captureCombined = false;
+    fake.state.captureNextUiFree = false;
+  });
+
+  it('retains the UIA breaker when screenshot capture also fails during crash recovery', async () => {
+    fake.state.identityVersion = 1;
+    fake.state.incarnationVersion = 3;
+    fake.state.captureNextUiFree = false;
+    fake.state.captureCombined = false;
+    await listDesktopApps({ limit: 60 });
+    fake.state.crashNextSnapshot = true;
+    fake.state.captureNextUiFree = true;
+    const from = fake.requests.length;
+    const recovered = await getWindowState({ window: 77, includeScreenshot: true, includeUi: true });
+    expect(recovered.uiUnavailable?.code).toBe('UIA_PROCESS_CRASH');
+    expect(recovered.screenshotUnavailable?.code).toBe('CAPTURE_FAILED');
+    expect(recovered.elements).toEqual([]);
+    expect(fake.requests.slice(from).map((x: any) => [x.includeUi, x.includeScreenshot])).toEqual([
+      [true, true], [false, true], [false, false]
+    ]);
+    const next = fake.requests.length;
+    const breaker = await getWindowState({ window: 77, includeScreenshot: false, includeUi: true });
+    expect(breaker.uiUnavailable?.code).toBe('UIA_PROCESS_CRASH');
+    expect(fake.requests.slice(next).map((x: any) => [x.includeUi, x.includeScreenshot])).toEqual([[false, false]]);
+  });
+
 });
