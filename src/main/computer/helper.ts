@@ -1111,6 +1111,10 @@ function Assert-CoordinateFrame($frame) {
     if ($null -eq $row -or $row.state -eq 'minimized') {
       throw "STALE_FRAME: target window $id is no longer drawable"
     }
+    if ([string]$frame.processStartTime -notmatch '^[0-9]{8,20}$' -or
+        [string]$row.processStartTime -cne [string]$frame.processStartTime) {
+      throw "STALE_FRAME: target process incarnation changed since frame $($frame.id)"
+    }
     if ($row.x -ne [int]$geometry.x -or $row.y -ne [int]$geometry.y -or $row.width -ne [int]$geometry.width -or $row.height -ne [int]$geometry.height) {
       throw "STALE_FRAME: target window $id moved or resized after frame $($frame.id)"
     }
@@ -1119,7 +1123,8 @@ function Assert-CoordinateFrame($frame) {
     Assert-Focused $id
     Assert-InputOwner $id $frame.ownerWindow $frame.targetApp $frame.ownerApp
     $after = Get-WindowRow $id
-    if ($null -eq $after -or $after.x -ne [int]$geometry.x -or $after.y -ne [int]$geometry.y -or $after.width -ne [int]$geometry.width -or $after.height -ne [int]$geometry.height) {
+    if ($null -eq $after -or [string]$after.processStartTime -cne [string]$frame.processStartTime -or
+        $after.x -ne [int]$geometry.x -or $after.y -ne [int]$geometry.y -or $after.width -ne [int]$geometry.width -or $after.height -ne [int]$geometry.height) {
       throw "STALE_FRAME: target window $id changed geometry while it was activated"
     }
     return
@@ -1135,6 +1140,18 @@ function Assert-CoordinateFrame($frame) {
 }
 
 ${WINDOWS_APPS_SCRIPT}
+
+# Require an identical live process incarnation for an entire UIA/pixel snapshot.
+function Assert-SnapshotOwner($original, $current) {
+  if ($null -eq $original -or $null -eq $current -or
+      [string]$original.processStartTime -notmatch '^[0-9]{8,20}$' -or
+      [string]$current.processStartTime -cne [string]$original.processStartTime -or
+      [uint32]$current.processId -ne [uint32]$original.processId -or
+      [string]$current.app -cne [string]$original.app -or
+      [string]$current.processPath -cne [string]$original.processPath) {
+    throw 'STALE_WINDOW: process owner changed during native snapshot'
+  }
+}
 
 function Handle-Request($request) {
   [Clf]::EnsureDpiAware()
@@ -1192,7 +1209,13 @@ function Handle-Request($request) {
       $result.route = $ui.route
     }
     'capture' {
+      $captureOwner = if ($request.id) { Get-WindowRow ([int64]$request.id) } else { $null }
       $capture = Capture-Target $request $null
+      if ($request.id) {
+        $latestOwner = Get-WindowRow ([int64]$request.id)
+        Assert-SnapshotOwner $captureOwner $latestOwner
+        $result.window = $latestOwner
+      }
       foreach ($key in $capture.Keys) { $result[$key] = $capture[$key] }
     }
     'snapshot' {
@@ -1207,6 +1230,8 @@ function Handle-Request($request) {
         try {
           $capture = Capture-Target $request ([Nullable[int64]]$id)
           foreach ($key in $capture.Keys) { $result[$key] = $capture[$key] }
+          # Capture/overlay can recycle the HWND between metadata and pixels.
+          Assert-SnapshotOwner $window (Get-WindowRow $id)
         } catch {
           $message = $_.Exception.GetBaseException().Message
           # A missing compositor surface does not invalidate this window's UIA provider.
@@ -1240,6 +1265,9 @@ function Handle-Request($request) {
           $result.elements = @()
         }
       }
+      # The full native transaction, including accessibility traversal, belongs to
+      # the original process instance or no image/ref may be published.
+      Assert-SnapshotOwner $window (Get-WindowRow $id)
       if ($result.screenshotUnavailable -and $result.uiUnavailable) {
         throw ($result.screenshotUnavailable.message + '; UIA_FAILED: ' + $result.uiUnavailable.message)
       }

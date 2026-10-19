@@ -974,6 +974,7 @@ interface Frame {
   width: number;
   height: number;
   windowId: number | null;
+  processStartTime: string | null;
   windowGeometry: Rect | null;
   /** Exact active-display rectangles captured with a screen frame; null for window frames. */
   displayTopology: Rect[] | null;
@@ -1506,6 +1507,7 @@ async function screenshotFromReply(
     width: size.width,
     height: size.height,
     windowId: frameWindow,
+    processStartTime: frameWindow === null ? null : (reply['window'] as WindowInfo | undefined)?.processStartTime ?? null,
     windowGeometry: frameWindow === null ? null : replyWindowGeometry ?? { ...region },
     displayTopology: frameWindow === null ? displayTopology : null,
     captureMode
@@ -1855,6 +1857,7 @@ async function actLocked(
       width: 1,
       height: 1,
       windowId: null,
+      processStartTime: null,
       windowGeometry: null,
       displayTopology: null,
       captureMode: 'screen' as const
@@ -2012,6 +2015,7 @@ async function actLocked(
               frame: {
                 id: frame.id,
                 window: frame.windowId,
+                ...(frame.windowId === null ? {} : { processStartTime: frame.processStartTime }),
                 ...(opts.ownerWindow === undefined ? {} : { ownerWindow: opts.ownerWindow }),
                 ...(opts.app === undefined ? {} : { targetApp: opts.app }),
                 ...(opts.ownerApp === undefined ? {} : { ownerApp: opts.ownerApp }),

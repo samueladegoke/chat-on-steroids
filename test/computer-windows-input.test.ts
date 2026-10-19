@@ -93,7 +93,7 @@ try { $null = Handle-Request $request; throw 'invalid key unexpectedly accepted'
 if ([Clf]::TestCalls -ne 0) { throw 'invalid key applied earlier actions' }
 $aliases = [CosWindowsKeys]::ResolveForLayout([string[]]@('Control_L','Control_R','Prior','KP_5'), [IntPtr]::Zero, [Func[char,IntPtr,int16]]{ param($char, $layout) return 0 })
 if (($aliases -join ',') -ne '162,65699,65569,101') { throw ('keysym normalization failed: ' + ($aliases -join ',')) }
-function Get-WindowRow([int64]$id) { return @{ id = $id; title = 'Owned fixture' } }
+function Get-WindowRow([int64]$id) { return @{ id = $id; title = 'Owned fixture'; app = 'fixture.exe'; processId = 101; processPath = 'C:\Apps\fixture.exe'; processStartTime = '133000000000000101' } }
 function Capture-Target($request, $forcedWindow) { return @{ width = 10; height = 10; captureMode = 'window' } }
 function Find-UiElements($request) { throw 'UIA_FAILED: fixture provider unavailable' }
 $request = '{"op":"snapshot","id":42,"includeScreenshot":true,"includeUi":true}' | ConvertFrom-Json

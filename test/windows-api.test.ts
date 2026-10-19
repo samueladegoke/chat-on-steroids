@@ -100,6 +100,21 @@ describe('Windows Window2 interface', () => {
     await api.type_text({ window, text: 'first\nsecond' });
     expect(backend.act).toHaveBeenLastCalledWith([{ type: 'paste', text: 'first\nsecond' }], { window: 42, app: window.app });
   });
+  it('rejects a coordinate click when the same HWND, PID and app refer to a new process incarnation', async () => {
+    const { api, backend } = fixture();
+    const original = '133000000000000101';
+    const recycled = '133000000000000202';
+    nativeWindow.processStartTime = original;
+    await api.get_window_state({ window });
+    vi.mocked(backend.getWindowState).mockResolvedValueOnce({
+      window: { ...nativeWindow, processStartTime: recycled },
+      screenshot: null, snapshotId: 0, uiUnavailable: null, elements: []
+    });
+    await expect(api.click({ window, screenshotId: 'frame-1', x: 10, y: 10 })).rejects.toThrow('STALE_WINDOW');
+    expect(backend.act).not.toHaveBeenCalled();
+    nativeWindow.processStartTime = original;
+  });
+
   it('rejects wrong app identities and screenshot ids from a replaced observation', async () => {
     const { api, result, backend } = fixture();
     await expect(api.get_window({ id: 42, app: 'wrong' })).rejects.toThrow('WINDOW_NOT_FOUND');

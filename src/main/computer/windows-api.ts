@@ -39,8 +39,8 @@ export interface WindowsComputerBackend {
   listWindows: typeof listWindows;
 }
 const labels: Record<UiActionName, string> = { invoke: 'Invoke', toggle: 'Toggle', select: 'Select', expand: 'Expand', collapse: 'Collapse', focus: 'Raise', scroll_up: 'Scroll Up', scroll_down: 'Scroll Down', scroll_left: 'Scroll Left', scroll_right: 'Scroll Right', scroll_into_view: 'Scroll Into View' };
-type Frame = Pick<Screenshot, 'frameId' | 'width' | 'height' | 'windowId'> & { app: string };
-type State = { app: string; frames: Map<string, Frame>; primary?: string; refs: Array<{ ref: string; actions: UiActionName[] }> };
+type Frame = Pick<Screenshot, 'frameId' | 'width' | 'height' | 'windowId'> & { app: string; processStartTime?: string };
+type State = { app: string; processStartTime?: string; frames: Map<string, Frame>; primary?: string; refs: Array<{ ref: string; actions: UiActionName[] }> };
 function publicWindow(value: WindowInfo): WindowsWindow {
   const app = value.app || value.appUserModelId || value.processPath;
   if (!app) throw new ComputerError('WINDOW_IDENTITY_UNAVAILABLE: observe a window with an exact native app identity.');
@@ -67,8 +67,11 @@ export function createWindowsComputerApi(backend: WindowsComputerBackend = { act
   const states = new Map<number, { state?: State }>();
   const parse = <K extends keyof typeof WINDOWS_API_SCHEMAS>(method: K, input: unknown): z.infer<(typeof WINDOWS_API_SCHEMAS)[K]> => WINDOWS_API_SCHEMAS[method].parse(input ?? {}) as z.infer<(typeof WINDOWS_API_SCHEMAS)[K]>;
   async function current(window: WindowsWindow): Promise<void> {
-    const found = publicWindow((await backend.getWindowState({ window: window.id, includeScreenshot: false, includeUi: false, includeRelated: false })).window);
+    const live = (await backend.getWindowState({ window: window.id, includeScreenshot: false, includeUi: false, includeRelated: false })).window;
+    const found = publicWindow(live);
     if (found.app !== window.app) throw new ComputerError('STALE_WINDOW: app identity changed; get the window again.');
+    const observed = states.get(window.id)?.state?.processStartTime;
+    if (observed && live.processStartTime !== observed) throw new ComputerError('STALE_WINDOW: native process incarnation changed; get a fresh window state.');
   }
   function stateFor(window: WindowsWindow): State {
     const state = states.get(window.id)?.state;
@@ -137,7 +140,7 @@ export function createWindowsComputerApi(backend: WindowsComputerBackend = { act
       if (states.get(args.window.id) !== pending) throw new ComputerError('STALE_WINDOW_STATE: observation was superseded.');
       const window = publicWindow(result.window);
       if (window.app !== args.window.app) throw new ComputerError('STALE_WINDOW: app identity changed.');
-      const state: State = { app: window.app, frames: new Map(), refs: result.elements.map(e => ({ ref: e.ref, actions: [...(e.actions ?? [])] })) };
+      const state: State = { app: window.app, processStartTime: result.window.processStartTime, frames: new Map(), refs: result.elements.map(e => ({ ref: e.ref, actions: [...(e.actions ?? [])] })) };
       const screenshots: WindowsWindowState['screenshots'] = [];
       // EnumWindows supplies related windows from highest to lowest z-order.
       const shots = [result.screenshot, ...(result.related ?? []).map(r => r.screenshot).reverse()];
@@ -146,7 +149,7 @@ export function createWindowsComputerApi(backend: WindowsComputerBackend = { act
         const id = `frame-${shot.frameId}`;
         const frameWindow = shot === result.screenshot ? result.window : result.related?.find(r => r.screenshot === shot)?.window;
         if (!frameWindow) throw new ComputerError('WINDOW_IDENTITY_UNAVAILABLE: screenshot has no window owner.');
-        state.frames.set(id, { frameId: shot.frameId, width: shot.width, height: shot.height, windowId: shot.windowId, app: publicWindow(frameWindow).app });
+        state.frames.set(id, { frameId: shot.frameId, width: shot.width, height: shot.height, windowId: shot.windowId, app: publicWindow(frameWindow).app, processStartTime: frameWindow.processStartTime });
         if (shot === result.screenshot) state.primary = id;
         screenshots.push({ id, url: `data:image/png;base64,${shot.data}`, width: shot.width, height: shot.height, originX: shot.region.x, originY: shot.region.y, zIndex: screenshots.length });
       }
