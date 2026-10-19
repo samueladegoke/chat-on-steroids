@@ -1308,7 +1308,11 @@ function Handle-Request($request) {
         try {
           $actionTarget = if ($a.type -in @('click_ui','set_value_ui','ui_action','focus')) { [int64]$a.window } elseif ($request.targetWindow) { [int64]$request.targetWindow } elseif ($request.frame.window) { [int64]$request.frame.window } else { 0 }
           Assert-InputOwner $actionTarget $request.ownerWindow $request.targetApp $request.ownerApp
-          if ($request.targetWindow -and $a.type -in @('move','click','double_click','scroll','drag','type','keypress')) {
+          # Window-frame coordinates must prove incarnation BEFORE any focus change.
+          # Assert-CoordinateFrame owns activation; non-coordinate input keeps its
+          # established focus path.
+          $frameCoordinates = $request.frame -and $a.type -in @('move','click','double_click','scroll','drag')
+          if ($request.targetWindow -and $a.type -in @('move','click','double_click','scroll','drag','type','keypress') -and -not $frameCoordinates) {
             Assert-Focused ([int64]$request.targetWindow)
             Assert-InputOwner $actionTarget $request.ownerWindow $request.targetApp $request.ownerApp
           }

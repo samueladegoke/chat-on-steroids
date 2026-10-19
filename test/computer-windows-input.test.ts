@@ -74,9 +74,10 @@ $script:checks = 0
 $script:focuses = @()
 function Assert-Focused([int64]$id) { $script:focuses += $id }
 function Assert-CoordinateFrame($frame) {
-  if ($script:focuses.Count -ne ($script:checks + 1)) { throw 'frame checked before targeted focus' }
+  if ($script:focuses.Count -ne $script:checks) { throw 'frame focus occurred before ownership validation' }
   $script:checks++
   if ($script:checks -eq 2) { throw 'STALE_FRAME: changed after first action' }
+  Assert-Focused ([int64]$request.targetWindow)
 }
 [Clf]::TestReset(0)
 $request = '{"op":"act","targetWindow":42,"frame":{"id":1},"actions":[{"type":"move","x":1,"y":1},{"type":"move","x":2,"y":2}]}' | ConvertFrom-Json
@@ -84,7 +85,16 @@ $result = Handle-Request $request
 if ($result.ok -ne $false -or $result.completed_count -ne 1 -or $result.failed_index -ne 1 -or $result.error_code -ne 'STALE_FRAME' -or [Clf]::TestCalls -ne 1) {
   throw 'per-action stale frame did not preserve exact partial result'
 }
-if (($script:focuses -join ',') -ne '42,42') { throw 'target not focused before every physical action' }
+if (($script:focuses -join ',') -ne '42') { throw 'stale second frame focused target before native owner validation' }
+# Also reject a stale FIRST frame with zero activation or OS input.
+function Assert-CoordinateFrame($frame) { throw 'STALE_FRAME: process incarnation changed before focus' }
+$script:focuses = @()
+[Clf]::TestReset(0)
+$request = '{"op":"act","targetWindow":42,"frame":{"id":1},"actions":[{"type":"click","x":1,"y":1}]}' | ConvertFrom-Json
+$result = Handle-Request $request
+if ($result.ok -ne $false -or $result.error_code -ne 'STALE_FRAME' -or $script:focuses.Count -ne 0 -or [Clf]::TestCalls -ne 0) {
+  throw 'stale first frame focused or injected input before rejection'
+}
 [Clf]::TestReset(0)
 $request = '{"op":"act","frame":{"id":1},"actions":[{"type":"move","x":1,"y":1},{"type":"keypress","keys":["not-a-key"]}]}' | ConvertFrom-Json
 try { $null = Handle-Request $request; throw 'invalid key unexpectedly accepted' } catch {

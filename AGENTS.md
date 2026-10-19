@@ -5066,7 +5066,7 @@ identity; implicit foreground or unseeded observations never recover by guessing
 A short per-owner circuit breaker suppresses another UIA call to a crashed provider.
 A native process-creation FILETIME distinguishes recycled PID/HWND tuples; snapshots recheck
 that owner after capture/UI traversal, and window-bound coordinate input rechecks it
-before and after focus. Recovery
+before its first focus and again after focus. Recovery
 fails closed when this process-incarnation identity cannot be proved.
 If HWND reuse is proved by a UI-free breaker preflight, the replacement owner is
 the recovery identity for that observation; changing it again during the crash
