@@ -94,7 +94,7 @@ export function createWindowsComputerApi(backend: WindowsComputerBackend = { act
     if (!Number.isFinite(x) || !Number.isFinite(y) || x < 0 || y < 0 || x >= frame.width || y >= frame.height) {
       throw new ComputerError('COORDINATE_OUT_OF_BOUNDS: use coordinates inside the selected screenshot region.');
     }
-    const opts = { frameId: frame.frameId, window: frame.windowId, app: frame.app, ...(frame.windowId === window.id ? {} : { ownerWindow: window.id, ownerApp: window.app }) };
+    const opts = { frameId: frame.frameId, window: frame.windowId, app: frame.app, ...(frame.processStartTime ? { expectedProcessStartTime: frame.processStartTime } : {}), ...(frame.windowId === window.id ? {} : { ownerWindow: window.id, ownerApp: window.app }) };
     return { x, y, opts };
   }
   async function mutate(window: WindowsWindow | undefined, action: Action, opts?: Parameters<typeof act>[1]) {
@@ -104,8 +104,12 @@ export function createWindowsComputerApi(backend: WindowsComputerBackend = { act
     // A submitted input consumes observation authority even if the native operation fails.
     states.clear();
     const nativeOpts = opts ?? (window ? { window: window.id, app: window.app } : {});
-    await backend.act([action], window && validatedProcessStartTime
-      ? { ...nativeOpts, expectedProcessStartTime: validatedProcessStartTime }
+    // The facade owner is checked above, but related screenshot frames may target a
+    // different process. Never substitute the owner's creation time for that target.
+    const targetProcessStartTime = opts?.expectedProcessStartTime ??
+      (!opts || opts.window === window?.id ? validatedProcessStartTime : undefined);
+    await backend.act([action], window && targetProcessStartTime
+      ? { ...nativeOpts, expectedProcessStartTime: targetProcessStartTime }
       : nativeOpts);
   }
   return {

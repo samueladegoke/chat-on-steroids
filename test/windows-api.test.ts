@@ -40,6 +40,22 @@ describe('Windows Window2 interface', () => {
     expect(backend.act).toHaveBeenLastCalledWith([{ type: 'click', x: 15, y: 15, button: 'right', count: 2 }], { frameId: 2, window: 43, app: window.app, ownerWindow: 42, ownerApp: window.app });
     await expect(api.click({ window, x: 5, y: 5 })).rejects.toThrow('STALE_WINDOW_STATE');
   });
+  it('uses the popup process incarnation rather than the unchanged owner for cross-process popup coordinates', async () => {
+    const { api, backend, result } = fixture();
+    const ownerStart = '133000000000000101';
+    const popupStart = '133000000000000202';
+    result.window = { ...nativeWindow, processStartTime: ownerStart };
+    result.related = [{
+      window: { ...nativeWindow, id: 43, processStartTime: popupStart },
+      screenshot: { ...shot, frameId: 2, windowId: 43, region: { x: 250, y: 350, width: 150, height: 150 }, width: 75, height: 75 }
+    }];
+    await api.get_window_state({ window });
+    await api.click({ window, screenshotId: 'frame-2', x: 15, y: 15 });
+    expect(backend.act).toHaveBeenCalledWith(
+      [expect.objectContaining({ type: 'click', x: 15, y: 15 })],
+      expect.objectContaining({ window: 43, ownerWindow: 42, expectedProcessStartTime: popupStart })
+    );
+  });
   it('reports focus, incomplete accessibility and unavailable text while retaining usable pixels', async () => {
     const { api, result, backend } = fixture();
     Object.assign(result, { uiTruncated: true });

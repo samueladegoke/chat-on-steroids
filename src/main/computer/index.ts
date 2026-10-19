@@ -2003,6 +2003,7 @@ async function actLocked(
   let batchIndices: number[] = [];
   let reply: Record<string, any> | null = null;
   let helperUsed = false;
+  let needsCursorResample = false;
   const flush = async (): Promise<void> => {
     if (batch.length === 0) return;
     const sending = batch;
@@ -2036,6 +2037,7 @@ async function actLocked(
           : {})
       }, expected);
       helperUsed = true;
+      needsCursorResample = false;
       const helperRoutes = Array.isArray(reply['routes']) ? reply['routes'].map(String) : [];
       for (let index = 0; index < sending.length; index++) {
         const route = helperRoutes[index];
@@ -2118,6 +2120,7 @@ async function actLocked(
       if (ms > 0) await new Promise((resolve) => setTimeout(resolve, ms));
       routes.push('local');
       completedCount += 1;
+      if (helperUsed) needsCursorResample = true;
       continue;
     }
     if (action.type === 'read_clipboard') {
@@ -2132,6 +2135,7 @@ async function actLocked(
       }
       routes.push('local');
       completedCount += 1;
+      if (helperUsed) needsCursorResample = true;
       continue;
     }
     if (action.type === 'write_clipboard') {
@@ -2145,6 +2149,7 @@ async function actLocked(
       }
       routes.push('local');
       completedCount += 1;
+      if (helperUsed) needsCursorResample = true;
       continue;
     }
     batch.push(mapOne(action));
@@ -2152,12 +2157,19 @@ async function actLocked(
   }
   // A pure clipboard/wait batch must not depend on a native accessibility helper at all. This is
   // what makes the connector genuinely useful when the user granted only clipboard access or
-  // when the desktop helper is unavailable. Mixed desktop batches still take one final cursor
-  // sample after any trailing local wait/clipboard work so the pointer report remains current.
+  // when the desktop helper is unavailable. Native action acknowledgements already
+  // include a cursor; querying again after paste risks losing confirmed completion.
+  // Only local work after the last native reply can require a fresh pointer sample.
   if (batch.length > 0) {
     await flush();
-  } else if (helperUsed) {
-    reply = await runHelper({ op: 'cursor' });
+  } else if (helperUsed && needsCursorResample) {
+    try {
+      reply = await runHelper({ op: 'cursor' });
+    } catch {
+      // Cursor diagnostics are non-authoritative after acknowledged input.
+      // Never erase the completed routes or invite a replay of those mutations.
+      return { cursor: null, clipboard, completedCount, routes };
+    }
   }
 
   if (reply === null) return { cursor: null, clipboard, completedCount, routes };
@@ -2166,7 +2178,8 @@ async function actLocked(
   const sx = Number(raw?.x);
   const sy = Number(raw?.y);
   if (!Number.isFinite(sx) || !Number.isFinite(sy)) {
-    throw new ComputerError('The desktop helper returned an invalid pointer position.');
+    // The mutation may already have completed; only pointer metadata is missing.
+    return { cursor: null, clipboard, completedCount, routes };
   }
   const current = qualifiedFrame(requestedFrame ?? lastFrame, generationOfReply(reply));
   const image = current

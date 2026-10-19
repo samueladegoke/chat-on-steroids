@@ -840,7 +840,11 @@ function Act-UiElement($request) {
       # that last resort explicit and safe: the referenced window, not an overlay at the
       # same desktop coordinates, must be foreground before the pointer goes down.
       Write-UiaStage 'uia.action.bounds'
+      # UIA resolution/metadata can run arbitrary provider code and recycle the HWND.
+      # Verify the actual process incarnation before *any* fallback focus side effect.
+      Assert-InputOwner $id $request.ownerWindow $request.targetApp $request.ownerApp
       Assert-Focused $id
+      Assert-InputOwner $id $request.ownerWindow $request.targetApp $request.ownerApp
       $r = $element.Current.BoundingRectangle
       if ($r.Width -le 0 -or $r.Height -le 0) { throw "UI_ELEMENT_OFFSCREEN: the referenced element has no clickable bounds" }
       Assert-InputOwner $id $request.ownerWindow $request.targetApp $request.ownerApp

@@ -22,7 +22,7 @@ const fake = vi.hoisted(() => {
   const requests: Array<Record<string, any>> = [];
   const children: Array<Transport> = [];
   const clipboard = { writeText: vi.fn(async (_text: string) => {}), readText: vi.fn(async () => '') };
-  const overrides = { focusFailure: false, geometry: false, semanticOnly: false };
+  const overrides = { focusFailure: false, geometry: false, semanticOnly: false, cursorFailure: false };
   class Transport extends Emitter {
     readonly pid = 9000 + children.length;
     exitCode: number | null = null;
@@ -67,6 +67,9 @@ const fake = vi.hoisted(() => {
         routes: (request.actions ?? []).map(() => 'uia'),
         ...(request.__cosRequestId ? { __cosRequestId: request.__cosRequestId } : {})
       };
+      if (overrides.cursorFailure && request.op === 'cursor') {
+        Object.assign(reply, { ok: false, error_code: 'HELPER_EXITED', message: 'cursor transport failed after paste' });
+      }
       if (overrides.focusFailure && request.actions?.some((action: any) => action.type === 'focus')) {
         Object.assign(reply, { ok: false, error_code: 'FOCUS_FAILED', message: 'requested target is not foreground', completed_count: 0, failed_index: 0, routes: [] });
       }
@@ -123,6 +126,7 @@ describe.each(['stdio', 'addon'] as const)('Desktop reply provenance (%s)', (tra
     fake.overrides.focusFailure = false;
     fake.overrides.geometry = false;
     fake.overrides.semanticOnly = false;
+    fake.overrides.cursorFailure = false;
     Object.defineProperty(process, 'platform', { ...platform, value: transport === 'addon' ? 'darwin' : 'linux' });
     vi.stubEnv('COS_MACOS_DESKTOP_HELPER', '');
     computer = await import('../src/main/computer/index.js');
@@ -251,6 +255,9 @@ describe.each(['stdio', 'addon'] as const)('Desktop reply provenance (%s)', (tra
     const result = await computer.act([{ type: 'paste', text }], { window: 77 });
     expect(fake.clipboard.writeText).toHaveBeenCalledExactlyOnceWith(text);
     expect(result.completedCount).toBe(1);
+    // Native Ctrl+V acknowledgement already contains its cursor; a second
+    // diagnostic helper round-trip cannot be allowed to lose completed input.
+    expect(fake.requests.filter(request => request.op === 'cursor')).toHaveLength(0);
     expect(fake.requests.filter(request => request.op === 'act')).toMatchObject([
       { targetWindow: 77, actions: [{ type: 'focus', window: 77 }] },
       { targetWindow: 77, actions: [{ type: 'keypress', keys: ['ctrl', 'v'] }] }
@@ -258,6 +265,16 @@ describe.each(['stdio', 'addon'] as const)('Desktop reply provenance (%s)', (tra
     fake.clipboard.writeText.mockClear();
     await expect(computer.act([{ type: 'paste', text }, { type: 'write_clipboard', text: 'later' }], { window: 77 })).rejects.toThrow(/PASTE_SEQUENCE/);
     expect(fake.clipboard.writeText).not.toHaveBeenCalled();
+  });
+
+  it.runIf(transport === 'stdio')('preserves acknowledged paste after trailing cursor diagnostics fail', async () => {
+    Object.defineProperty(process, 'platform', { ...platform, value: 'win32' });
+    fake.overrides.cursorFailure = true;
+    const result = await computer.act([{ type: 'paste', text: 'sent once' }, { type: 'wait', ms: 0 }], { window: 77 });
+    expect(result).toMatchObject({ completedCount: 2, routes: ['uia', 'local'], cursor: null });
+    expect(fake.clipboard.writeText).toHaveBeenCalledExactlyOnceWith('sent once');
+    expect(fake.requests.filter(request => request.op === 'cursor')).toHaveLength(1);
+    expect(fake.requests.filter(request => request.op === 'act')).toHaveLength(2);
   });
 
   it.runIf(transport === 'stdio')('waits for asynchronous clipboard publication before injecting paste', async () => {
