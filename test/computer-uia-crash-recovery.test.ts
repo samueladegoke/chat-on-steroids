@@ -238,9 +238,12 @@ describe.runIf(process.platform === 'win32')('Windows UIA access-violation recov
 
     const actRequestsBeforeCrash = fake.requests.filter((request) => request.op === 'act').length;
     fake.state.crashNextAct = true;
-    await expect(act([{ type: 'click_ref', ref: third.elements[0]!.ref }], { window: 77 })).rejects.toThrow(
-      /PARTIAL_BATCH:.*UIA_PROCESS_CRASH/
-    );
+    // The helper crashed without acknowledging whether Invoke ran. Never report an exact
+    // completed_count=0: a caller could otherwise replay an already completed mutation.
+    await expect(act([{ type: 'click_ref', ref: third.elements[0]!.ref }], { window: 77 })).rejects.toMatchObject({
+      completedCount: null, failedIndex: null,
+      message: expect.stringMatching(/OUTCOME_UNCONFIRMED:.*UIA_PROCESS_CRASH/)
+    });
     expect(fake.children).toHaveLength(2);
     expect(fake.requests.filter((request) => request.op === 'act')).toHaveLength(actRequestsBeforeCrash + 1);
 

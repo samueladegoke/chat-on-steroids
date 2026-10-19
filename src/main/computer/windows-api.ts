@@ -94,7 +94,10 @@ export function createWindowsComputerApi(backend: WindowsComputerBackend = { act
     if (!Number.isFinite(x) || !Number.isFinite(y) || x < 0 || y < 0 || x >= frame.width || y >= frame.height) {
       throw new ComputerError('COORDINATE_OUT_OF_BOUNDS: use coordinates inside the selected screenshot region.');
     }
-    const opts = { frameId: frame.frameId, window: frame.windowId, app: frame.app, ...(frame.processStartTime ? { expectedProcessStartTime: frame.processStartTime } : {}), ...(frame.windowId === window.id ? {} : { ownerWindow: window.id, ownerApp: window.app }) };
+    if (frame.windowId !== window.id && frame.processStartTime && !state.processStartTime) {
+      throw new ComputerError('STALE_WINDOW_STATE: related popup owner process incarnation is unavailable');
+    }
+    const opts = { frameId: frame.frameId, window: frame.windowId, app: frame.app, ...(frame.processStartTime ? { expectedProcessStartTime: frame.processStartTime } : {}), ...(frame.windowId === window.id ? {} : { ownerWindow: window.id, ownerApp: window.app, ...(state.processStartTime ? { expectedOwnerProcessStartTime: state.processStartTime } : {}) }) };
     return { x, y, opts };
   }
   async function mutate(window: WindowsWindow | undefined, action: Action, opts?: Parameters<typeof act>[1]) {

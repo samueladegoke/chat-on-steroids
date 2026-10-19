@@ -22,7 +22,7 @@ const fake = vi.hoisted(() => {
   const requests: Array<Record<string, any>> = [];
   const children: Array<Transport> = [];
   const clipboard = { writeText: vi.fn(async (_text: string) => {}), readText: vi.fn(async () => '') };
-  const overrides = { focusFailure: false, geometry: false, semanticOnly: false, cursorFailure: false };
+  const overrides = { focusFailure: false, geometry: false, semanticOnly: false, cursorFailure: false, popupIdentitySwap: false };
   class Transport extends Emitter {
     readonly pid = 9000 + children.length;
     exitCode: number | null = null;
@@ -67,6 +67,12 @@ const fake = vi.hoisted(() => {
         routes: (request.actions ?? []).map(() => 'uia'),
         ...(request.__cosRequestId ? { __cosRequestId: request.__cosRequestId } : {})
       };
+      if (overrides.popupIdentitySwap && request.op === 'snapshot' && request.id === 77) {
+        Object.assign(reply, { relatedWindows: [{ ...window, id: 43, processStartTime: '133000000000000101' }] });
+      }
+      if (overrides.popupIdentitySwap && request.op === 'capture' && request.id === 43) {
+        Object.assign(reply, { window: { ...window, id: 43, processStartTime: '133000000000000202' } });
+      }
       if (overrides.cursorFailure && request.op === 'cursor') {
         Object.assign(reply, { ok: false, error_code: 'HELPER_EXITED', message: 'cursor transport failed after paste' });
       }
@@ -127,6 +133,7 @@ describe.each(['stdio', 'addon'] as const)('Desktop reply provenance (%s)', (tra
     fake.overrides.geometry = false;
     fake.overrides.semanticOnly = false;
     fake.overrides.cursorFailure = false;
+    fake.overrides.popupIdentitySwap = false;
     Object.defineProperty(process, 'platform', { ...platform, value: transport === 'addon' ? 'darwin' : 'linux' });
     vi.stubEnv('COS_MACOS_DESKTOP_HELPER', '');
     computer = await import('../src/main/computer/index.js');
@@ -142,6 +149,17 @@ describe.each(['stdio', 'addon'] as const)('Desktop reply provenance (%s)', (tra
     fake.children.at(-1)!.close();
     await computer.listWindows();
   };
+
+  it.runIf(transport === 'stdio')('does not publish a popup snapshot with an older enumeration incarnation', async () => {
+    Object.defineProperty(process, 'platform', { ...platform, value: 'win32' });
+    fake.overrides.popupIdentitySwap = true;
+    const state = await computer.getWindowState({ window: 77, includeRelated: true });
+    expect(state.related).toHaveLength(1);
+    expect(state.related?.[0]).toMatchObject({
+      window: { id: 43, processStartTime: '133000000000000101' },
+      screenshot: null, error: expect.stringMatching(/STALE_FRAME/)
+    });
+  });
 
   it('keeps older frames and refs usable while the same helper remains active', async () => {
     expect((await computer.listWindows()).windows[0]!.title).toBe('Example ä😀');

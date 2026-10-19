@@ -100,6 +100,14 @@ describe('desktop partial batch result', () => {
     });
   });
 
+  it('marks a missing native mutation receipt as ambiguous rather than an exact zero', async () => {
+    fake.setResponse({ ok: false, error_code: 'HELPER_EXITED', message: 'reply lost after input' });
+    await expect(act([{ type: 'type', text: 'may already be delivered' }])).rejects.toMatchObject({
+      completedCount: null, failedIndex: null, completedRoutes: null,
+      message: expect.stringMatching(/OUTCOME_UNCONFIRMED.*Do not repeat the unacknowledged input/)
+    });
+  });
+
   it('does not invent route evidence when the helper route list is malformed', async () => {
     fake.setResponse({
       ok: false,

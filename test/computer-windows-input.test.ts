@@ -73,6 +73,7 @@ if (([Clf]::TestEvents -join ',') -ne 'text:97:4,text:97:6,text:98:4,text:98:6,t
 $script:checks = 0
 $script:focuses = @()
 function Assert-Focused([int64]$id) { $script:focuses += $id }
+function Assert-PhysicalHit([int64]$id, [int]$x, [int]$y) { }
 function Assert-CoordinateFrame($frame) {
   if ($script:focuses.Count -ne $script:checks) { throw 'frame focus occurred before ownership validation' }
   $script:checks++
@@ -86,6 +87,17 @@ if ($result.ok -ne $false -or $result.completed_count -ne 1 -or $result.failed_i
   throw 'per-action stale frame did not preserve exact partial result'
 }
 if (($script:focuses -join ',') -ne '42') { throw 'stale second frame focused target before native owner validation' }
+# Identity/foreground can remain valid while a nonactivating popup covers input pixels.
+# Reject that hit before sending a single pointer event.
+function Assert-CoordinateFrame($frame) { Assert-Focused ([int64]$request.targetWindow) }
+function Assert-PhysicalHit([int64]$id, [int]$x, [int]$y) { throw 'OCCLUDED_TARGET: another window receives the pointer' }
+[Clf]::TestReset(0)
+$request = '{"op":"act","targetWindow":42,"frame":{"id":1},"actions":[{"type":"click","x":1,"y":1}]}' | ConvertFrom-Json
+$result = Handle-Request $request
+if ($result.ok -ne $false -or $result.error_code -ne 'OCCLUDED_TARGET' -or $result.completed_count -ne 0 -or [Clf]::TestCalls -ne 0) {
+  throw 'occluded coordinates were injected into a different window'
+}
+function Assert-PhysicalHit([int64]$id, [int]$x, [int]$y) { }
 # Also reject a stale FIRST frame with zero activation or OS input.
 function Assert-CoordinateFrame($frame) { throw 'STALE_FRAME: process incarnation changed before focus' }
 $script:focuses = @()

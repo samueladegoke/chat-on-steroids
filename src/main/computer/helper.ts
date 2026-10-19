@@ -73,6 +73,7 @@ public static class Clf {
   [DllImport("user32.dll")] static extern int GetSystemMetrics(int index);
   [DllImport("user32.dll")] static extern bool SetCursorPos(int x, int y);
   [DllImport("user32.dll")] static extern bool GetCursorPos(out POINT p);
+  [DllImport("user32.dll")] static extern IntPtr WindowFromPoint(POINT p);
   [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc cb, IntPtr lp);
   [DllImport("user32.dll", CharSet = CharSet.Unicode)]
   static extern int GetWindowTextW(IntPtr h, StringBuilder s, int max);
@@ -414,6 +415,14 @@ public static class Clf {
     return owner != IntPtr.Zero && IsRelatedWindow(window.ToInt64(), owner.ToInt64()) ? owner : IntPtr.Zero;
   }
 
+  // A nonactivating owned popup may cover a still-foreground owner window.
+  // WindowFromPoint resolves the actual top-level pointer receiver.
+  public static bool HitTargetsWindow(long handle, int x, int y) {
+    POINT p = new POINT(); p.X = x; p.Y = y;
+    IntPtr hit = WindowFromPoint(p);
+    return hit != IntPtr.Zero && GetAncestor(hit, 2) == GetAncestor(new IntPtr(handle), 2);
+  }
+
   public static bool InputIsFocused(long handle) {
     IntPtr window = new IntPtr(handle);
     if (!IsWindowVisible(window) || IsIconic(window)) return false;
@@ -738,7 +747,7 @@ function Get-UiActions($element, $current) {
   return @($actions.ToArray())
 }
 
-function Invoke-UiAction($element, [string]$action) {
+function Invoke-UiAction($element, [string]$action, [int64]$id, $owner, $targetApp, $ownerApp) {
   Write-UiaStage ("uia.action." + $action)
   # Explicit semantic actions never degrade to a click at guessed coordinates.
   $patternId = switch ($action) {
@@ -753,6 +762,7 @@ function Invoke-UiAction($element, [string]$action) {
   }
   if ($action -eq 'focus') {
     if (-not $element.Current.IsKeyboardFocusable) { throw 'UI_ACTION_UNSUPPORTED: element is not keyboard focusable' }
+    Assert-InputOwner $id $owner $targetApp $ownerApp
     $element.SetFocus()
     return
   }
@@ -760,6 +770,8 @@ function Invoke-UiAction($element, [string]$action) {
   if (-not $element.TryGetCurrentPattern($patternId, [ref]$pattern)) {
     throw "UI_ACTION_UNSUPPORTED: element does not currently support $action"
   }
+  # Acquiring a pattern may invoke a hostile provider. Check after all reads.
+  Assert-InputOwner $id $owner $targetApp $ownerApp
   switch ($action) {
     'invoke' { ([System.Windows.Automation.InvokePattern]$pattern).Invoke() }
     'toggle' { ([System.Windows.Automation.TogglePattern]$pattern).Toggle() }
@@ -778,6 +790,7 @@ function Invoke-UiAction($element, [string]$action) {
         if (-not $scroll.Current.HorizontallyScrollable) { throw 'UI_ACTION_UNSUPPORTED: element is not horizontally scrollable' }
         $horizontal = if ($action -eq 'scroll_left') { [System.Windows.Automation.ScrollAmount]::LargeDecrement } else { [System.Windows.Automation.ScrollAmount]::LargeIncrement }
       }
+      Assert-InputOwner $id $owner $targetApp $ownerApp
       $scroll.Scroll($horizontal, $vertical)
     }
   }
@@ -848,12 +861,18 @@ function Act-UiElement($request) {
       $r = $element.Current.BoundingRectangle
       if ($r.Width -le 0 -or $r.Height -le 0) { throw "UI_ELEMENT_OFFSCREEN: the referenced element has no clickable bounds" }
       Assert-InputOwner $id $request.ownerWindow $request.targetApp $request.ownerApp
-      [Clf]::Click([int][Math]::Round($r.X + $r.Width / 2), [int][Math]::Round($r.Y + $r.Height / 2), $button, $count)
+      # Bounds reads can also switch foreground. Revalidate before pointer-down.
+      Assert-Focused $id
+      Assert-InputOwner $id $request.ownerWindow $request.targetApp $request.ownerApp
+      $px = [int][Math]::Round($r.X + $r.Width / 2)
+      $py = [int][Math]::Round($r.Y + $r.Height / 2)
+      Assert-PhysicalHit $id $px $py
+      [Clf]::Click($px, $py, $button, $count)
       $route = 'sendinput'
     }
   } else {
     Assert-InputOwner $id $request.ownerWindow $request.targetApp $request.ownerApp
-    Invoke-UiAction $element $action
+    Invoke-UiAction $element $action $id $request.ownerWindow $request.targetApp $request.ownerApp
     $route = 'uia'
   }
   return @{ runtimeKey = $completedRuntimeKey; name = $completedElementName; route = $route }
@@ -1106,6 +1125,16 @@ function Assert-InputOwner([int64]$target, $owner, $targetApp, $ownerApp) {
       throw 'WINDOW_APP_MISMATCH: input target no longer belongs to the observed application'
     }
   }
+  if ($owner -and $script:ExpectedInputStartTime -and -not $script:ExpectedOwnerStartTime) {
+    throw 'STALE_WINDOW: popup owner process incarnation proof is unavailable'
+  }
+  if ($owner -and $script:ExpectedOwnerStartTime) {
+    $ownerCurrent = Get-WindowRow ([int64]$owner)
+    if ([string]$script:ExpectedOwnerStartTime -notmatch '^[0-9]{8,20}$' -or $null -eq $ownerCurrent -or
+        [string]$ownerCurrent.processStartTime -cne [string]$script:ExpectedOwnerStartTime) {
+      throw 'STALE_WINDOW: owner process incarnation changed before popup input'
+    }
+  }
   if ($ownerApp) {
     $ownerRow = if ($owner) { Get-WindowRow ([int64]$owner) } else { $null }
     if ($null -eq $ownerRow -or $ownerRow.app -cne [string]$ownerApp) {
@@ -1114,6 +1143,12 @@ function Assert-InputOwner([int64]$target, $owner, $targetApp, $ownerApp) {
   }
   if ($owner -and ($target -le 0 -or ($target -ne [int64]$owner -and -not [Clf]::IsRelatedWindow($target, [int64]$owner)))) {
     throw 'RELATED_WINDOW_GONE: input target no longer belongs to the observed window'
+  }
+}
+
+function Assert-PhysicalHit([int64]$id, [int]$x, [int]$y) {
+  if (-not [Clf]::InputIsFocused($id) -or -not [Clf]::HitTargetsWindow($id, $x, $y)) {
+    throw 'OCCLUDED_TARGET: the observed window does not own the input pixels'
   }
 }
 
@@ -1173,6 +1208,7 @@ function Handle-Request($request) {
   [Clf]::EnsureDpiAware()
   # Clear request-scoped input proof even if a prior helper request failed.
   $script:ExpectedInputStartTime = if ($request.op -eq 'act') { [string]$request.expectedProcessStartTime } else { '' }
+  $script:ExpectedOwnerStartTime = if ($request.op -eq 'act') { [string]$request.expectedOwnerProcessStartTime } else { '' }
   $script:ExpectedInputWindow = if ($request.op -eq 'act' -and $request.targetWindow) { [int64]$request.targetWindow } else { 0 }
   # UIA stage evidence belongs to one request only. stdout replies and stderr diagnostics are
   # independent pipes, so every stage carries the nonce minted by the parent transport for this
@@ -1341,6 +1377,15 @@ function Handle-Request($request) {
             Assert-CoordinateFrame $request.frame
           }
           Assert-InputOwner $actionTarget $request.ownerWindow $request.targetApp $request.ownerApp
+          # Foreground is not proof of the pixels under an owned/no-activate popup.
+          # Validate the top-level pointer receiver immediately before physical effects.
+          if ($actionTarget -gt 0 -and $a.type -in @('move','click','double_click','scroll')) {
+            Assert-PhysicalHit $actionTarget ([int]$a.x) ([int]$a.y)
+          } elseif ($actionTarget -gt 0 -and $a.type -eq 'drag') {
+            for ($point = 0; $point -lt $a.xs.Count; $point++) {
+              Assert-PhysicalHit $actionTarget ([int]$a.xs[$point]) ([int]$a.ys[$point])
+            }
+          }
           switch ($a.type) {
             'click_ui' {
               $ui = Act-UiElement @{ id = $a.window; snapshotId = $a.snapshotId; runtimeKey = $a.runtimeKey; action = 'click'; button = $a.button; count = (Get-RequestedClickCount $a); ownerWindow = $request.ownerWindow; targetApp = $request.targetApp; ownerApp = $request.ownerApp }

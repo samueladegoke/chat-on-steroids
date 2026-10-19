@@ -1365,6 +1365,11 @@ export async function getWindowState(opts: {
               ? await screenshotLocked({ window: relatedWindow.id, ownerWindow: window.id, maxWidth: limit }, undefined,
                   { generation: generationOfReply(reply), code: 'STALE_FRAME' })
               : null;
+            // Enumeration precedes this distinct native capture; reject an
+            // incarnation swap instead of publishing B2 pixels under B1 metadata.
+            if (relatedShot && (frameById(relatedShot.frameId)?.processStartTime ?? null) !== (relatedWindow.processStartTime ?? null)) {
+              throw new ComputerError('STALE_FRAME: related popup changed process incarnation between enumeration and capture');
+            }
             related.push({ window: relatedWindow, screenshot: relatedShot });
           } catch (err) {
             // A disappearing popup must not discard the useful main-window observation.
@@ -1641,7 +1646,7 @@ export interface PointerResult {
 
 export async function act(
   actions: Action[],
-  opts: { frameId?: number; window?: number; ownerWindow?: number; app?: string; ownerApp?: string; expectedProcessStartTime?: string } = {}
+  opts: { frameId?: number; window?: number; ownerWindow?: number; app?: string; ownerApp?: string; expectedProcessStartTime?: string; expectedOwnerProcessStartTime?: string } = {}
 ): Promise<ActionResult> {
   return exclusive(() => actLocked(actions, opts));
 }
@@ -1801,7 +1806,7 @@ async function verifyDesktopLocked(spec: VerificationSpec): Promise<Verification
 
 async function actLocked(
   actions: Action[],
-  opts: { frameId?: number; window?: number; ownerWindow?: number; app?: string; ownerApp?: string; expectedProcessStartTime?: string }
+  opts: { frameId?: number; window?: number; ownerWindow?: number; app?: string; ownerApp?: string; expectedProcessStartTime?: string; expectedOwnerProcessStartTime?: string }
 ): Promise<ActionResult> {
   const requestedWindowsIdentity = process.platform === 'win32' && opts.window !== undefined
     ? windowsKnownWindowIdentities.get(opts.window) ?? null
@@ -1842,6 +1847,9 @@ async function actLocked(
     throw new ComputerError(
       'FRAME_REQUIRED: coordinate actions must include the frameId returned with the screenshot they came from.'
     );
+  }
+  if (opts.ownerWindow !== undefined && opts.expectedProcessStartTime && !opts.expectedOwnerProcessStartTime) {
+    throw new ComputerError('STALE_WINDOW: popup owner process incarnation must be proven independently from the target');
   }
   const requestedFrame = frameById(opts.frameId);
   // Keep a small immutable history so an unrelated observation does not invalidate a
@@ -2016,6 +2024,7 @@ async function actLocked(
         actions: sending,
         ...(opts.window === undefined ? {} : { targetWindow: opts.window }),
         ...(opts.ownerWindow === undefined ? {} : { ownerWindow: opts.ownerWindow }),
+        ...(opts.expectedOwnerProcessStartTime === undefined ? {} : { expectedOwnerProcessStartTime: opts.expectedOwnerProcessStartTime }),
         ...(opts.app === undefined ? {} : { targetApp: opts.app }),
         ...(opts.ownerApp === undefined ? {} : { ownerApp: opts.ownerApp }),
         ...(expectedInputStartTime === undefined ? {} : { expectedProcessStartTime: expectedInputStartTime }),
@@ -2056,8 +2065,18 @@ async function actLocked(
         // from immediately crashing a fresh helper on the same proven provider identity.
         rememberWindowsUiaCrashIdentity(opts.window, requestedWindowsIdentity, uiaCrash);
       }
-      const partial = err instanceof ComputerError ? (err.completedCount ?? 0) : 0;
-      const failedBatchIndex = err instanceof ComputerError ? (err.failedIndex ?? partial) : partial;
+      // Missing native acknowledgement is not evidence that no action executed.
+      // An exact partial receipt may be counted; a transport failure is ambiguous.
+      const exactPartial = err instanceof ComputerError && err.completedCount !== null && err.failedIndex !== null;
+      if (!exactPartial) {
+        const message = err instanceof Error ? err.message : String(err);
+        throw new ComputerError(
+          `OUTCOME_UNCONFIRMED: acknowledged_prefix=${completedCount} routes=${routes.join('+') || 'none'}; native action completion is unknown. Do not repeat the unacknowledged input. ${message}`,
+          { ...(routes.length ? { completedRoutes: [...routes] } : {}) }
+        );
+      }
+      const partial = err.completedCount!;
+      const failedBatchIndex = err.failedIndex!;
       const helperRoutes = err instanceof ComputerError ? err.completedRoutes : null;
       const hasExactPartialRoutes = helperRoutes !== null && helperRoutes.length === partial;
       if (hasExactPartialRoutes) routes.push(...helperRoutes);
@@ -2091,6 +2110,7 @@ async function actLocked(
           ...(opts.app === undefined ? {} : { targetApp: opts.app }),
           ...(expectedInputStartTime === undefined ? {} : { expectedProcessStartTime: expectedInputStartTime }),
           ...(opts.ownerWindow === undefined ? {} : { ownerWindow: opts.ownerWindow }),
+          ...(opts.expectedOwnerProcessStartTime === undefined ? {} : { expectedOwnerProcessStartTime: opts.expectedOwnerProcessStartTime }),
           ...(opts.ownerApp === undefined ? {} : { ownerApp: opts.ownerApp }) }, expected);
         // Clipboard publication remains owned by Electron. The next native action targets
         // the explicitly selected window; it is one authored paste, not two counted steps.
@@ -2108,7 +2128,8 @@ async function actLocked(
         const partial = err instanceof ComputerError ? err : null;
         throw new ComputerError(
           `${err instanceof Error ? err.message : String(err)}. Clipboard text was replaced; paste delivery is not confirmed.`,
-          { completedCount: partial?.completedCount ?? completedCount, failedIndex: partial?.failedIndex ?? index,
+          { ...(partial?.completedCount === null ? {} : { completedCount: partial?.completedCount ?? completedCount }),
+            ...(partial?.failedIndex === null ? {} : { failedIndex: partial?.failedIndex ?? index }),
             ...(partial?.completedRoutes ? { completedRoutes: partial.completedRoutes } : {}) }
         );
       }
