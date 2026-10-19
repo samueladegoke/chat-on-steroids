@@ -107,12 +107,10 @@ function Start-AppExecutable([string]$path) {
   $start = New-Object System.Diagnostics.ProcessStartInfo
   $start.FileName = $path
   $start.Arguments = ''
-  $start.UseShellExecute = $false
-  # Explicit executables must not inherit this long-lived helper's stdin/stdout/stderr pipes.
-  # A console child that inherits them can consume future JSON requests or inject fake replies.
-  # CREATE_NO_WINDOW detaches console stdio while still allowing ordinary GUI executables to
-  # create their own top-level windows; the exact executable path and zero arguments are retained.
-  $start.CreateNoWindow = $true
+  # ShellExecute opens an exact resolved executable, not a shell command or argument string.
+  # Unlike CREATE_NO_WINDOW, it gives console apps their own visible console instead of
+  # hiding them; launch through the shell rather than inheriting this helper's stdio pipes.
+  $start.UseShellExecute = $true
   $start.WorkingDirectory = [IO.Path]::GetDirectoryName($path)
   $process = [System.Diagnostics.Process]::Start($start)
   if ($null -eq $process) { throw 'APP_LAUNCH_FAILED: Windows did not start the executable' }
@@ -164,7 +162,7 @@ function Invoke-WindowsAppsCatalog($request, [bool]$launch) {
         throw 'APP_NOT_FOUND: app ID or executable was not found; list apps or provide an existing .exe path/name'
       }
       # Catalog items keep their native launch verb; explicit executables above use
-      # ProcessStartInfo with no shell and no command-line arguments.
+      # ProcessStartInfo ShellExecute on a validated executable path, without arguments.
       $selected.InvokeVerb('open')
       return @{ app = $appId; displayName = $selectedName; status = 'launch_requested'; windowConfirmed = $false }
     }
