@@ -5066,8 +5066,14 @@ identity; implicit foreground or unseeded observations never recover by guessing
 A short per-owner circuit breaker suppresses another UIA call to a crashed provider.
 A native process-creation FILETIME distinguishes recycled PID/HWND tuples; snapshots recheck
 that owner after capture/UI traversal, and window-bound coordinate input rechecks it
-before its first focus and again after focus. Recovery
-fails closed when this process-incarnation identity cannot be proved.
+before its first focus and again after focus. Each window-targeted keyboard, text,
+focus or paste request also carries a freshly verified process-creation identity
+into the native dispatcher; an owner change fails before native focus/input.
+Once a semantic UI action succeeds, later provider metadata reads must not turn
+its completion receipt into a failure. When both screenshot and accessibility
+channels fail, report an explicit observation failure even if metadata is available;
+preserve the native crash breaker. Recovery fails closed when this process-incarnation
+identity cannot be proved.
 If HWND reuse is proved by a UI-free breaker preflight, the replacement owner is
 the recovery identity for that observation; changing it again during the crash
 fails `STALE_WINDOW`. Semantic input is never replayed. WPF and unidentified

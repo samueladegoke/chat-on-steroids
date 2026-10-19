@@ -359,10 +359,8 @@ describe.runIf(process.platform === 'win32')('Windows UIA access-violation recov
     fake.state.crashNextSnapshot = true;
     fake.state.captureNextUiFree = true;
     const from = fake.requests.length;
-    const recovered = await getWindowState({ window: 77, includeScreenshot: true, includeUi: true });
-    expect(recovered.uiUnavailable?.code).toBe('UIA_PROCESS_CRASH');
-    expect(recovered.screenshotUnavailable?.code).toBe('CAPTURE_FAILED');
-    expect(recovered.elements).toEqual([]);
+    await expect(getWindowState({ window: 77, includeScreenshot: true, includeUi: true }))
+      .rejects.toThrow(/OBSERVATION_FAILED:.*CAPTURE_FAILED.*UIA_PROCESS_CRASH/);
     expect(fake.requests.slice(from).map((x: any) => [x.includeUi, x.includeScreenshot])).toEqual([
       [true, true], [false, true], [false, false]
     ]);

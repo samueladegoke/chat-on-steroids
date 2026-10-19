@@ -66,12 +66,13 @@ export function createWindowsComputerApi(backend: WindowsComputerBackend = { act
   // Pending observations occupy the same bounded map. Replacing an entry fences late results.
   const states = new Map<number, { state?: State }>();
   const parse = <K extends keyof typeof WINDOWS_API_SCHEMAS>(method: K, input: unknown): z.infer<(typeof WINDOWS_API_SCHEMAS)[K]> => WINDOWS_API_SCHEMAS[method].parse(input ?? {}) as z.infer<(typeof WINDOWS_API_SCHEMAS)[K]>;
-  async function current(window: WindowsWindow): Promise<void> {
+  async function current(window: WindowsWindow): Promise<string | undefined> {
     const live = (await backend.getWindowState({ window: window.id, includeScreenshot: false, includeUi: false, includeRelated: false })).window;
     const found = publicWindow(live);
     if (found.app !== window.app) throw new ComputerError('STALE_WINDOW: app identity changed; get the window again.');
     const observed = states.get(window.id)?.state?.processStartTime;
     if (observed && live.processStartTime !== observed) throw new ComputerError('STALE_WINDOW: native process incarnation changed; get a fresh window state.');
+    return live.processStartTime;
   }
   function stateFor(window: WindowsWindow): State {
     const state = states.get(window.id)?.state;
@@ -98,11 +99,14 @@ export function createWindowsComputerApi(backend: WindowsComputerBackend = { act
   }
   async function mutate(window: WindowsWindow | undefined, action: Action, opts?: Parameters<typeof act>[1]) {
     const expected = window ? states.get(window.id) : undefined;
-    if (window) await current(window);
+    const validatedProcessStartTime = window ? await current(window) : undefined;
     if (window && states.get(window.id) !== expected) throw new ComputerError('STALE_WINDOW_STATE: observation changed before input.');
     // A submitted input consumes observation authority even if the native operation fails.
     states.clear();
-    await backend.act([action], opts ?? (window ? { window: window.id, app: window.app } : {}));
+    const nativeOpts = opts ?? (window ? { window: window.id, app: window.app } : {});
+    await backend.act([action], window && validatedProcessStartTime
+      ? { ...nativeOpts, expectedProcessStartTime: validatedProcessStartTime }
+      : nativeOpts);
   }
   return {
     target: 'windows' as const,

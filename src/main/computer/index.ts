@@ -1348,6 +1348,11 @@ export async function getWindowState(opts: {
             }
           : null
       );
+      if (includeScreenshot && includeUi && screenshotUnavailable && uiUnavailable) {
+        // A metadata-only fallback is not successful observation when both requested
+        // channels failed. Install the UIA crash breaker first, then fail explicitly.
+        throw new ComputerError(`OBSERVATION_FAILED: ${screenshotUnavailable.code}: ${screenshotUnavailable.message}; ${uiUnavailable.code}: ${uiUnavailable.message}`);
+      }
       const found = includeUi && uiUnavailable === null
         ? await findUiLocked({ window: window.id, maxResults: opts.maxElements ?? 60 }, frame, reply)
         : { window: window.id, snapshotId: null, elements: [] as UiElementInfo[], accessibility: undefined };
@@ -1636,7 +1641,7 @@ export interface PointerResult {
 
 export async function act(
   actions: Action[],
-  opts: { frameId?: number; window?: number; ownerWindow?: number; app?: string; ownerApp?: string } = {}
+  opts: { frameId?: number; window?: number; ownerWindow?: number; app?: string; ownerApp?: string; expectedProcessStartTime?: string } = {}
 ): Promise<ActionResult> {
   return exclusive(() => actLocked(actions, opts));
 }
@@ -1796,11 +1801,13 @@ async function verifyDesktopLocked(spec: VerificationSpec): Promise<Verification
 
 async function actLocked(
   actions: Action[],
-  opts: { frameId?: number; window?: number; ownerWindow?: number; app?: string; ownerApp?: string }
+  opts: { frameId?: number; window?: number; ownerWindow?: number; app?: string; ownerApp?: string; expectedProcessStartTime?: string }
 ): Promise<ActionResult> {
   const requestedWindowsIdentity = process.platform === 'win32' && opts.window !== undefined
     ? windowsKnownWindowIdentities.get(opts.window) ?? null
     : null;
+  const expectedInputStartTime = opts.expectedProcessStartTime ??
+    (requestedWindowsIdentity?.split('\u001f').at(-1) || undefined);
   if (process.platform !== 'win32' && actions.some(action => action.type === 'paste' || action.type === 'launch_app' || action.type === 'ui_action')) {
     throw new ComputerError('ACTION_UNSUPPORTED: paste, launch_app and ui_action are currently Windows only.');
   }
@@ -2010,6 +2017,7 @@ async function actLocked(
         ...(opts.ownerWindow === undefined ? {} : { ownerWindow: opts.ownerWindow }),
         ...(opts.app === undefined ? {} : { targetApp: opts.app }),
         ...(opts.ownerApp === undefined ? {} : { ownerApp: opts.ownerApp }),
+        ...(expectedInputStartTime === undefined ? {} : { expectedProcessStartTime: expectedInputStartTime }),
         ...(needsFrame
           ? {
               frame: {
@@ -2079,6 +2087,7 @@ async function actLocked(
         await runHelper({ op: 'act', actions: [{ type: 'focus', window: opts.window }],
           targetWindow: opts.window,
           ...(opts.app === undefined ? {} : { targetApp: opts.app }),
+          ...(expectedInputStartTime === undefined ? {} : { expectedProcessStartTime: expectedInputStartTime }),
           ...(opts.ownerWindow === undefined ? {} : { ownerWindow: opts.ownerWindow }),
           ...(opts.ownerApp === undefined ? {} : { ownerApp: opts.ownerApp }) }, expected);
         // Clipboard publication remains owned by Electron. The next native action targets

@@ -800,6 +800,9 @@ function Act-UiElement($request) {
   Write-UiaStage 'uia.action.resolve'
   $element = Resolve-UiElement $id ([int]$request.snapshotId) ([string]$request.runtimeKey)
   if (-not $element.Current.IsEnabled) { throw "UI_ELEMENT_DISABLED: the referenced element is disabled" }
+  # Cache diagnostic metadata before the mutation; Invoke can destroy its own provider.
+  $completedElementName = try { [string]$element.Current.Name } catch { '' }
+  $completedRuntimeKey = [string]$request.runtimeKey
   if ($action -eq 'set_value') {
     Write-UiaStage 'uia.action.set_value'
     $pattern = $null
@@ -849,7 +852,7 @@ function Act-UiElement($request) {
     Invoke-UiAction $element $action
     $route = 'uia'
   }
-  return @{ runtimeKey = (Ui-RuntimeKey $element); name = [string]$element.Current.Name; route = $route }
+  return @{ runtimeKey = $completedRuntimeKey; name = $completedElementName; route = $route }
 }
 
 function Find-UiElements($request) {
@@ -1084,6 +1087,15 @@ function Capture-Target($request, [Nullable[int64]]$forcedWindow) {
 }
 
 function Assert-InputOwner([int64]$target, $owner, $targetApp, $ownerApp) {
+  # The exact creation time established by the previous observation stays attached
+  # to all native input, not merely pointer frames. Verify before every side effect.
+  if ($script:ExpectedInputStartTime -and $target -eq [int64]$script:ExpectedInputWindow) {
+    $now = Get-WindowRow $target
+    if ([string]$script:ExpectedInputStartTime -notmatch '^[0-9]{8,20}$' -or
+        $null -eq $now -or [string]$now.processStartTime -cne [string]$script:ExpectedInputStartTime) {
+      throw 'STALE_WINDOW: target process incarnation changed before input'
+    }
+  }
   if ($targetApp) {
     $targetRow = Get-WindowRow $target
     if ($null -eq $targetRow -or $targetRow.app -cne [string]$targetApp) {
@@ -1155,6 +1167,9 @@ function Assert-SnapshotOwner($original, $current) {
 
 function Handle-Request($request) {
   [Clf]::EnsureDpiAware()
+  # Clear request-scoped input proof even if a prior helper request failed.
+  $script:ExpectedInputStartTime = if ($request.op -eq 'act') { [string]$request.expectedProcessStartTime } else { '' }
+  $script:ExpectedInputWindow = if ($request.op -eq 'act' -and $request.targetWindow) { [int64]$request.targetWindow } else { 0 }
   # UIA stage evidence belongs to one request only. stdout replies and stderr diagnostics are
   # independent pipes, so every stage carries the nonce minted by the parent transport for this
   # exact request. Unknown/malformed request ids deliberately disable UIA crash classification.

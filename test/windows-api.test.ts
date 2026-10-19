@@ -100,10 +100,32 @@ describe('Windows Window2 interface', () => {
     await api.type_text({ window, text: 'first\nsecond' });
     expect(backend.act).toHaveBeenLastCalledWith([{ type: 'paste', text: 'first\nsecond' }], { window: 42, app: window.app });
   });
+  it('carries the observed process incarnation across keyboard and focus action preflight', async () => {
+    const { api, backend, result } = fixture();
+    const incarnation = '133000000000000101';
+    result.window = { ...nativeWindow, processStartTime: incarnation };
+    await api.get_window_state({ window });
+    await api.press_key({ window, key: 'Control_L+A' });
+    expect(backend.act).toHaveBeenLastCalledWith(
+      [{ type: 'keypress', keys: ['Control_L', 'A'] }],
+      expect.objectContaining({ window: 42, app: window.app, expectedProcessStartTime: incarnation })
+    );
+    await api.type_text({ window, text: 'new text' });
+    expect(backend.act).toHaveBeenLastCalledWith(
+      [{ type: 'type', text: 'new text' }],
+      expect.objectContaining({ window: 42, app: window.app, expectedProcessStartTime: incarnation })
+    );
+    await api.activate_window({ window });
+    expect(backend.act).toHaveBeenLastCalledWith(
+      [{ type: 'focus', window: 42 }],
+      expect.objectContaining({ window: 42, app: window.app, expectedProcessStartTime: incarnation })
+    );
+  });
   it('rejects a coordinate click when the same HWND, PID and app refer to a new process incarnation', async () => {
     const { api, backend } = fixture();
     const original = '133000000000000101';
     const recycled = '133000000000000202';
+    const prior = nativeWindow.processStartTime;
     nativeWindow.processStartTime = original;
     await api.get_window_state({ window });
     vi.mocked(backend.getWindowState).mockResolvedValueOnce({
@@ -112,7 +134,7 @@ describe('Windows Window2 interface', () => {
     });
     await expect(api.click({ window, screenshotId: 'frame-1', x: 10, y: 10 })).rejects.toThrow('STALE_WINDOW');
     expect(backend.act).not.toHaveBeenCalled();
-    nativeWindow.processStartTime = original;
+    nativeWindow.processStartTime = prior;
   });
 
   it('rejects wrong app identities and screenshot ids from a replaced observation', async () => {

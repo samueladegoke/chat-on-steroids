@@ -127,6 +127,16 @@ function Find-UiElements($request) { throw 'provider unavailable' }
 try { $null = Handle-Request $request; throw 'two unavailable channels were presented as success' } catch {
   if ($_.Exception.Message -notmatch 'CAPTURE_FAILED:.*UIA_FAILED:') { throw }
 }
+# A Window2 preflight proved A, but B may reuse the HWND before this native action.
+# No keyboard injection or even focus is allowed after that replacement.
+function Get-WindowRow([int64]$id) { return @{ id=$id; title='Replaced owner'; app='fixture.exe'; processId=101; processPath='C:\Apps\fixture.exe'; processStartTime='133000000000000202' } }
+$script:focuses = @()
+[Clf]::TestReset(0)
+$request = '{"op":"act","targetWindow":42,"targetApp":"fixture.exe","expectedProcessStartTime":"133000000000000101","actions":[{"type":"type","text":"unsafe"}]}' | ConvertFrom-Json
+$result = Handle-Request $request
+if ($result.ok -ne $false -or $result.error_code -ne 'STALE_WINDOW' -or $script:focuses.Count -ne 0 -or [Clf]::TestCalls -ne 0) {
+  throw 'recycled process received input or focus after a validated facade preflight'
+}
 Write-Output 'WINDOWS_INPUT_PROBE_OK'
 `;
     const dir = mkdtempSync(path.join(tmpdir(), 'cos-input-test-'));
