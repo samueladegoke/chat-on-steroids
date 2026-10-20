@@ -98,6 +98,21 @@ if ($result.ok -ne $false -or $result.error_code -ne 'OCCLUDED_TARGET' -or $resu
   throw 'occluded coordinates were injected into a different window'
 }
 function Assert-PhysicalHit([int64]$id, [int]$x, [int]$y) { }
+# A drag starts in a verified target window but may end in another application.
+# Only its pointer-down pixel is subject to the starting window's physical-hit gate.
+$script:checkedDragPoints = @()
+function Assert-PhysicalHit([int64]$id, [int]$x, [int]$y) {
+  $script:checkedDragPoints += "$x,$y"
+  if ($x -ne 10) { throw 'OCCLUDED_TARGET: drag end incorrectly attributed to source window' }
+}
+[Clf]::TestReset(0)
+$request = '{"op":"act","targetWindow":42,"frame":{"id":1},"actions":[{"type":"drag","xs":[10,900],"ys":[20,30],"button":"left","durationMs":50}]}' | ConvertFrom-Json
+$result = Handle-Request $request
+if ($result.ok -ne $true -or $result.completed_count -ne 1 -or ($script:checkedDragPoints -join ',') -ne '10,20' -or [Clf]::TestCalls -eq 0) {
+  throw ('CROSS_WINDOW_DRAG_REFUSED_OR_RECHECKED_DESTINATION: ' + ($result | ConvertTo-Json -Compress))
+}
+Write-Output 'CROSS_WINDOW_DRAG_STARTED_WITH_VERIFIED_POINTER_DOWN'
+function Assert-PhysicalHit([int64]$id, [int]$x, [int]$y) { }
 # Also reject a stale FIRST frame with zero activation or OS input.
 function Assert-CoordinateFrame($frame) { throw 'STALE_FRAME: process incarnation changed before focus' }
 $script:focuses = @()

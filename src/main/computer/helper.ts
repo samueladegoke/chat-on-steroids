@@ -416,11 +416,12 @@ public static class Clf {
   }
 
   // A nonactivating owned popup may cover a still-foreground owner window.
-  // WindowFromPoint resolves the actual top-level pointer receiver.
+  // GA_ROOTOWNER includes its menus, but rejects an unrelated top-level overlay.
   public static bool HitTargetsWindow(long handle, int x, int y) {
     POINT p = new POINT(); p.X = x; p.Y = y;
     IntPtr hit = WindowFromPoint(p);
-    return hit != IntPtr.Zero && GetAncestor(hit, 2) == GetAncestor(new IntPtr(handle), 2);
+    IntPtr receiverOwner = hit != IntPtr.Zero ? GetAncestor(hit, 3) : IntPtr.Zero;
+    return receiverOwner != IntPtr.Zero && receiverOwner == GetAncestor(new IntPtr(handle), 3);
   }
 
   public static bool InputIsFocused(long handle) {
@@ -1382,9 +1383,7 @@ function Handle-Request($request) {
           if ($actionTarget -gt 0 -and $a.type -in @('move','click','double_click','scroll')) {
             Assert-PhysicalHit $actionTarget ([int]$a.x) ([int]$a.y)
           } elseif ($actionTarget -gt 0 -and $a.type -eq 'drag') {
-            for ($point = 0; $point -lt $a.xs.Count; $point++) {
-              Assert-PhysicalHit $actionTarget ([int]$a.xs[$point]) ([int]$a.ys[$point])
-            }
+            Assert-PhysicalHit $actionTarget ([int]$a.xs[0]) ([int]$a.ys[0])
           }
           switch ($a.type) {
             'click_ui' {

@@ -6,6 +6,45 @@ import { describe, expect, it } from 'vitest';
 import { HELPER_SCRIPT } from '../src/main/computer/helper.js';
 
 describe.runIf(process.platform === 'win32')('native physical hit receiver validation', () => {
+  it('accepts an owned context-menu popup but rejects an unrelated no-activate overlay', () => {
+    // Compile the production HitTargetsWindow against deterministic ownership
+    // fixtures; no windows, focus or OS input are modified.
+    const method = '  public static bool HitTargetsWindow(long handle, int x, int y) {' +
+      HELPER_SCRIPT.split('  public static bool HitTargetsWindow(long handle, int x, int y) {')[1]?.split('  public static bool InputIsFocused(')[0];
+    expect(method).toContain('GetAncestor');
+    const fixture = String.raw`
+$ErrorActionPreference = 'Stop'
+Add-Type -TypeDefinition @"
+using System;
+public static class Clf {
+  public struct POINT { public int X, Y; }
+  static IntPtr WindowFromPoint(POINT p) { return new IntPtr(p.X); }
+  static IntPtr GetAncestor(IntPtr hwnd, uint kind) {
+    if (kind == 2) return hwnd; // GA_ROOT leaves the owned popup separate
+    if (kind == 3 && hwnd.ToInt64() == 201) return new IntPtr(100); // GA_ROOTOWNER
+    return hwnd; // foreign no-activate overlay 301 is independent
+  }
+` + method + String.raw`
+}
+"@
+if (-not [Clf]::HitTargetsWindow(100, 100, 0)) { throw 'TARGET_WINDOW_REJECTED' }
+if (-not [Clf]::HitTargetsWindow(100, 201, 0)) { throw 'OWNED_MENU_REJECTED' }
+if ([Clf]::HitTargetsWindow(100, 301, 0)) { throw 'FOREIGN_OVERLAY_ACCEPTED' }
+if ([Clf]::HitTargetsWindow(100, 0, 0)) { throw 'NULL_HIT_ACCEPTED' }
+Write-Output 'OWNED_POPUP_ALLOWED_FOREIGN_OVERLAY_DENIED'
+`;
+    const dir = mkdtempSync(path.join(tmpdir(), 'cos-owner-hit-'));
+    try {
+      const script = path.join(dir, 'owner-hit.ps1');
+      writeFileSync(script, fixture, 'utf8');
+      const result = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', script], {
+        encoding: 'utf8', windowsHide: true, timeout: 25_000
+      });
+      expect(result.status, result.stderr + result.stdout).toBe(0);
+      expect(result.stdout).toContain('OWNED_POPUP_ALLOWED_FOREIGN_OVERLAY_DENIED');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
   it('rejects an overlay before physical indexed-click sends any OS input', () => {
     const hit = 'function Assert-PhysicalHit([int64]$id, [int]$x, [int]$y) {' +
       HELPER_SCRIPT.split('function Assert-PhysicalHit([int64]$id, [int]$x, [int]$y) {')[1]?.split('function Assert-CoordinateFrame(')[0];
