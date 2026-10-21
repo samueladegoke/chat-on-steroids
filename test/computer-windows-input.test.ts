@@ -17,6 +17,7 @@ describe.runIf(process.platform === 'win32')('compiled Windows input failure rec
   public static List<string> TestMoves = new List<string>();
   public static List<int> TestWheels = new List<int>();
   public static int TestFailCall, TestCalls;
+  public static long TestForeignRoot;
   public static void TestReset(int failCall) { TestEvents.Clear(); TestMoves.Clear(); TestWheels.Clear(); TestCalls = 0; TestFailCall = failCall; }
   static uint SendInput(uint n, INPUT[] inputs, int size) {
     TestCalls++;
@@ -26,7 +27,9 @@ describe.runIf(process.platform === 'win32')('compiled Windows input failure rec
     return TestCalls == TestFailCall ? n - 1 : n;
   }`)
       .replace('[DllImport("user32.dll")] static extern int GetSystemMetrics(int index);',
-        'static int GetSystemMetrics(int index) { return index == 78 || index == 79 ? 1000 : 0; }');
+        'static int GetSystemMetrics(int index) { return index == 78 || index == 79 ? 1000 : 0; }')
+      .replace('public static long ForeignInputRoot(long handle) {',
+        'public static long ForeignInputRoot(long handle) {\n    if (TestForeignRoot != 0) return TestForeignRoot;');
     const assertions = String.raw`
 [Clf]::TestReset(3)
 try { [Clf]::Drag([int[]]@(1,2), [int[]]@(1,2), 'left'); throw 'drag unexpectedly succeeded' } catch {
@@ -164,6 +167,29 @@ $result = Handle-Request $request
 if ($result.ok -ne $false -or $result.error_code -ne 'STALE_WINDOW' -or $script:focuses.Count -ne 0 -or [Clf]::TestCalls -ne 0) {
   throw 'recycled process received input or focus after a validated facade preflight'
 }
+# Keys for a no-activate popup reach its input root. When that root belongs to another
+# process, the popup's own incarnation proves nothing about it: refuse before focus or keys.
+function Assert-InputOwner([int64]$target, $owner, $targetApp, $ownerApp) { }
+[Clf]::TestForeignRoot = 77
+foreach ($json in @(
+  '{"op":"act","targetWindow":42,"actions":[{"type":"type","text":"x"}]}',
+  '{"op":"act","targetWindow":42,"ownerWindow":77,"actions":[{"type":"type","text":"x"}]}',
+  '{"op":"act","targetWindow":42,"ownerWindow":78,"expectedOwnerProcessStartTime":"133000000000000202","actions":[{"type":"type","text":"x"}]}',
+  '{"op":"act","actions":[{"type":"focus","window":42}]}')) {
+  $script:focuses = @()
+  [Clf]::TestReset(0)
+  $result = Handle-Request ($json | ConvertFrom-Json)
+  if ($result.ok -ne $false -or $result.error_code -ne 'STALE_WINDOW' -or $script:focuses.Count -ne 0 -or [Clf]::TestCalls -ne 0) {
+    throw ('FOREIGN_INPUT_ROOT_RECEIVED_INPUT: ' + $json)
+  }
+}
+$script:focuses = @()
+[Clf]::TestReset(0)
+$result = Handle-Request ('{"op":"act","targetWindow":42,"ownerWindow":77,"expectedOwnerProcessStartTime":"133000000000000202","actions":[{"type":"type","text":"x"}]}' | ConvertFrom-Json)
+if ($result.ok -ne $true -or ($script:focuses -join ',') -ne '42' -or [Clf]::TestCalls -eq 0) {
+  throw ('PROVEN_POPUP_OWNER_REFUSED: ' + ($result | ConvertTo-Json -Compress))
+}
+[Clf]::TestForeignRoot = 0
 Write-Output 'WINDOWS_INPUT_PROBE_OK'
 `;
     const dir = mkdtempSync(path.join(tmpdir(), 'cos-input-test-'));

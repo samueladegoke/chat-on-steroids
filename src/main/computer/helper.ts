@@ -415,13 +415,50 @@ public static class Clf {
     return owner != IntPtr.Zero && IsRelatedWindow(window.ToInt64(), owner.ToInt64()) ? owner : IntPtr.Zero;
   }
 
-  // A nonactivating owned popup may cover a still-foreground owner window.
-  // GA_ROOTOWNER includes its menus, but rejects an unrelated top-level overlay.
+  // A top-level window that never takes activation: no-activate popups, #32768 menus,
+  // desktop-child lists (ComboLBox) and captionless popups (toolkit menus, Auto-Suggest).
+  static bool IsTransientPopup(IntPtr window) {
+    int style = GetWindowLong(window, -16);
+    if ((GetWindowLong(window, -20) & 0x08000000) != 0 || IsMenu(window) || (style & 0x40000000) != 0) return true;
+    return (style & unchecked((int)0x80000000)) != 0 && (style & 0x00C00000) != 0x00C00000; // WS_POPUP without WS_CAPTION
+  }
+
+  // Menus, dropdown lists and autocomplete popups of the target cover its pixels while it stays
+  // foreground. Only such a popup from the target's own process may receive its input: owned by
+  // the target, or ownerless on its GUI thread. Never another process, an activatable dialog,
+  // or the owner/sibling of a popup target.
+  static bool ReceiverIsTarget(IntPtr receiver, IntPtr target) {
+    if (receiver == IntPtr.Zero) return false;
+    IntPtr receiverRoot = GetAncestor(receiver, 2), targetRoot = GetAncestor(target, 2);
+    if (receiverRoot == IntPtr.Zero || targetRoot == IntPtr.Zero) return false;
+    if (receiverRoot == targetRoot) return true;
+    uint receiverProcess, targetProcess;
+    uint receiverThread = GetWindowThreadProcessId(receiverRoot, out receiverProcess);
+    uint targetThread = GetWindowThreadProcessId(targetRoot, out targetProcess);
+    if (receiverProcess == 0 || receiverProcess != targetProcess || !IsTransientPopup(receiverRoot) || InputRoot(targetRoot) != targetRoot) return false;
+    return OwnedBy(receiverRoot, targetRoot) || (GetWindow(receiverRoot, 4) == IntPtr.Zero && receiverThread == targetThread);
+  }
+
+  // WindowFromPoint resolves the top-level receiver, but mouse capture on the foreground
+  // thread overrides it, so both must belong to the target.
   public static bool HitTargetsWindow(long handle, int x, int y) {
+    IntPtr target = new IntPtr(handle);
     POINT p = new POINT(); p.X = x; p.Y = y;
-    IntPtr hit = WindowFromPoint(p);
-    IntPtr receiverOwner = hit != IntPtr.Zero ? GetAncestor(hit, 3) : IntPtr.Zero;
-    return receiverOwner != IntPtr.Zero && receiverOwner == GetAncestor(new IntPtr(handle), 3);
+    if (!ReceiverIsTarget(WindowFromPoint(p), target)) return false;
+    GUITHREADINFO gui = new GUITHREADINFO();
+    gui.cbSize = (uint)Marshal.SizeOf(typeof(GUITHREADINFO));
+    return GetGUIThreadInfo(0, ref gui) && (gui.capture == IntPtr.Zero || ReceiverIsTarget(gui.capture, target));
+  }
+
+  // Activation and keys for a no-activate popup reach its input root. Returns that root when it
+  // belongs to another process, whose incarnation the popup's own identity does not prove.
+  public static long ForeignInputRoot(long handle) {
+    IntPtr window = new IntPtr(handle), root = InputRoot(window);
+    if (root == IntPtr.Zero || root == window) return 0;
+    uint windowProcess, rootProcess;
+    GetWindowThreadProcessId(window, out windowProcess);
+    GetWindowThreadProcessId(root, out rootProcess);
+    return rootProcess == windowProcess ? 0 : root.ToInt64();
   }
 
   public static bool InputIsFocused(long handle) {
@@ -1147,9 +1184,18 @@ function Assert-InputOwner([int64]$target, $owner, $targetApp, $ownerApp) {
   }
 }
 
+function Assert-InputRootOwner([int64]$id) {
+  # Assert-InputOwner has already proven the request's owner incarnation, so only that exact
+  # owner may be the foreign root that receives activation and keys.
+  $root = [Clf]::ForeignInputRoot($id)
+  if ($root -ne 0 -and ($root -ne $script:ExpectedOwnerWindow -or -not $script:ExpectedOwnerStartTime)) {
+    throw 'STALE_WINDOW: popup owner process incarnation proof is unavailable'
+  }
+}
+
 function Assert-PhysicalHit([int64]$id, [int]$x, [int]$y) {
   if (-not [Clf]::InputIsFocused($id) -or -not [Clf]::HitTargetsWindow($id, $x, $y)) {
-    throw 'OCCLUDED_TARGET: the observed window does not own the input pixels'
+    throw 'OCCLUDED_TARGET: another window covers this point and would receive the input. Observe again, then close it or act on the window in front.'
   }
 }
 
@@ -1211,6 +1257,7 @@ function Handle-Request($request) {
   $script:ExpectedInputStartTime = if ($request.op -eq 'act') { [string]$request.expectedProcessStartTime } else { '' }
   $script:ExpectedOwnerStartTime = if ($request.op -eq 'act') { [string]$request.expectedOwnerProcessStartTime } else { '' }
   $script:ExpectedInputWindow = if ($request.op -eq 'act' -and $request.targetWindow) { [int64]$request.targetWindow } else { 0 }
+  $script:ExpectedOwnerWindow = if ($request.op -eq 'act' -and $request.ownerWindow) { [int64]$request.ownerWindow } else { 0 }
   # UIA stage evidence belongs to one request only. stdout replies and stderr diagnostics are
   # independent pipes, so every stage carries the nonce minted by the parent transport for this
   # exact request. Unknown/malformed request ids deliberately disable UIA crash classification.
@@ -1369,6 +1416,7 @@ function Handle-Request($request) {
           # established focus path.
           $frameCoordinates = $request.frame -and $a.type -in @('move','click','double_click','scroll','drag')
           if ($request.targetWindow -and $a.type -in @('move','click','double_click','scroll','drag','type','keypress') -and -not $frameCoordinates) {
+            Assert-InputRootOwner ([int64]$request.targetWindow)
             Assert-Focused ([int64]$request.targetWindow)
             Assert-InputOwner $actionTarget $request.ownerWindow $request.targetApp $request.ownerApp
           }
@@ -1409,7 +1457,7 @@ function Handle-Request($request) {
             'drag'         { $duration = if ($null -ne $a.durationMs) { [int]$a.durationMs } else { 350 }; [Clf]::Drag([int[]]$a.xs, [int[]]$a.ys, $a.button, $duration); $routes += 'sendinput' }
             'type'         { [Clf]::Type([string]$a.text); $routes += 'sendinput' }
             'keypress'     { [Clf]::Press([int[]]$a.resolvedKeys); $routes += 'sendinput' }
-            'focus'        { Assert-Focused ([int64]$a.window); Assert-InputOwner ([int64]$a.window) $request.ownerWindow $request.targetApp $request.ownerApp; $routes += 'focus' }
+            'focus'        { Assert-InputRootOwner ([int64]$a.window); Assert-Focused ([int64]$a.window); Assert-InputOwner ([int64]$a.window) $request.ownerWindow $request.targetApp $request.ownerApp; $routes += 'focus' }
             default        { throw "BAD_ACTION: Unknown action: $($a.type)" }
           }
           $completed += 1

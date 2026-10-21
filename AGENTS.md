@@ -5075,10 +5075,15 @@ identity into the native dispatcher; an owner change fails before native focus/i
 Acknowledged paste completion is not undone by later cursor diagnostics; any
 missing pointer sample must not induce input replay.
 Cross-process popup input proves both the observed owner and target process
-incarnations before focus/input. Frames captured separately from popup enumeration
+incarnations before focus/input; keys or activation for a popup whose input root is
+another process need that exact owner's proof. Frames captured separately from popup enumeration
 must not reuse an outdated enumeration owner. Physical coordinate and indexed
-clicks validate the actual pointer hit receiver, not just the foreground owner:
-a no-activate popup occluding an observed window fails closed. Explicit UIA
+clicks validate the actual pointer hit receiver and foreground mouse capture, not just
+the foreground owner. Only the target or a non-activating popup of its own process
+(owned by it, or ownerless on its GUI thread: menus, dropdown lists, autocomplete)
+may receive them; another process's overlay, even one owned by the target, an
+activatable dialog, or a popup target's owner/sibling fails closed. A drag checks
+only its pointer-down point, so it may end over another window inside the frame. Explicit UIA
 secondary actions verify the owner after provider property and pattern reads and
 before mutation. Lost native input acknowledgements retain an ambiguous completion
 status and must never be reported as exact zero or replayed.

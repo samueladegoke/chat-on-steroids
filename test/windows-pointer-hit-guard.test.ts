@@ -6,31 +6,124 @@ import { describe, expect, it } from 'vitest';
 import { HELPER_SCRIPT } from '../src/main/computer/helper.js';
 
 describe.runIf(process.platform === 'win32')('native physical hit receiver validation', () => {
-  it('accepts an owned context-menu popup but rejects an unrelated no-activate overlay', () => {
-    // Compile the production HitTargetsWindow against deterministic ownership
-    // fixtures; no windows, focus or OS input are modified.
-    const method = '  public static bool HitTargetsWindow(long handle, int x, int y) {' +
-      HELPER_SCRIPT.split('  public static bool HitTargetsWindow(long handle, int x, int y) {')[1]?.split('  public static bool InputIsFocused(')[0];
-    expect(method).toContain('GetAncestor');
+  it('accepts the target\'s own popups and menus but rejects every other receiver', () => {
+    // Compile the production ownership and hit-test methods against a deterministic
+    // window table; no windows, focus or OS input are touched. WindowFromPoint returns
+    // the handle named by x, and the foreground thread's capture is [Clf]::Capture.
+    const methods = '  static bool OwnedBy(' +
+      HELPER_SCRIPT.split('  static bool OwnedBy(')[1]?.split('  public static bool InputIsFocused(')[0];
+    expect(methods).toContain('public static bool HitTargetsWindow(long handle, int x, int y)');
     const fixture = String.raw`
 $ErrorActionPreference = 'Stop'
 Add-Type -TypeDefinition @"
 using System;
+using System.Collections.Generic;
+using System.Runtime.InteropServices;
+using System.Text;
 public static class Clf {
   public struct POINT { public int X, Y; }
-  static IntPtr WindowFromPoint(POINT p) { return new IntPtr(p.X); }
-  static IntPtr GetAncestor(IntPtr hwnd, uint kind) {
-    if (kind == 2) return hwnd; // GA_ROOT leaves the owned popup separate
-    if (kind == 3 && hwnd.ToInt64() == 201) return new IntPtr(100); // GA_ROOTOWNER
-    return hwnd; // foreign no-activate overlay 301 is independent
+  public struct RECT { public int Left, Top, Right, Bottom; }
+  [StructLayout(LayoutKind.Sequential)]
+  struct GUITHREADINFO {
+    public uint cbSize, flags;
+    public IntPtr active, focus, capture, menuOwner, moveSize, caret;
+    public RECT caretRect;
   }
-` + method + String.raw`
+  const long NOACTIVATE = 0x08000000, FRAME = 0x00CF0000, CHILD = 0x44000000, POPUP = 0x80800000, DIALOG = 0x80C80000;
+  // handle -> GA_ROOT, GW_OWNER, style, extended style, process, GUI thread. Popup
+  // shapes follow a live Windows 11 probe of real menus, dropdown lists and autocomplete.
+  static Dictionary<long, long[]> W = new Dictionary<long, long[]>();
+  static Dictionary<long, string> Class = new Dictionary<long, string>();
+  public static long Capture = 0;
+  static void Add(long h, long root, long owner, long style, long ex, string cls, long pid, long tid) {
+    W[h] = new long[] { root, owner, style, ex, pid, tid }; Class[h] = cls;
+  }
+  static Clf() {
+    Add(100, 100, 0, FRAME, 0, "AppWindow", 10, 1);             // the target A
+    Add(110, 100, 0, CHILD, 0, "Button", 10, 1);                // a child control of A
+    Add(120, 120, 0, FRAME, 0, "AppWindow", 10, 1);             // another window of A's thread
+    Add(201, 201, 100, POPUP, NOACTIVATE, "Popup", 10, 1);      // A's own no-activate dropdown
+    Add(202, 202, 0, POPUP, 0x189, "#32768", 10, 1);            // ownerless context menu of A's thread
+    Add(203, 203, 100, POPUP, 0x189, "#32768", 10, 1);          // context menu owned by A
+    Add(204, 204, 100, POPUP, NOACTIVATE, "Popup", 10, 1);      // a sibling of 201
+    Add(205, 205, 0, CHILD, 0x88, "ComboLBox", 10, 1);          // dropdown list: a desktop child
+    Add(206, 206, 0, POPUP, 0x8C, "Auto-Suggest Dropdown", 10, 1); // unowned autocomplete popup
+    Add(207, 207, 100, POPUP, 0x10008, "ToolStripDropDown", 10, 1); // toolkit menu owned by A
+    Add(208, 208, 120, POPUP, 0x10008, "ToolStripDropDown", 10, 1); // menu of A's sibling window
+    Add(301, 301, 0, POPUP, NOACTIVATE, "Overlay", 30, 3);      // another app's overlay
+    Add(302, 302, 100, POPUP, NOACTIVATE, "Overlay", 30, 3);    // another app's overlay owned by A
+    Add(303, 303, 100, DIALOG, 0, "#32770", 10, 1);             // A's activatable owned dialog
+    Add(304, 304, 0, POPUP, 0x189, "#32768", 10, 2);            // ownerless menu of another thread
+    Add(305, 305, 0, POPUP, 0x189, "#32768", 30, 3);            // another app's ownerless menu
+  }
+  static IntPtr WindowFromPoint(POINT p) { return new IntPtr(p.X); }
+  static bool IsWindow(IntPtr h) { return W.ContainsKey(h.ToInt64()); }
+  static bool IsWindowVisible(IntPtr h) { return IsWindow(h); }
+  static bool IsIconic(IntPtr h) { return false; }
+  static IntPtr GetAncestor(IntPtr h, uint kind) {
+    long[] w;
+    if (!W.TryGetValue(h.ToInt64(), out w)) return IntPtr.Zero;
+    long root = w[0];
+    if (kind == 3) while (W[root][1] != 0) root = W[root][1]; // GA_ROOTOWNER
+    return new IntPtr(root);
+  }
+  static IntPtr GetWindow(IntPtr h, uint command) {
+    long[] w;
+    return command == 4 && W.TryGetValue(h.ToInt64(), out w) ? new IntPtr(w[1]) : IntPtr.Zero;
+  }
+  static int GetWindowLong(IntPtr h, int index) {
+    long[] w;
+    if (!W.TryGetValue(h.ToInt64(), out w)) return 0;
+    return index == -16 ? unchecked((int)w[2]) : index == -20 ? unchecked((int)w[3]) : 0;
+  }
+  static int GetClassNameW(IntPtr h, StringBuilder value, int count) {
+    string name;
+    if (!Class.TryGetValue(h.ToInt64(), out name)) return 0;
+    value.Append(name); return name.Length;
+  }
+  static uint GetWindowThreadProcessId(IntPtr h, out uint pid) {
+    long[] w;
+    if (!W.TryGetValue(h.ToInt64(), out w)) { pid = 0; return 0; }
+    pid = (uint)w[4]; return (uint)w[5];
+  }
+  static bool GetGUIThreadInfo(uint thread, ref GUITHREADINFO info) {
+    if (thread == 0) thread = 1; // A's thread is the foreground thread
+    info.menuOwner = thread == 1 ? new IntPtr(100) : thread == 3 ? new IntPtr(302) : IntPtr.Zero;
+    info.capture = thread == 1 ? new IntPtr(Capture) : IntPtr.Zero;
+    return true;
+  }
+` + methods + String.raw`
 }
 "@
-if (-not [Clf]::HitTargetsWindow(100, 100, 0)) { throw 'TARGET_WINDOW_REJECTED' }
-if (-not [Clf]::HitTargetsWindow(100, 201, 0)) { throw 'OWNED_MENU_REJECTED' }
-if ([Clf]::HitTargetsWindow(100, 301, 0)) { throw 'FOREIGN_OVERLAY_ACCEPTED' }
-if ([Clf]::HitTargetsWindow(100, 0, 0)) { throw 'NULL_HIT_ACCEPTED' }
+$failures = @()
+function Expect-Hit([long]$target, [long]$hit, [bool]$allowed, [string]$name) {
+  if ([Clf]::HitTargetsWindow($target, [int]$hit, 0) -ne $allowed) { $script:failures += $name }
+}
+Expect-Hit 100 100 $true 'TARGET_REJECTED'
+Expect-Hit 100 110 $true 'CHILD_CONTROL_REJECTED'
+Expect-Hit 100 201 $true 'OWNED_NOACTIVATE_POPUP_REJECTED'
+Expect-Hit 100 202 $true 'OWNERLESS_THREAD_MENU_REJECTED'
+Expect-Hit 100 203 $true 'OWNED_MENU_REJECTED'
+Expect-Hit 100 205 $true 'COMBOBOX_LIST_REJECTED'
+Expect-Hit 100 206 $true 'AUTOCOMPLETE_REJECTED'
+Expect-Hit 100 207 $true 'OWNED_TOOLKIT_MENU_REJECTED'
+Expect-Hit 201 201 $true 'POPUP_FRAME_SELF_REJECTED'
+Expect-Hit 202 202 $true 'MENU_FRAME_SELF_REJECTED'
+Expect-Hit 100 301 $false 'FOREIGN_OVERLAY_ACCEPTED'
+Expect-Hit 100 302 $false 'FOREIGN_PROCESS_OWNED_OVERLAY_ACCEPTED'
+Expect-Hit 100 303 $false 'ACTIVATABLE_OWNED_DIALOG_ACCEPTED'
+Expect-Hit 201 100 $false 'POPUP_FRAME_HIT_OWNER_ACCEPTED'
+Expect-Hit 201 204 $false 'POPUP_FRAME_HIT_SIBLING_ACCEPTED'
+Expect-Hit 100 208 $false 'OTHER_WINDOW_MENU_ACCEPTED'
+Expect-Hit 100 304 $false 'OTHER_THREAD_MENU_ACCEPTED'
+Expect-Hit 100 305 $false 'FOREIGN_MENU_ACCEPTED'
+Expect-Hit 100 0 $false 'NULL_HIT_ACCEPTED'
+# Mouse capture on the foreground thread overrides WindowFromPoint.
+[Clf]::Capture = 301; Expect-Hit 100 100 $false 'FOREIGN_CAPTURE_ACCEPTED'
+[Clf]::Capture = 110; Expect-Hit 100 100 $true 'TARGET_CAPTURE_REJECTED'
+[Clf]::Capture = 205; Expect-Hit 100 205 $true 'DROPPED_LIST_CAPTURE_REJECTED'
+[Clf]::Capture = 0
+if ($failures.Count) { throw ('HIT_MATRIX_FAILED: ' + ($failures -join ',')) }
 Write-Output 'OWNED_POPUP_ALLOWED_FOREIGN_OVERLAY_DENIED'
 `;
     const dir = mkdtempSync(path.join(tmpdir(), 'cos-owner-hit-'));
