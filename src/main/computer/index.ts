@@ -1237,6 +1237,12 @@ export async function getWindowState(opts: {
     const limit = Math.min(MAX_SCREENSHOT_WIDTH, Math.max(320, Math.floor(opts.maxWidth ?? DEFAULT_SCREENSHOT_WIDTH)));
     const dir = includeScreenshot ? await fs.mkdtemp(path.join(os.tmpdir(), 'clf-shot-')) : null;
     const file = dir ? path.join(dir, 'screen.png') : null;
+    // Snapshot replies are one externally atomic observation. Failed later
+    // popup/parent validation must not expose image frames or semantic refs
+    // which were created earlier but never returned to the caller.
+    const priorFrames = new Map(frames);
+    const priorLastFrame = lastFrame;
+    const priorUiRefs = new Map(uiRefs);
     try {
       const snapshotRequest = (requestUi: boolean, requestScreenshot = includeScreenshot): Record<string, unknown> => ({
         op: 'snapshot',
@@ -1404,6 +1410,13 @@ export async function getWindowState(opts: {
         ...(found.accessibility ? { accessibility: found.accessibility } : {}),
         ...(related.length > 0 ? { related } : {})
       };
+    } catch (error) {
+      frames.clear();
+      for (const [id, frame] of priorFrames) frames.set(id, frame);
+      lastFrame = priorLastFrame;
+      uiRefs.clear();
+      for (const [id, ref] of priorUiRefs) uiRefs.set(id, ref);
+      throw error;
     } finally {
       if (dir) await fs.rm(dir, { recursive: true, force: true }).catch(() => {});
     }
@@ -2110,6 +2123,16 @@ async function actLocked(
           ? exactRoutes.join('+')
           : 'none'
         : 'unavailable';
+      // A native SendInput may have accepted a prefix inside the failed
+      // logical action. Those OS effects do not count as an acknowledged
+      // completed action, but retrying that action can duplicate mutations.
+      if (/^INPUT_EFFECT_UNCONFIRMED:/.test(message)) {
+        throw new ComputerError(
+          `OUTCOME_UNCONFIRMED: acknowledged_prefix=${totalCompleted} failed_index=${originalFailed} routes=${routeEvidence}; native action may be partially applied. Do not repeat the unacknowledged input. ${message}`,
+          { completedCount: totalCompleted, failedIndex: originalFailed,
+            ...(exactRoutes ? { completedRoutes: exactRoutes } : {}) }
+        );
+      }
       throw new ComputerError(
         `PARTIAL_BATCH: completed_count=${totalCompleted} failed_index=${originalFailed} routes=${routeEvidence}. ${message}`,
         {

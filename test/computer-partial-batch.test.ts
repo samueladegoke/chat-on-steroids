@@ -108,6 +108,19 @@ describe('desktop partial batch result', () => {
     });
   });
 
+  it('does not treat partially accepted native packets as a safe zero-effect retry', async () => {
+    fake.setResponse({
+      ok: false, error_code: 'INPUT_EFFECT_UNCONFIRMED',
+      message: 'SendInput was blocked (sent 5 of 6); third down may already have executed',
+      completed_count: 0, failed_index: 0, routes: []
+    });
+    await expect(act([{ type: 'type', text: 'may have a partial accepted prefix' }]))
+      .rejects.toMatchObject({
+        completedCount: 0, failedIndex: 0, completedRoutes: [],
+        message: expect.stringMatching(/OUTCOME_UNCONFIRMED:.*partially applied.*Do not repeat the unacknowledged input/)
+      });
+  });
+
   it('does not invent route evidence when the helper route list is malformed', async () => {
     fake.setResponse({
       ok: false,

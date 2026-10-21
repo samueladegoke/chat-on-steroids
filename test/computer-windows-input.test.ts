@@ -16,18 +16,32 @@ describe.runIf(process.platform === 'win32')('compiled Windows input failure rec
   public static List<string> TestEvents = new List<string>();
   public static List<string> TestMoves = new List<string>();
   public static List<int> TestWheels = new List<int>();
-  public static int TestFailCall, TestCalls;
+  public static int TestCurrentX, TestCurrentY, TestCursorOffset;
+  public static int TestFailCall, TestCalls, TestTruncateTo = -1;
   public static long TestForeignRoot;
-  public static void TestReset(int failCall) { TestEvents.Clear(); TestMoves.Clear(); TestWheels.Clear(); TestCalls = 0; TestFailCall = failCall; }
+  public static void TestReset(int failCall) { TestEvents.Clear(); TestMoves.Clear(); TestWheels.Clear(); TestCalls = 0; TestFailCall = failCall; TestCursorOffset = 0; TestTruncateTo = -1; }
   static uint SendInput(uint n, INPUT[] inputs, int size) {
     TestCalls++;
-    foreach (INPUT i in inputs) TestEvents.Add(i.type == INPUT_MOUSE ? "mouse:" + i.u.mi.dwFlags : (i.u.ki.dwFlags & 4) != 0 ? "text:" + i.u.ki.wScan + ":" + i.u.ki.dwFlags : "key:" + i.u.ki.wVk + ":" + i.u.ki.dwFlags);
-    foreach (INPUT i in inputs) if (i.type == INPUT_MOUSE && (i.u.mi.dwFlags & 1) != 0) TestMoves.Add(i.u.mi.dx + "," + i.u.mi.dy);
-    foreach (INPUT i in inputs) if (i.type == INPUT_MOUSE && (i.u.mi.dwFlags & 0x1800) != 0) TestWheels.Add(unchecked((int)i.u.mi.mouseData));
-    return TestCalls == TestFailCall ? n - 1 : n;
+    uint accepted = TestCalls == TestFailCall ? (uint)Math.Min((int)n, TestTruncateTo < 0 ? (int)n - 1 : TestTruncateTo) : n;
+    for (int at = 0; at < accepted; at++) {
+      INPUT i = inputs[at];
+      TestEvents.Add(i.type == INPUT_MOUSE ? "mouse:" + i.u.mi.dwFlags : (i.u.ki.dwFlags & 4) != 0 ? "text:" + i.u.ki.wScan + ":" + i.u.ki.dwFlags : "key:" + i.u.ki.wVk + ":" + i.u.ki.dwFlags);
+    }
+    for (int at = 0; at < accepted; at++) {
+      INPUT i = inputs[at];
+      if (i.type != INPUT_MOUSE || (i.u.mi.dwFlags & 1) == 0) continue;
+      TestMoves.Add(i.u.mi.dx + "," + i.u.mi.dy);
+      TestCurrentX = (int)Math.Round(i.u.mi.dx * 999.0 / 65535.0) + TestCursorOffset;
+      TestCurrentY = (int)Math.Round(i.u.mi.dy * 999.0 / 65535.0);
+    }
+    for (int at = 0; at < accepted; at++) if (inputs[at].type == INPUT_MOUSE && (inputs[at].u.mi.dwFlags & 0x1800) != 0)
+      TestWheels.Add(unchecked((int)inputs[at].u.mi.mouseData));
+    return accepted;
   }`)
       .replace('[DllImport("user32.dll")] static extern int GetSystemMetrics(int index);',
         'static int GetSystemMetrics(int index) { return index == 78 || index == 79 ? 1000 : 0; }')
+      .replace('[DllImport("user32.dll")] static extern bool GetCursorPos(out POINT p);',
+        'static bool GetCursorPos(out POINT p) { p = new POINT(); p.X = TestCurrentX; p.Y = TestCurrentY; return true; }')
       .replace('public static long ForeignInputRoot(long handle) {',
         'public static long ForeignInputRoot(long handle) {\n    if (TestForeignRoot != 0) return TestForeignRoot;')
       // The production guard is exercised after Move, but the synthetic Win32
@@ -35,7 +49,7 @@ describe.runIf(process.platform === 'win32')('compiled Windows input failure rec
       // foreground app or pointer capture while OS SendInput is stubbed.
       .replace('static void GuardPointerReceiver(long target, int x, int y) {',
         'public static bool TestPointerAllowed = true;\n  static void GuardPointerReceiver(long target, int x, int y) {')
-      .replace('(!InputIsFocused(target) || !HitTargetsWindow(target, x, y))', '!TestPointerAllowed');
+      .replace('(!InputIsFocused(target) || !HitTargetsWindow(target, actual.X, actual.Y))', '!TestPointerAllowed');
     const assertions = String.raw`
 [Clf]::TestReset(3)
 try { [Clf]::Drag([int[]]@(1,2), [int[]]@(1,2), 'left'); throw 'drag unexpectedly succeeded' } catch {
@@ -52,7 +66,7 @@ if (@([Clf]::TestEvents | Where-Object { $_ -eq 'mouse:2' }).Count -ne 3 -or @([
 try { [Clf]::Press([int[]]@(17,83)); throw 'chord unexpectedly succeeded' } catch {
   if ($_.Exception.Message -notmatch 'SendInput was blocked') { throw }
 }
-if (([Clf]::TestEvents -join ',') -ne 'key:17:0,key:83:0,key:83:2,key:17:2') { throw 'partial chord not released in reverse order' }
+if (([Clf]::TestEvents -join ',') -ne 'key:17:0,key:83:2,key:17:2') { throw 'partial chord not released in reverse order' }
 [Clf]::TestReset(2)
 try { [Clf]::Click(1,1,'left',1); throw 'click unexpectedly succeeded' } catch {
   if ($_.Exception.Message -notmatch 'SendInput was blocked') { throw }
@@ -78,7 +92,7 @@ if (([Clf]::TestEvents -join ',') -ne 'text:97:4,text:97:6,text:98:4,text:98:6')
 try { [Clf]::Type('ab'); throw 'partial text unexpectedly succeeded' } catch {
   if ($_.Exception.Message -notmatch 'SendInput was blocked') { throw }
 }
-if (([Clf]::TestEvents -join ',') -ne 'text:97:4,text:97:6,text:98:4,text:98:6,text:97:6,text:98:6') { throw 'partial Unicode packets not released' }
+if (([Clf]::TestEvents -join ',') -ne 'text:97:4,text:97:6,text:98:4,text:97:6,text:98:6') { throw 'partial Unicode packets not released' }
 $script:checks = 0
 $script:focuses = @()
 function Assert-Focused([int64]$id) { $script:focuses += $id }
@@ -101,7 +115,31 @@ foreach ($type in @('click','scroll','drag')) {
   }
 }
 [Clf]::TestPointerAllowed = $true
-function Assert-CoordinateFrame($frame) {
+[Clf]::TestReset(0)
+[Clf]::TestCursorOffset = 100
+$request = '{"op":"act","targetWindow":42,"frame":{"id":1},"actions":[{"type":"click","x":10,"y":20}]}' | ConvertFrom-Json
+$result = Handle-Request $request
+if ($result.ok -ne $false -or $result.error_code -ne 'OCCLUDED_TARGET' -or
+  @([Clf]::TestEvents | Where-Object { $_ -match '^mouse:(2|4|8|16|32|64|2048|4096)$' }).Count -ne 0) {
+  throw 'CONFINED_CURSOR_DELIVERED_INPUT_OUTSIDE_REQUESTED_POINT'
+}
+[Clf]::TestCursorOffset = 0
+# The post-move pure frame/owner callback must execute in the same native call
+# before any button/wheel. No second Move can slip between it and SendInput.
+function Assert-CoordinateFrame($frame, [bool]$noFocus = $false) {
+  if ($noFocus) { throw 'STALE_FRAME: window moved during native cursor movement' }
+}
+[Clf]::TestReset(0)
+$request = '{"op":"act","targetWindow":42,"frame":{"id":1},"actions":[{"type":"click","x":10,"y":20}]}' | ConvertFrom-Json
+$result = Handle-Request $request
+if ($result.ok -ne $false -or $result.error_code -ne 'STALE_FRAME' -or
+    @([Clf]::TestEvents | Where-Object { $_ -match '^mouse:(2|4|8|16|32|64|2048|4096)$' }).Count -ne 0 -or
+    [Clf]::TestMoves.Count -ne 1) {
+  throw 'POST_MOVE_PROCESS_OR_GEOMETRY_REVALIDATION_BYPASSED'
+}
+# Leave the ordinary action-sequence fixture's first frame validation unchanged.
+function Assert-CoordinateFrame($frame, [bool]$noFocus = $false) {
+  if ($noFocus) { return }
   if ($script:focuses.Count -ne $script:checks) { throw 'frame focus occurred before ownership validation' }
   $script:checks++
   if ($script:checks -eq 2) { throw 'STALE_FRAME: changed after first action' }
@@ -116,7 +154,7 @@ if ($result.ok -ne $false -or $result.completed_count -ne 1 -or $result.failed_i
 if (($script:focuses -join ',') -ne '42') { throw 'stale second frame focused target before native owner validation' }
 # Identity/foreground can remain valid while a nonactivating popup covers input pixels.
 # Reject that hit before sending a single pointer event.
-function Assert-CoordinateFrame($frame) { Assert-Focused ([int64]$request.targetWindow) }
+function Assert-CoordinateFrame($frame, [bool]$noFocus = $false) { if (-not $noFocus) { Assert-Focused ([int64]$request.targetWindow) } }
 function Assert-PhysicalHit([int64]$id, [int]$x, [int]$y) { throw 'OCCLUDED_TARGET: another window receives the pointer' }
 [Clf]::TestReset(0)
 $request = '{"op":"act","targetWindow":42,"frame":{"id":1},"actions":[{"type":"click","x":1,"y":1}]}' | ConvertFrom-Json
@@ -125,6 +163,20 @@ if ($result.ok -ne $false -or $result.error_code -ne 'OCCLUDED_TARGET' -or $resu
   throw 'occluded coordinates were injected into a different window'
 }
 function Assert-PhysicalHit([int64]$id, [int]$x, [int]$y) { }
+# Real SendInput can accept 5 of 6 input packets. This is NOT equivalent to
+# completing zero clicks safely: two full clicks and the third DOWN happened,
+# and recovery-UP may complete the third click. Preserve the accepted prefix.
+function Assert-CoordinateFrame($frame, [bool]$noFocus = $false) { }
+[Clf]::TestReset(2)
+[Clf]::TestTruncateTo = 5
+$request = '{"op":"act","targetWindow":42,"frame":{"id":1},"actions":[{"type":"click","x":10,"y":20,"count":3}]}' | ConvertFrom-Json
+$result = Handle-Request $request
+if ($result.ok -ne $false -or $result.error_code -ne 'INPUT_EFFECT_UNCONFIRMED' -or
+    $result.completed_count -ne 0 -or $result.failed_index -ne 0 -or
+    @([Clf]::TestEvents | Where-Object { $_ -eq 'mouse:2' }).Count -ne 3 -or
+    @([Clf]::TestEvents | Where-Object { $_ -eq 'mouse:4' }).Count -ne 3) {
+  throw 'PARTIAL_NATIVE_MULTI_CLICK_WAS_REPORTED_AS_SAFE_RETRY'
+}
 # A drag starts in a verified target window but may end in another application.
 # Only its pointer-down pixel is subject to the starting window's physical-hit gate.
 $script:checkedDragPoints = @()

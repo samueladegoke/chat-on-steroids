@@ -120,7 +120,8 @@ public static class Clf {
 
   static void Send(INPUT[] inputs) {
     uint sent = SendInput((uint)inputs.Length, inputs, Marshal.SizeOf(typeof(INPUT)));
-    if (sent != inputs.Length) throw new Exception("SendInput was blocked (sent " + sent + " of " + inputs.Length + "). A window running as administrator can refuse synthetic input.");
+    if (sent != inputs.Length) throw new Exception((sent > 0 ? "INPUT_EFFECT_UNCONFIRMED: " : "") +
+      "SendInput was blocked (sent " + sent + " of " + inputs.Length + "). A window running as administrator can refuse synthetic input.");
   }
 
   static INPUT Mouse(uint flags, int dx, int dy, uint data) {
@@ -182,14 +183,35 @@ public static class Clf {
   // tooltip/overlay or change mouse capture; recheck after Move, immediately
   // before the irreversible button/wheel input, without restricting drag drops.
   static void GuardPointerReceiver(long target, int x, int y) {
-    if (target > 0 && (!InputIsFocused(target) || !HitTargetsWindow(target, x, y))) {
+    POINT actual = new POINT();
+    // SendInput's accepted MOVE is not proof the cursor arrived at the desired
+    // location (ClipCursor and desktop policies can constrain its landing).
+    // The OS button/wheel packet uses the real cursor, never the requested P.
+    // Permit a bounded compositor/input-queue settling interval, not a blind
+    // second movement or an indefinite wait for a permanently confined cursor.
+    bool landed = false;
+    for (int attempt = 0; attempt < 4; attempt++) {
+      if (GetCursorPos(out actual) && Math.Abs((long)actual.X - x) <= 1 && Math.Abs((long)actual.Y - y) <= 1) {
+        landed = true;
+        break;
+      }
+      if (attempt < 3) System.Threading.Thread.Sleep(1);
+    }
+    if (!landed)
+      throw new InvalidOperationException("OCCLUDED_TARGET: pointer did not reach the requested location");
+    if (target > 0 && (!InputIsFocused(target) || !HitTargetsWindow(target, actual.X, actual.Y))) {
       throw new InvalidOperationException("OCCLUDED_TARGET: receiver changed after pointer movement; observe again");
     }
   }
 
   public static void Click(int x, int y, string button, int times, long target) {
+    Click(x, y, button, times, target, null);
+  }
+
+  public static void Click(int x, int y, string button, int times, long target, Action afterMove) {
     if (times < 1 || times > 3) throw new ArgumentException("BAD_ACTION: click count must be between 1 and 3");
     Move(x, y);
+    if (afterMove != null) afterMove();
     GuardPointerReceiver(target, x, y);
     uint down, up;
     ButtonFlags(button, out down, out up);
@@ -215,7 +237,12 @@ public static class Clf {
   }
 
   public static void Scroll(int x, int y, int dx, int dy, bool rawWheel, long target) {
+    Scroll(x, y, dx, dy, rawWheel, target, null);
+  }
+
+  public static void Scroll(int x, int y, int dx, int dy, bool rawWheel, long target, Action afterMove) {
     Move(x, y);
+    if (afterMove != null) afterMove();
     GuardPointerReceiver(target, x, y);
     List<INPUT> batch = new List<INPUT>();
     // Positive scroll_y means "scroll down" for the caller; the wheel API is the
@@ -235,6 +262,10 @@ public static class Clf {
   }
 
   public static void Drag(int[] xs, int[] ys, string button, int durationMs, long target) {
+    Drag(xs, ys, button, durationMs, target, null);
+  }
+
+  public static void Drag(int[] xs, int[] ys, string button, int durationMs, long target, Action afterMove) {
     if (xs == null || ys == null || xs.Length != ys.Length || xs.Length < 2 || xs.Length > 64 || durationMs < 50 || durationMs > 2000)
       throw new ArgumentException("BAD_ACTION: drag requires 2-64 points and a 50-2000 ms duration");
     double[] distance = new double[xs.Length];
@@ -245,6 +276,7 @@ public static class Clf {
     uint down, up;
     ButtonFlags(button, out down, out up);
     Move(xs[0], ys[0]);
+    if (afterMove != null) afterMove();
     GuardPointerReceiver(target, xs[0], ys[0]);
     try {
       Send(new INPUT[] { Mouse(down, 0, 0, 0) });
@@ -455,6 +487,12 @@ public static class Clf {
     if (receiver == IntPtr.Zero) return false;
     IntPtr receiverRoot = GetAncestor(receiver, 2), targetRoot = GetAncestor(target, 2);
     if (receiverRoot == IntPtr.Zero || targetRoot == IntPtr.Zero) return false;
+    // GA_ROOT can be the target even when a different process hosts the hit
+    // child (or owns mouse capture). Check the actual receiver, not only root.
+    uint actualProcess, rootProcess;
+    GetWindowThreadProcessId(receiver, out actualProcess);
+    GetWindowThreadProcessId(targetRoot, out rootProcess);
+    if (actualProcess == 0 || rootProcess == 0 || actualProcess != rootProcess) return false;
     if (receiverRoot == targetRoot) return true;
     uint receiverProcess, targetProcess;
     uint receiverThread = GetWindowThreadProcessId(receiverRoot, out receiverProcess);
@@ -936,7 +974,9 @@ function Act-UiElement($request) {
       $px = [int][Math]::Round($r.X + $r.Width / 2)
       $py = [int][Math]::Round($r.Y + $r.Height / 2)
       Assert-PhysicalHit $id $px $py
-      [Clf]::Click($px, $py, $button, $count, $id)
+      [Clf]::Click($px, $py, $button, $count, $id, [Action]{
+        Assert-InputOwner $id $request.ownerWindow $request.targetApp $request.ownerApp
+      })
       $route = 'sendinput'
     }
   } else {
@@ -1232,7 +1272,7 @@ function Assert-PhysicalHit([int64]$id, [int]$x, [int]$y) {
   }
 }
 
-function Assert-CoordinateFrame($frame) {
+function Assert-CoordinateFrame($frame, [bool]$noFocus = $false) {
   $region = $frame.region
   if ($frame.window) {
     $id = [int64]$frame.window
@@ -1249,6 +1289,9 @@ function Assert-CoordinateFrame($frame) {
     if ($row.x -ne [int]$geometry.x -or $row.y -ne [int]$geometry.y -or $row.width -ne [int]$geometry.width -or $row.height -ne [int]$geometry.height) {
       throw "STALE_FRAME: target window $id moved or resized after frame $($frame.id)"
     }
+    # Executed inside the native after-Move callback: authorization only.
+    # Never focus here, and never move twice before injecting the button.
+    if ($noFocus) { return }
     # A background snapshot is safe to observe, but physical coordinates must land on that
     # exact window rather than on an overlay. Focus only here, on the mutating path.
     Assert-Focused $id
@@ -1485,6 +1528,10 @@ function Handle-Request($request) {
           } elseif ($actionTarget -gt 0 -and $a.type -eq 'drag') {
             Assert-PhysicalHit $actionTarget ([int]$a.xs[0]) ([int]$a.ys[0])
           }
+          $postMove = [Action]{
+            Assert-InputOwner $actionTarget $request.ownerWindow $request.targetApp $request.ownerApp
+            if ($request.frame) { Assert-CoordinateFrame $request.frame $true }
+          }
           switch ($a.type) {
             'click_ui' {
               $ui = Act-UiElement @{ id = $a.window; snapshotId = $a.snapshotId; runtimeKey = $a.runtimeKey; action = 'click'; button = $a.button; count = (Get-RequestedClickCount $a); ownerWindow = $request.ownerWindow; targetApp = $request.targetApp; ownerApp = $request.ownerApp }
@@ -1503,10 +1550,10 @@ function Handle-Request($request) {
               $routes += 'shell'
             }
             'move'         { [Clf]::Move([int]$a.x, [int]$a.y); $routes += 'sendinput' }
-            'click'        { [Clf]::Click([int]$a.x, [int]$a.y, $a.button, (Get-RequestedClickCount $a), $actionTarget); $routes += 'sendinput' }
-            'double_click' { [Clf]::Click([int]$a.x, [int]$a.y, $a.button, 2, $actionTarget); $routes += 'sendinput' }
-            'scroll'       { [Clf]::Scroll([int]$a.x, [int]$a.y, [int]$a.scroll_x, [int]$a.scroll_y, [bool]$a.rawWheel, $actionTarget); $routes += 'sendinput' }
-            'drag'         { $duration = if ($null -ne $a.durationMs) { [int]$a.durationMs } else { 350 }; [Clf]::Drag([int[]]$a.xs, [int[]]$a.ys, $a.button, $duration, $actionTarget); $routes += 'sendinput' }
+            'click'        { [Clf]::Click([int]$a.x, [int]$a.y, $a.button, (Get-RequestedClickCount $a), $actionTarget, $postMove); $routes += 'sendinput' }
+            'double_click' { [Clf]::Click([int]$a.x, [int]$a.y, $a.button, 2, $actionTarget, $postMove); $routes += 'sendinput' }
+            'scroll'       { [Clf]::Scroll([int]$a.x, [int]$a.y, [int]$a.scroll_x, [int]$a.scroll_y, [bool]$a.rawWheel, $actionTarget, $postMove); $routes += 'sendinput' }
+            'drag'         { $duration = if ($null -ne $a.durationMs) { [int]$a.durationMs } else { 350 }; [Clf]::Drag([int[]]$a.xs, [int[]]$a.ys, $a.button, $duration, $actionTarget, $postMove); $routes += 'sendinput' }
             'type'         { [Clf]::Type([string]$a.text); $routes += 'sendinput' }
             'keypress'     { [Clf]::Press([int[]]$a.resolvedKeys); $routes += 'sendinput' }
             'focus'        { Assert-InputRootOwner ([int64]$a.window); Assert-Focused ([int64]$a.window); Assert-InputOwner ([int64]$a.window) $request.ownerWindow $request.targetApp $request.ownerApp; $routes += 'focus' }

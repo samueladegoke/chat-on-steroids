@@ -13,7 +13,7 @@ describe('Windows snapshot and frame ownership boundaries', () => {
     expect(HELPER_SCRIPT).toMatch(/function Assert-SnapshotOwner[\s\S]*STALE_WINDOW: process owner changed/);
   });
   it('checks process incarnation in coordinate frame before and after focus', () => {
-    const frame = HELPER_SCRIPT.split('function Assert-CoordinateFrame($frame) {')[1]?.split('function Handle-Request')[0] ?? '';
+    const frame = HELPER_SCRIPT.split('function Assert-CoordinateFrame($frame, [bool]$noFocus = $false) {')[1]?.split('function Handle-Request')[0] ?? '';
     expect(frame).toContain('processStartTime');
     expect(frame).toContain('STALE_FRAME');
     expect(frame).toContain('Assert-Focused');
@@ -59,8 +59,8 @@ catch { if ($_.Exception.Message -notmatch 'STALE_WINDOW: process owner changed'
   });
 
   it('rejects stale native coordinate frame before focus or any OS input', () => {
-    const frame = 'function Assert-CoordinateFrame($frame) {' +
-      HELPER_SCRIPT.split('function Assert-CoordinateFrame($frame) {')[1]!.split('${WINDOWS_APPS_SCRIPT}')[0]!;
+    const frame = 'function Assert-CoordinateFrame($frame, [bool]$noFocus = $false) {' +
+      HELPER_SCRIPT.split('function Assert-CoordinateFrame($frame, [bool]$noFocus = $false) {')[1]!.split('${WINDOWS_APPS_SCRIPT}')[0]!;
     const setup = String.raw`
 $ErrorActionPreference='Stop'
 function Assert-InputOwner($target, $owner, $targetApp, $ownerApp) { }

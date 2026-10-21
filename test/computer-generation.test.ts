@@ -89,7 +89,11 @@ const fake = vi.hoisted(() => {
         });
       }
       if (overrides.popupParentSwap && request.op === 'capture' && request.id === 43) {
-        Object.assign(reply, { window: { ...window, id: 43, processStartTime: '133000000000000101' } });
+        Object.assign(reply, {
+          window: { ...window, id: 43, processStartTime: '133000000000000101' },
+          region: { x: 250, y: 350, width: 100, height: 100 },
+          windowGeometry: { x: 250, y: 350, width: 100, height: 100 }
+        });
         overrides.parentChanged = true;
       }
       if (overrides.popupParentNativeReject && request.op === 'snapshot' && request.id === 77) {
@@ -223,6 +227,22 @@ describe.each(['stdio', 'addon'] as const)('Desktop reply provenance (%s)', (tra
     expect(fake.requests.find((request) => request.op === 'capture' && request.id === 43))
       .toMatchObject({ ownerWindow: 77, expectedOwnerProcessStartTime: '133000000000000505' });
     expect(fake.requests.some((request) => request.op === 'identity' && request.id === 77)).toBe(true);
+  });
+
+  it.runIf(transport === 'stdio')('rolls back unreturned frames after a rejected popup parent', async () => {
+    Object.defineProperty(process, 'platform', { ...platform, value: 'win32' });
+    const published = await computer.screenshot({ window: 77 });
+    fake.overrides.popupParentSwap = true;
+    await expect(computer.getWindowState({ window: 77, includeRelated: true }))
+      .rejects.toThrow(/STALE_FRAME.*parent process incarnation/);
+    const cropped = await computer.screenshot({ crop: { x: 0, y: 0, width: 10, height: 10 } });
+    expect(cropped.region.x).toBe(0);
+    expect(cropped.region.y).toBe(0);
+    expect(fake.requests.at(-1)).toMatchObject({
+      op: 'capture', region: { x: 0, y: 0, width: 10, height: 10 }
+    });
+    await expect(computer.act([{ type: 'move', x: 10, y: 10 }], { frameId: published.frameId }))
+      .resolves.toBeTruthy();
   });
 
   it.runIf(transport === 'stdio')('never downgrades native parent-replacement errors to an optional popup failure', async () => {

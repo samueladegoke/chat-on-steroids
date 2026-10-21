@@ -56,6 +56,7 @@ public static class Clf {
     Add(303, 303, 100, DIALOG, 0, "#32770", 10, 1);             // A's activatable owned dialog
     Add(304, 304, 0, POPUP, 0x189, "#32768", 10, 2);            // ownerless menu of another thread
     Add(305, 305, 0, POPUP, 0x189, "#32768", 30, 3);            // another app's ownerless menu
+    Add(306, 100, 0, CHILD, 0, "ForeignChild", 30, 3);          // foreign embedded child under A's GA_ROOT
   }
   static IntPtr WindowFromPoint(POINT p) { return new IntPtr(p.X); }
   static bool IsWindow(IntPtr h) { return W.ContainsKey(h.ToInt64()); }
@@ -118,6 +119,7 @@ Expect-Hit 201 204 $false 'POPUP_FRAME_HIT_SIBLING_ACCEPTED'
 Expect-Hit 100 208 $false 'OTHER_WINDOW_MENU_ACCEPTED'
 Expect-Hit 100 304 $false 'OTHER_THREAD_MENU_ACCEPTED'
 Expect-Hit 100 305 $false 'FOREIGN_MENU_ACCEPTED'
+Expect-Hit 100 306 $false 'FOREIGN_CHILD_ACCEPTED'
 Expect-Hit 100 0 $false 'NULL_HIT_ACCEPTED'
 # A sibling window on the SAME GUI thread can open an ownerless menu; the GUI
 # thread by itself is insufficient evidence that this popup belongs to A.
@@ -125,6 +127,7 @@ Expect-Hit 100 0 $false 'NULL_HIT_ACCEPTED'
 [Clf]::MenuOwner = 100; Expect-Hit 100 202 $true 'OWN_OWNERLESS_MENU_REJECTED_AFTER_SIBLING'
 # Mouse capture on the foreground thread overrides WindowFromPoint.
 [Clf]::Capture = 301; Expect-Hit 100 100 $false 'FOREIGN_CAPTURE_ACCEPTED'
+[Clf]::Capture = 306; Expect-Hit 100 100 $false 'FOREIGN_CHILD_CAPTURE_ACCEPTED'
 [Clf]::Capture = 110; Expect-Hit 100 100 $true 'TARGET_CAPTURE_REJECTED'
 [Clf]::Capture = 205; Expect-Hit 100 205 $true 'DROPPED_LIST_CAPTURE_REJECTED'
 [Clf]::Capture = 0
@@ -148,8 +151,8 @@ Write-Output 'OWNED_POPUP_ALLOWED_FOREIGN_OVERLAY_DENIED'
     expect(source).toMatch(/Move\(x, y\);[\s\S]*?GuardPointerReceiver\(target, x, y\);[\s\S]*?Send\(batch\.ToArray\(\)\)/);
     expect(source).toMatch(/public static void Scroll\([\s\S]*?Move\(x, y\);[\s\S]*?GuardPointerReceiver\(target, x, y\);[\s\S]*?Send\(batch\.ToArray\(\)\)/);
     expect(source).toMatch(/Move\(xs\[0\], ys\[0\]\);[\s\S]*?GuardPointerReceiver\(target, xs\[0\], ys\[0\]\);[\s\S]*?Mouse\(down/);
-    expect(HELPER_SCRIPT).toContain('[Clf]::Click([int]$a.x, [int]$a.y, $a.button, (Get-RequestedClickCount $a), $actionTarget)');
-    expect(HELPER_SCRIPT).toContain('[Clf]::Scroll([int]$a.x, [int]$a.y, [int]$a.scroll_x, [int]$a.scroll_y, [bool]$a.rawWheel, $actionTarget)');
+    expect(HELPER_SCRIPT).toContain('[Clf]::Click([int]$a.x, [int]$a.y, $a.button, (Get-RequestedClickCount $a), $actionTarget, $postMove)');
+    expect(HELPER_SCRIPT).toContain('[Clf]::Scroll([int]$a.x, [int]$a.y, [int]$a.scroll_x, [int]$a.scroll_y, [bool]$a.rawWheel, $actionTarget, $postMove)');
   });
 
   it('rejects an overlay before physical indexed-click sends any OS input', () => {
