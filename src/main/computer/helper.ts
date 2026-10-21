@@ -1645,7 +1645,9 @@ while (($line = [Console]::In.ReadLine()) -ne $null) {
     if ($candidateRequestId -match '^[A-Za-z0-9_-]{1,80}$') { $requestId = $candidateRequestId }
     $reply = Handle-Request $request
   } catch {
-    $message = $_.Exception.Message
+    # A direct act_ui mutation reaches this protocol boundary wrapped by
+    # PowerShell MethodInvocationException. Preserve the native source code.
+    $message = $_.Exception.GetBaseException().Message
     $code = 'HELPER_ERROR'
     if ($message -match '^([A-Z0-9_]+):\s*(.+)') {
       $code = $Matches[1]

@@ -114,7 +114,9 @@ const fake = vi.hoisted(() => {
         Object.assign(reply, { window: { ...window, processStartTime: '133000000000000505' } });
       }
       if (overrides.popupIdentitySwap && request.op === 'capture' && request.id === 43) {
-        Object.assign(reply, { window: { ...window, id: 43, processStartTime: '133000000000000202' } });
+        Object.assign(reply, { window: { ...window, id: 43, processStartTime: '133000000000000202' },
+          region: { x: 250, y: 350, width: 100, height: 100 },
+          windowGeometry: { x: 250, y: 350, width: 100, height: 100 } });
       }
       if (overrides.cursorFailure && request.op === 'cursor') {
         Object.assign(reply, { ok: false, error_code: 'HELPER_EXITED', message: 'cursor transport failed after paste' });
@@ -206,6 +208,14 @@ describe.each(['stdio', 'addon'] as const)('Desktop reply provenance (%s)', (tra
       window: { id: 43, processStartTime: '133000000000000101' },
       screenshot: null, error: expect.stringMatching(/STALE_FRAME/)
     });
+    // The rejected popup must not replace the main picture as default crop frame,
+    // nor leave a guessable unpublished frame id valid for later input.
+    expect(state.screenshot?.region.x).toBe(0);
+    const cropped = await computer.screenshot({ crop: { x: 0, y: 0, width: 10, height: 10 } });
+    expect(cropped.region.x).toBe(0);
+    expect(cropped.region.y).toBe(0);
+    await expect(computer.act([{ type: 'move', x: 10, y: 10 }], { frameId: state.screenshot!.frameId + 1 }))
+      .rejects.toThrow(/STALE_FRAME/);
   });
 
   it.runIf(transport === 'stdio')('pins the original parent incarnation for each separately captured popup', async () => {

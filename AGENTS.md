@@ -5095,6 +5095,10 @@ its completion receipt into a failure. When both screenshot and accessibility
 channels fail, report an explicit observation failure even if metadata is available;
 preserve the native crash breaker. Recovery fails closed when this process-incarnation
 identity cannot be proved.
+An optional related-popup capture rejected after publication checks must also
+discard its unpublished frame and restore the previous crop-frame selection.
+The standalone native `act_ui` protocol must preserve the original error code
+through PowerShell's method-invocation exception wrapper.
 If HWND reuse is proved by a UI-free breaker preflight, the replacement owner is
 the recovery identity for that observation; changing it again during the crash
 fails `STALE_WINDOW`. Semantic input is never replayed. WPF and unidentified

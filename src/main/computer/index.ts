@@ -1366,6 +1366,11 @@ export async function getWindowState(opts: {
       if (process.platform === 'win32' && opts.includeRelated && !screenshotUnavailable && Array.isArray(reply['relatedWindows'])) {
         for (const relatedWindow of (reply['relatedWindows'] as WindowInfo[]).slice(0, 3)) {
           if (!Number.isSafeInteger(relatedWindow.id) || relatedWindow.id <= 0 || relatedWindow.id === window.id) continue;
+          // A rejected optional popup capture is not part of the published observation.
+          // In particular, screenshotLocked already remembers its frame before we compare
+          // its process incarnation with the earlier popup enumeration.
+          const beforeRelatedFrames = new Map(frames);
+          const beforeRelatedLastFrame = lastFrame;
           try {
             const relatedShot = includeScreenshot
               ? await screenshotLocked({ window: relatedWindow.id, ownerWindow: window.id,
@@ -1384,6 +1389,13 @@ export async function getWindowState(opts: {
             // invalidates the identity of the complete observation, including
             // already captured primary pixels, refs and related metadata.
             if (String(err).includes('parent process incarnation')) throw err;
+            // Restore only this rejected popup's unpublished frame effects. Do not
+            // resurrect frames if the native helper generation changed mid-capture.
+            if (isHelperGenerationActive(generationOfReply(reply))) {
+              frames.clear();
+              for (const [id, frame] of beforeRelatedFrames) frames.set(id, frame);
+              lastFrame = beforeRelatedLastFrame;
+            }
             // A disappearing popup must not discard the useful main-window observation.
             // Capture rechecks native ownership; never substitute arbitrary screen pixels.
             related.push({ window: relatedWindow, screenshot: null, error: (err instanceof Error ? err.message : String(err)).slice(0, 500) });

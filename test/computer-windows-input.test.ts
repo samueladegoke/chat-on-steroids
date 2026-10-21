@@ -216,6 +216,18 @@ if ($result.ok -ne $false -or $result.error_code -ne 'OCCLUDED_TARGET' -or $resu
   throw 'occluded coordinates were injected into a different window'
 }
 function Assert-PhysicalHit([int64]$id, [int]$x, [int]$y) { }
+# Standalone screen-coordinate input has no HWND incarnation to compare.
+# The no-focus native callback must not manufacture WINDOW_APP_MISMATCH.
+foreach ($withScreenFrame in @($false, $true)) {
+  [Clf]::TestReset(0)
+  $screenAction = @{ op='act'; actions=@(@{ type='click'; x=10; y=20 }) }
+  if ($withScreenFrame) { $screenAction.frame = @{ id=1; region=@{ x=0; y=0; width=1000; height=1000 } } }
+  $screenResult = Handle-Request $screenAction
+  if ($screenResult.ok -ne $true -or $screenResult.completed_count -ne 1 -or
+      [Clf]::TestEvents -notcontains 'mouse:2') {
+    throw ('UNTARGETED_SCREEN_CLICK_BROKEN: ' + ($screenResult | ConvertTo-Json -Compress))
+  }
+}
 # Real SendInput can accept 5 of 6 input packets. This is NOT equivalent to
 # completing zero clicks safely: two full clicks and the third DOWN happened,
 # and recovery-UP may complete the third click. Preserve the accepted prefix.

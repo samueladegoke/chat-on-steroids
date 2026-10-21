@@ -127,6 +127,7 @@ Expect-Hit 100 305 $false 'FOREIGN_MENU_ACCEPTED'
 Expect-Hit 100 306 $false 'FOREIGN_CHILD_ACCEPTED'
 Expect-Hit 130 400 $false 'REPARENTED_TARGET_FOREIGN_ROOT_ACCEPTED'
 Expect-Hit 130 401 $false 'REPARENTED_TARGET_FOREIGN_CHILD_ACCEPTED'
+Expect-Hit 130 130 $false 'REPARENTED_TARGET_SELF_ACCEPTED'
 Expect-Hit 100 0 $false 'NULL_HIT_ACCEPTED'
 # A sibling window on the SAME GUI thread can open an ownerless menu; the GUI
 # thread by itself is insufficient evidence that this popup belongs to A.
@@ -212,6 +213,31 @@ Write-Output 'OCCLUSION_FAILS_CLOSED_BEFORE_POINTER_DOWN'
       const result = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', script], { encoding: 'utf8', windowsHide: true, timeout: 20_000 });
       expect(result.status, result.stderr + result.stdout).toBe(0);
       expect(result.stdout).toContain('OCCLUSION_FAILS_CLOSED_BEFORE_POINTER_DOWN');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('preserves the native uncertainty code through the standalone UI action transport catch', () => {
+    expect(HELPER_SCRIPT).toContain("'act_ui' {");
+    const loopStart = HELPER_SCRIPT.indexOf('while (($line = [Console]::In.ReadLine()) -ne $null) {');
+    expect(loopStart).toBeGreaterThan(0);
+    const protocolLoop = HELPER_SCRIPT.slice(loopStart);
+    const source = String.raw`
+$ErrorActionPreference = 'Stop'
+Add-Type -TypeDefinition @"
+public static class Clf {
+  public static void ThrowUncertain() { throw new System.InvalidOperationException("INPUT_EFFECT_UNCONFIRMED: synthetic accepted native down"); }
+}
+"@
+function Handle-Request($request) { [Clf]::ThrowUncertain(); return @{ ok = $true } }
+` + protocolLoop;
+    const dir = mkdtempSync(path.join(tmpdir(), 'cos-actui-error-'));
+    try {
+      const script = path.join(dir, 'actui-error.ps1');
+      writeFileSync(script, source, 'utf8');
+      const result = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', script], {
+        input: '{"op":"act_ui"}\n', encoding: 'utf8', windowsHide: true, timeout: 20_000
+      });
+      expect(result.status, result.stderr + result.stdout).toBe(0);
+      expect(JSON.parse(result.stdout.trim())).toMatchObject({ ok: false, error_code: 'INPUT_EFFECT_UNCONFIRMED' });
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });
