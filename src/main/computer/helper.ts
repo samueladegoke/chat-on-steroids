@@ -211,7 +211,10 @@ public static class Clf {
   public static void Click(int x, int y, string button, int times, long target, Action afterMove) {
     if (times < 1 || times > 3) throw new ArgumentException("BAD_ACTION: click count must be between 1 and 3");
     Move(x, y);
-    if (afterMove != null) afterMove();
+    if (afterMove != null) {
+      GuardPointerReceiver(target, x, y); // Wait for actual landing before native identity postflight.
+      afterMove();
+    }
     GuardPointerReceiver(target, x, y);
     uint down, up;
     ButtonFlags(button, out down, out up);
@@ -242,7 +245,10 @@ public static class Clf {
 
   public static void Scroll(int x, int y, int dx, int dy, bool rawWheel, long target, Action afterMove) {
     Move(x, y);
-    if (afterMove != null) afterMove();
+    if (afterMove != null) {
+      GuardPointerReceiver(target, x, y);
+      afterMove();
+    }
     GuardPointerReceiver(target, x, y);
     List<INPUT> batch = new List<INPUT>();
     // Positive scroll_y means "scroll down" for the caller; the wheel API is the
@@ -276,7 +282,10 @@ public static class Clf {
     uint down, up;
     ButtonFlags(button, out down, out up);
     Move(xs[0], ys[0]);
-    if (afterMove != null) afterMove();
+    if (afterMove != null) {
+      GuardPointerReceiver(target, xs[0], ys[0]);
+      afterMove();
+    }
     GuardPointerReceiver(target, xs[0], ys[0]);
     try {
       Send(new INPUT[] { Mouse(down, 0, 0, 0) });
