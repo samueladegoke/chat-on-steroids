@@ -287,8 +287,11 @@ public static class Clf {
       afterMove();
     }
     GuardPointerReceiver(target, xs[0], ys[0]);
+    bool pressed = false;
+    Exception failure = null;
     try {
       Send(new INPUT[] { Mouse(down, 0, 0, 0) });
+      pressed = true;
       int steps = Math.Min(256, Math.Max(2, (int)Math.Ceiling(durationMs / 10.0)));
       int segment = 1;
       var clock = System.Diagnostics.Stopwatch.StartNew();
@@ -303,8 +306,16 @@ public static class Clf {
         int remaining = (int)Math.Ceiling((double)durationMs * step / steps - clock.ElapsedMilliseconds);
         if (remaining > 0) System.Threading.Thread.Sleep(Math.Min(10, remaining));
       }
-    } finally {
-      Send(new INPUT[] { Mouse(up, 0, 0, 0) });
+    } catch (Exception error) {
+      failure = error;
+    }
+    // Always attempt release. Never let a failed cleanup disguise earlier effects.
+    try { Send(new INPUT[] { Mouse(up, 0, 0, 0) }); }
+    catch (Exception error) { if (failure == null) failure = error; }
+    if (failure != null) {
+      if (pressed && !failure.GetBaseException().Message.StartsWith("INPUT_EFFECT_UNCONFIRMED:"))
+        throw new InvalidOperationException("INPUT_EFFECT_UNCONFIRMED: drag accepted button-down before failing: " + failure.GetBaseException().Message);
+      System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(failure).Throw();
     }
   }
 
@@ -331,13 +342,20 @@ public static class Clf {
     if (text.IndexOf('\r') >= 0 || text.IndexOf('\n') >= 0)
       throw new InvalidOperationException("MULTILINE_REQUIRES_PASTE: literal multiline text requires the clipboard paste action");
     List<INPUT> batch = new List<INPUT>();
-    foreach (char c in text) {
-      batch.Add(Unicode(c, false));
-      batch.Add(Unicode(c, true));
-      // SendInput caps out on very long batches; flush in chunks.
-      if (batch.Count >= 200) { SendText(batch); batch.Clear(); }
+    bool priorChunkSent = false;
+    try {
+      foreach (char c in text) {
+        batch.Add(Unicode(c, false));
+        batch.Add(Unicode(c, true));
+        // SendInput caps out on very long batches; flush in chunks.
+        if (batch.Count >= 200) { SendText(batch); priorChunkSent = true; batch.Clear(); }
+      }
+      if (batch.Count > 0) SendText(batch);
+    } catch (Exception error) {
+      if (priorChunkSent && !error.GetBaseException().Message.StartsWith("INPUT_EFFECT_UNCONFIRMED:"))
+        throw new InvalidOperationException("INPUT_EFFECT_UNCONFIRMED: earlier text chunks were accepted before failure: " + error.GetBaseException().Message);
+      throw;
     }
-    if (batch.Count > 0) SendText(batch);
   }
 
   static void SendText(List<INPUT> batch) {
@@ -365,11 +383,21 @@ public static class Clf {
     List<INPUT> up = new List<INPUT>();
     for (int i = 0; i < vks.Length; i++) down.Add(Key(vks[i], false));
     for (int i = vks.Length - 1; i >= 0; i--) up.Add(Key(vks[i], true));
+    bool pressed = false;
+    Exception failure = null;
     try {
       Send(down.ToArray());
+      pressed = true;
       System.Threading.Thread.Sleep(35);
-    } finally {
-      Send(up.ToArray());
+    } catch (Exception error) {
+      failure = error;
+    }
+    try { Send(up.ToArray()); }
+    catch (Exception error) { if (failure == null) failure = error; }
+    if (failure != null) {
+      if (pressed && !failure.GetBaseException().Message.StartsWith("INPUT_EFFECT_UNCONFIRMED:"))
+        throw new InvalidOperationException("INPUT_EFFECT_UNCONFIRMED: key-down sequence was accepted before failure: " + failure.GetBaseException().Message);
+      System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(failure).Throw();
     }
   }
 

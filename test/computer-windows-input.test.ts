@@ -56,6 +56,27 @@ try { [Clf]::Drag([int[]]@(1,2), [int[]]@(1,2), 'left'); throw 'drag unexpectedl
   if ($_.Exception.Message -notmatch 'SendInput was blocked') { throw }
 }
 if ([Clf]::TestEvents[[Clf]::TestEvents.Count - 1] -ne 'mouse:4') { throw 'drag did not release after move failure' }
+# The pointer-down already succeeded even if a subsequent interpolated MOVE
+# accepts zero packets. The logical drag is not safe to retry.
+function Assert-PhysicalHit([int64]$id, [int]$x, [int]$y) { }
+function Assert-CoordinateFrame($frame, [bool]$noFocus = $false) { }
+[Clf]::TestReset(3)
+$result = Handle-Request ('{"op":"act","targetWindow":42,"frame":{"id":1},"actions":[{"type":"drag","xs":[10,900],"ys":[20,30],"durationMs":50}]}' | ConvertFrom-Json)
+if ($result.ok -ne $false -or $result.error_code -ne 'INPUT_EFFECT_UNCONFIRMED' -or $result.completed_count -ne 0 -or
+    [Clf]::TestEvents -notcontains 'mouse:2' -or [Clf]::TestEvents[-1] -ne 'mouse:4') {
+  throw ('DRAG_MUTATION_WAS_REPORTED_AS_SAFE: ' + ($result | ConvertTo-Json -Compress))
+}
+[Clf]::TestReset(2)
+try { [Clf]::Press([int[]]@(17,83)); throw 'chord unexpectedly succeeded' } catch {
+  if ($_.Exception.GetBaseException().Message -notmatch '^INPUT_EFFECT_UNCONFIRMED:') { throw 'CHORD_RELEASE_FAILURE_WAS_REPORTED_AS_SAFE' }
+}
+if ([Clf]::TestEvents -notcontains 'key:17:0') { throw 'CHORD_DOWN_NOT_APPLIED' }
+[Clf]::TestReset(2)
+$result = Handle-Request (@{ op='act'; actions=@(@{ type='type'; text=('a' * 101) }) })
+if ($result.ok -ne $false -or $result.error_code -ne 'INPUT_EFFECT_UNCONFIRMED' -or $result.completed_count -ne 0 -or
+    [Clf]::TestEvents.Count -lt 200) {
+  throw ('CHUNKED_TEXT_FAILURE_WAS_REPORTED_AS_SAFE: ' + ($result | ConvertTo-Json -Compress))
+}
 [Clf]::TestReset(0)
 [Clf]::Drag([int[]]@(0,999), [int[]]@(0,999), 'left', 50)
 if ([Clf]::TestMoves.Count -le 2 -or [Clf]::TestMoves[0] -ne '0,0' -or [Clf]::TestMoves[[Clf]::TestMoves.Count - 1] -ne '65535,65535' -or [Clf]::TestEvents[[Clf]::TestEvents.Count - 1] -ne 'mouse:4') { throw 'two-point drag did not interpolate to exact endpoint and release' }
@@ -124,6 +145,27 @@ if ($result.ok -ne $false -or $result.error_code -ne 'OCCLUDED_TARGET' -or
   throw 'CONFINED_CURSOR_DELIVERED_INPUT_OUTSIDE_REQUESTED_POINT'
 }
 [Clf]::TestCursorOffset = 0
+# First pointer guard accepts the hit. The no-focus identity callback changes
+# the actual receiver; only the FINAL post-callback guard can refuse the input.
+function Assert-CoordinateFrame($frame, [bool]$noFocus = $false) {
+  if ($noFocus) { [Clf]::TestPointerAllowed = $false }
+}
+foreach ($type in @('click','scroll','drag')) {
+  [Clf]::TestReset(0)
+  [Clf]::TestPointerAllowed = $true
+  $request = switch ($type) {
+    click { '{"op":"act","targetWindow":42,"frame":{"id":1},"actions":[{"type":"click","x":10,"y":20}]}' | ConvertFrom-Json }
+    scroll { '{"op":"act","targetWindow":42,"frame":{"id":1},"actions":[{"type":"scroll","x":10,"y":20,"scroll_y":1}]}' | ConvertFrom-Json }
+    drag { '{"op":"act","targetWindow":42,"frame":{"id":1},"actions":[{"type":"drag","xs":[10,900],"ys":[20,30],"durationMs":50}]}' | ConvertFrom-Json }
+  }
+  $result = Handle-Request $request
+  if ($result.ok -ne $false -or $result.error_code -ne 'OCCLUDED_TARGET' -or $result.completed_count -ne 0 -or
+      [Clf]::TestMoves.Count -ne 1 -or
+      @([Clf]::TestEvents | Where-Object { $_ -match '^mouse:(2|4|8|16|32|64|2048|4096)$' }).Count -ne 0) {
+    throw ('POST_CALLBACK_RECEIVER_SWAP_APPLIED_INPUT: ' + $type)
+  }
+}
+[Clf]::TestPointerAllowed = $true
 # The post-move pure frame/owner callback must execute in the same native call
 # before any button/wheel. No second Move can slip between it and SendInput.
 function Assert-CoordinateFrame($frame, [bool]$noFocus = $false) {

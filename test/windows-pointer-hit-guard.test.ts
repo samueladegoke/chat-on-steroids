@@ -167,7 +167,7 @@ public static class Clf {
   public static int Clicks=0;
   public static bool InputIsFocused(long id) { return true; }
   public static bool HitTargetsWindow(long id, int x, int y) { return false; }
-  public static void Click(int x, int y, string button, int times, long target) { Clicks++; }
+  public static void Click(int x, int y, string button, int times, long target, System.Action afterMove) { Clicks++; }
 }
 "@
 $script:UiActionNames=@('invoke')
