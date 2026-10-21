@@ -22,7 +22,7 @@ const fake = vi.hoisted(() => {
   const requests: Array<Record<string, any>> = [];
   const children: Array<Transport> = [];
   const clipboard = { writeText: vi.fn(async (_text: string) => {}), readText: vi.fn(async () => '') };
-  const overrides = { focusFailure: false, geometry: false, semanticOnly: false, cursorFailure: false, popupIdentitySwap: false, popupParentFence: false };
+  const overrides = { focusFailure: false, geometry: false, semanticOnly: false, cursorFailure: false, popupIdentitySwap: false, popupParentFence: false, popupParentSwap: false, popupParentNativeReject: false, parentChanged: false };
   class Transport extends Emitter {
     readonly pid = 9000 + children.length;
     exitCode: number | null = null;
@@ -68,7 +68,10 @@ const fake = vi.hoisted(() => {
         ...(request.__cosRequestId ? { __cosRequestId: request.__cosRequestId } : {})
       };
       if (overrides.popupIdentitySwap && request.op === 'snapshot' && request.id === 77) {
-        Object.assign(reply, { relatedWindows: [{ ...window, id: 43, processStartTime: '133000000000000101' }] });
+        Object.assign(reply, {
+          window: { ...window, processStartTime: '133000000000000505' },
+          relatedWindows: [{ ...window, id: 43, processStartTime: '133000000000000101' }]
+        });
       }
       if (overrides.popupParentFence && request.op === 'snapshot' && request.id === 77) {
         Object.assign(reply, {
@@ -78,6 +81,33 @@ const fake = vi.hoisted(() => {
       }
       if (overrides.popupParentFence && request.op === 'capture' && request.id === 43) {
         Object.assign(reply, { window: { ...window, id: 43, processStartTime: '133000000000000101' } });
+      }
+      if (overrides.popupParentSwap && request.op === 'snapshot' && request.id === 77) {
+        Object.assign(reply, {
+          window: { ...window, processStartTime: '133000000000000505' },
+          relatedWindows: [{ ...window, id: 43, processStartTime: '133000000000000101' }]
+        });
+      }
+      if (overrides.popupParentSwap && request.op === 'capture' && request.id === 43) {
+        Object.assign(reply, { window: { ...window, id: 43, processStartTime: '133000000000000101' } });
+        overrides.parentChanged = true;
+      }
+      if (overrides.popupParentNativeReject && request.op === 'snapshot' && request.id === 77) {
+        Object.assign(reply, {
+          window: { ...window, processStartTime: '133000000000000505' },
+          relatedWindows: [{ ...window, id: 43, processStartTime: '133000000000000101' }]
+        });
+      }
+      if (overrides.popupParentNativeReject && request.op === 'capture' && request.id === 43) {
+        Object.assign(reply, { ok: false, error_code: 'STALE_FRAME',
+          message: 'related popup parent process incarnation changed during capture' });
+      }
+      if (overrides.popupParentSwap && request.op === 'identity' && request.id === 77) {
+        Object.assign(reply, { window: { ...window, processStartTime: overrides.parentChanged
+          ? '133000000000000606' : '133000000000000505' } });
+      }
+      if ((overrides.popupIdentitySwap || overrides.popupParentFence) && request.op === 'identity' && request.id === 77) {
+        Object.assign(reply, { window: { ...window, processStartTime: '133000000000000505' } });
       }
       if (overrides.popupIdentitySwap && request.op === 'capture' && request.id === 43) {
         Object.assign(reply, { window: { ...window, id: 43, processStartTime: '133000000000000202' } });
@@ -144,6 +174,9 @@ describe.each(['stdio', 'addon'] as const)('Desktop reply provenance (%s)', (tra
     fake.overrides.cursorFailure = false;
     fake.overrides.popupIdentitySwap = false;
     fake.overrides.popupParentFence = false;
+    fake.overrides.popupParentSwap = false;
+    fake.overrides.popupParentNativeReject = false;
+    fake.overrides.parentChanged = false;
     Object.defineProperty(process, 'platform', { ...platform, value: transport === 'addon' ? 'darwin' : 'linux' });
     vi.stubEnv('COS_MACOS_DESKTOP_HELPER', '');
     computer = await import('../src/main/computer/index.js');
@@ -180,6 +213,23 @@ describe.each(['stdio', 'addon'] as const)('Desktop reply provenance (%s)', (tra
       ownerWindow: 77,
       expectedOwnerProcessStartTime: '133000000000000505'
     });
+  });
+
+  it.runIf(transport === 'stdio')('rejects the entire observation when parent reincarnates after popup pixels', async () => {
+    Object.defineProperty(process, 'platform', { ...platform, value: 'win32' });
+    fake.overrides.popupParentSwap = true;
+    await expect(computer.getWindowState({ window: 77, includeRelated: true }))
+      .rejects.toThrow(/STALE_FRAME.*parent process incarnation/);
+    expect(fake.requests.find((request) => request.op === 'capture' && request.id === 43))
+      .toMatchObject({ ownerWindow: 77, expectedOwnerProcessStartTime: '133000000000000505' });
+    expect(fake.requests.some((request) => request.op === 'identity' && request.id === 77)).toBe(true);
+  });
+
+  it.runIf(transport === 'stdio')('never downgrades native parent-replacement errors to an optional popup failure', async () => {
+    Object.defineProperty(process, 'platform', { ...platform, value: 'win32' });
+    fake.overrides.popupParentNativeReject = true;
+    await expect(computer.getWindowState({ window: 77, includeRelated: true }))
+      .rejects.toThrow(/STALE_FRAME.*parent process incarnation/);
   });
 
   it('keeps older frames and refs usable while the same helper remains active', async () => {

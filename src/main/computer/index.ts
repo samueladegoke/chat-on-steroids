@@ -1368,14 +1368,28 @@ export async function getWindowState(opts: {
               : null;
             // Enumeration precedes this distinct native capture; reject an
             // incarnation swap instead of publishing B2 pixels under B1 metadata.
-            if (relatedShot && (frameById(relatedShot.frameId)?.processStartTime ?? null) !== (relatedWindow.processStartTime ?? null)) {
+            if (relatedShot && (!/^\d{8,20}$/.test(relatedWindow.processStartTime ?? '') ||
+                (frameById(relatedShot.frameId)?.processStartTime ?? null) !== relatedWindow.processStartTime)) {
               throw new ComputerError('STALE_FRAME: related popup changed process incarnation between enumeration and capture');
             }
             related.push({ window: relatedWindow, screenshot: relatedShot });
           } catch (err) {
+            // An expired child alone is optional. A recycled *original parent*
+            // invalidates the identity of the complete observation, including
+            // already captured primary pixels, refs and related metadata.
+            if (String(err).includes('parent process incarnation')) throw err;
             // A disappearing popup must not discard the useful main-window observation.
             // Capture rechecks native ownership; never substitute arbitrary screen pixels.
             related.push({ window: relatedWindow, screenshot: null, error: (err instanceof Error ? err.message : String(err)).slice(0, 500) });
+          }
+        }
+        if (related.length > 0 && includeScreenshot) {
+          const proof = await runHelper({ op: 'identity', id: window.id },
+            { generation: generationOfReply(reply), code: 'STALE_FRAME' });
+          const parentNow = proof['window'] as WindowInfo | null;
+          if (!hasIncarnation(window) || !parentNow || !hasIncarnation(parentNow) ||
+              windowsWindowIdentity(parentNow) !== windowsWindowIdentity(window)) {
+            throw new ComputerError('STALE_FRAME: related popup parent process incarnation changed before observation returned');
           }
         }
       }

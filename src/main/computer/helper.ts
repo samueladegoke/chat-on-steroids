@@ -1142,10 +1142,10 @@ function Capture-Target($request, [Nullable[int64]]$forcedWindow) {
   # Capture the named window's compositor surface, never pixels of an occluding window.
   # DWM excludes invisible resize borders, so preserve outer geometry separately.
   if ($null -ne $id -and $request.file) {
-    Assert-CaptureParent $request
     if ($request.ownerWindow -and -not [Clf]::IsRelatedWindow([int64]$id, [int64]$request.ownerWindow)) {
       throw 'RELATED_WINDOW_GONE: popup no longer belongs to the observed window'
     }
+    Assert-CaptureParent $request
     Initialize-WindowsCapture
     try {
       $direct = [CosWindowsCapture]::Capture([int64]$id, $maxW, [string]$request.file) -split ','
@@ -1338,6 +1338,11 @@ function Handle-Request($request) {
       $foreground = [Clf]::ForegroundId()
       $result.window = Get-WindowRow $foreground
       $result.screen = $screen.virtual
+    }
+    'identity' {
+      # Read-only postflight for multi-round-trip related popup observation.
+      # Never focus the parent or invoke a potentially crashing UIA provider.
+      $result.window = Get-WindowRow ([int64]$request.id)
     }
     'find_ui' {
       $ui = Find-UiElements $request
