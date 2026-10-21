@@ -5082,7 +5082,10 @@ clicks validate the actual pointer hit receiver and foreground mouse capture, no
 the foreground owner. Only the target or a non-activating popup of its own process
 (owned by it, or ownerless on its GUI thread: menus, dropdown lists, autocomplete)
 may receive them; another process's overlay, even one owned by the target, an
-activatable dialog, or a popup target's owner/sibling fails closed. A drag checks
+activatable dialog, or a popup target's owner/sibling fails closed. The native guard checks
+the target HWND's own PID against its root PID, rejecting a target reparented
+under a foreign root; an ordinary captionless owned popup needs an additional
+tool-window/topmost hint and cannot rely on WS_POPUP alone. A drag checks
 only its pointer-down point, so it may end over another window inside the frame. Explicit UIA
 secondary actions verify the owner after provider property and pattern reads and
 before mutation. Lost native input acknowledgements retain an ambiguous completion

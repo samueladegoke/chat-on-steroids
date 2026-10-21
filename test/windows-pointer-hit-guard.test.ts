@@ -51,12 +51,16 @@ public static class Clf {
     Add(206, 206, 0, POPUP, 0x8C, "Auto-Suggest Dropdown", 10, 1); // unowned autocomplete popup
     Add(207, 207, 100, POPUP, 0x10008, "ToolStripDropDown", 10, 1); // toolkit menu owned by A
     Add(208, 208, 120, POPUP, 0x10008, "ToolStripDropDown", 10, 1); // menu of A's sibling window
+    Add(209, 209, 100, POPUP, 0, "FramelessOwned", 10, 1);      // activatable borderless owned app window
     Add(301, 301, 0, POPUP, NOACTIVATE, "Overlay", 30, 3);      // another app's overlay
     Add(302, 302, 100, POPUP, NOACTIVATE, "Overlay", 30, 3);    // another app's overlay owned by A
     Add(303, 303, 100, DIALOG, 0, "#32770", 10, 1);             // A's activatable owned dialog
     Add(304, 304, 0, POPUP, 0x189, "#32768", 10, 2);            // ownerless menu of another thread
     Add(305, 305, 0, POPUP, 0x189, "#32768", 30, 3);            // another app's ownerless menu
     Add(306, 100, 0, CHILD, 0, "ForeignChild", 30, 3);          // foreign embedded child under A's GA_ROOT
+    Add(400, 400, 0, FRAME, 0, "HostFrame", 40, 4);              // unrelated new top-level host
+    Add(130, 400, 0, CHILD, 0, "AppWindow", 10, 1);             // A target reparented into foreign host
+    Add(401, 400, 0, CHILD, 0, "HostChild", 40, 4);             // foreign host's own receiver
   }
   static IntPtr WindowFromPoint(POINT p) { return new IntPtr(p.X); }
   static bool IsWindow(IntPtr h) { return W.ContainsKey(h.ToInt64()); }
@@ -117,9 +121,12 @@ Expect-Hit 100 303 $false 'ACTIVATABLE_OWNED_DIALOG_ACCEPTED'
 Expect-Hit 201 100 $false 'POPUP_FRAME_HIT_OWNER_ACCEPTED'
 Expect-Hit 201 204 $false 'POPUP_FRAME_HIT_SIBLING_ACCEPTED'
 Expect-Hit 100 208 $false 'OTHER_WINDOW_MENU_ACCEPTED'
+Expect-Hit 100 209 $false 'ACTIVATABLE_FRAMELESS_OWNED_ACCEPTED'
 Expect-Hit 100 304 $false 'OTHER_THREAD_MENU_ACCEPTED'
 Expect-Hit 100 305 $false 'FOREIGN_MENU_ACCEPTED'
 Expect-Hit 100 306 $false 'FOREIGN_CHILD_ACCEPTED'
+Expect-Hit 130 400 $false 'REPARENTED_TARGET_FOREIGN_ROOT_ACCEPTED'
+Expect-Hit 130 401 $false 'REPARENTED_TARGET_FOREIGN_CHILD_ACCEPTED'
 Expect-Hit 100 0 $false 'NULL_HIT_ACCEPTED'
 # A sibling window on the SAME GUI thread can open an ownerless menu; the GUI
 # thread by itself is insufficient evidence that this popup belongs to A.
@@ -165,16 +172,24 @@ $ErrorActionPreference = 'Stop'
 Add-Type -TypeDefinition @"
 public static class Clf {
   public static int Clicks=0;
+  public static bool TestHitAllowed = false;
+  public static bool InNativeCallback = false;
   public static bool InputIsFocused(long id) { return true; }
-  public static bool HitTargetsWindow(long id, int x, int y) { return false; }
-  public static void Click(int x, int y, string button, int times, long target, System.Action afterMove) { Clicks++; }
+  public static bool HitTargetsWindow(long id, int x, int y) { return TestHitAllowed; }
+  public static void Click(int x, int y, string button, int times, long target, System.Action afterMove) {
+    InNativeCallback = true;
+    afterMove();
+    Clicks++;
+  }
 }
 "@
 $script:UiActionNames=@('invoke')
 $current=[pscustomobject]@{ IsEnabled=$true; Name='Blocked'; BoundingRectangle=[pscustomobject]@{ X=10; Y=10; Width=10; Height=10 } }
 $script:element=[pscustomobject]@{ Current=$current }
 function Resolve-UiElement($window,$snapshotId,$runtimeKey) { return $script:element }
-function Assert-InputOwner($target,$owner,$targetApp,$ownerApp) { }
+function Assert-InputOwner($target,$owner,$targetApp,$ownerApp) {
+  if ([Clf]::InNativeCallback) { throw 'STALE_WINDOW: owner changed after cursor movement' }
+}
 function Assert-Focused($id) { }
 function Write-UiaStage($marker) { }
 function Get-RequestedClickCount($request) { return 1 }
@@ -183,6 +198,11 @@ try { $null=Act-UiElement @{ id=77; snapshotId=1; runtimeKey='occluded'; action=
   if ($_.Exception.Message -notmatch '^OCCLUDED_TARGET:') { throw }
 }
 if ([Clf]::Clicks -ne 0) { throw 'OCCLUDED_PIXEL_RECEIVED_SENDINPUT' }
+[Clf]::TestHitAllowed = $true
+try { $null=Act-UiElement @{ id=77; snapshotId=1; runtimeKey='replaced'; action='click'; button='right'; count=1 }; throw 'UNEXPECTED_POSTMOVE_CLICK' } catch {
+  if ($_.Exception.GetBaseException().Message -notmatch '^STALE_WINDOW:') { throw }
+}
+if ([Clf]::Clicks -ne 0 -or -not [Clf]::InNativeCallback) { throw 'POSTMOVE_OWNER_SWAP_WAS_ACCEPTED' }
 Write-Output 'OCCLUSION_FAILS_CLOSED_BEFORE_POINTER_DOWN'
 `;
     const dir = mkdtempSync(path.join(tmpdir(), 'cos-hit-guard-'));

@@ -72,10 +72,21 @@ try { [Clf]::Press([int[]]@(17,83)); throw 'chord unexpectedly succeeded' } catc
 }
 if ([Clf]::TestEvents -notcontains 'key:17:0') { throw 'CHORD_DOWN_NOT_APPLIED' }
 [Clf]::TestReset(2)
+[Clf]::TestTruncateTo = 0
+try { [Clf]::Press([int[]]@(17,83)); throw 'chord unexpectedly succeeded' } catch {
+  if ($_.Exception.GetBaseException().Message -notmatch '^INPUT_EFFECT_UNCONFIRMED:') { throw 'ZERO_PACKET_CHORD_RELEASE_WAS_REPORTED_AS_SAFE' }
+}
+[Clf]::TestReset(2)
 $result = Handle-Request (@{ op='act'; actions=@(@{ type='type'; text=('a' * 101) }) })
 if ($result.ok -ne $false -or $result.error_code -ne 'INPUT_EFFECT_UNCONFIRMED' -or $result.completed_count -ne 0 -or
     [Clf]::TestEvents.Count -lt 200) {
   throw ('CHUNKED_TEXT_FAILURE_WAS_REPORTED_AS_SAFE: ' + ($result | ConvertTo-Json -Compress))
+}
+[Clf]::TestReset(2)
+[Clf]::TestTruncateTo = 0
+$result = Handle-Request (@{ op='act'; actions=@(@{ type='type'; text=('a' * 101) }) })
+if ($result.ok -ne $false -or $result.error_code -ne 'INPUT_EFFECT_UNCONFIRMED' -or $result.completed_count -ne 0) {
+  throw ('ZERO_PACKET_LATER_TEXT_CHUNK_WAS_REPORTED_AS_SAFE: ' + ($result | ConvertTo-Json -Compress))
 }
 [Clf]::TestReset(0)
 [Clf]::Drag([int[]]@(0,999), [int[]]@(0,999), 'left', 50)

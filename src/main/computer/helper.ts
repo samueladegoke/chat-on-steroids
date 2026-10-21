@@ -512,8 +512,11 @@ public static class Clf {
   // desktop-child lists (ComboLBox) and captionless popups (toolkit menus, Auto-Suggest).
   static bool IsTransientPopup(IntPtr window) {
     int style = GetWindowLong(window, -16);
-    if ((GetWindowLong(window, -20) & 0x08000000) != 0 || IsMenu(window) || (style & 0x40000000) != 0) return true;
-    return (style & unchecked((int)0x80000000)) != 0 && (style & 0x00C00000) != 0x00C00000; // WS_POPUP without WS_CAPTION
+    int exStyle = GetWindowLong(window, -20);
+    if ((exStyle & 0x08000000) != 0 || IsMenu(window) || (style & 0x40000000) != 0) return true;
+    // A plain borderless WS_POPUP can be an activatable app window whose pixels
+    // were not observed. Require a toolwindow/topmost popup hint as well.
+    return (exStyle & 0x88) != 0 && (style & unchecked((int)0x80000000)) != 0 && (style & 0x00C00000) != 0x00C00000;
   }
 
   // Menus, dropdown lists and autocomplete popups of the target cover its pixels while it stays
@@ -526,10 +529,14 @@ public static class Clf {
     if (receiverRoot == IntPtr.Zero || targetRoot == IntPtr.Zero) return false;
     // GA_ROOT can be the target even when a different process hosts the hit
     // child (or owns mouse capture). Check the actual receiver, not only root.
-    uint actualProcess, rootProcess;
+    uint actualProcess, rootProcess, targetOwnProcess;
     GetWindowThreadProcessId(receiver, out actualProcess);
     GetWindowThreadProcessId(targetRoot, out rootProcess);
-    if (actualProcess == 0 || rootProcess == 0 || actualProcess != rootProcess) return false;
+    GetWindowThreadProcessId(target, out targetOwnProcess);
+    // A child target can itself be reparented under a foreign top-level HWND.
+    // Neither that foreign root nor its own children are authorized receivers.
+    if (actualProcess == 0 || rootProcess == 0 || targetOwnProcess == 0 ||
+        rootProcess != targetOwnProcess || actualProcess != targetOwnProcess) return false;
     if (receiverRoot == targetRoot) return true;
     uint receiverProcess, targetProcess;
     uint receiverThread = GetWindowThreadProcessId(receiverRoot, out receiverProcess);
