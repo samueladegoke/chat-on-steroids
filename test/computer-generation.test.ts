@@ -221,7 +221,10 @@ describe.each(['stdio', 'addon'] as const)('Desktop reply provenance (%s)', (tra
   it.runIf(transport === 'stdio')('pins the original parent incarnation for each separately captured popup', async () => {
     Object.defineProperty(process, 'platform', { ...platform, value: 'win32' });
     fake.overrides.popupParentFence = true;
-    await computer.getWindowState({ window: 77, includeRelated: true });
+    const state = await computer.getWindowState({ window: 77, includeRelated: true });
+    // Capture order makes the rejected-popup test's attempted frame id
+    // deterministic rather than an arbitrary unallocated guess.
+    expect(state.related?.[0]?.screenshot?.frameId).toBe(state.screenshot!.frameId + 1);
     const capture = fake.requests.find((request) => request.op === 'capture' && request.id === 43);
     expect(capture).toMatchObject({
       ownerWindow: 77,
