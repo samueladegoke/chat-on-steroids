@@ -35,6 +35,7 @@ public static class Clf {
   static Dictionary<long, long[]> W = new Dictionary<long, long[]>();
   static Dictionary<long, string> Class = new Dictionary<long, string>();
   public static long Capture = 0;
+  public static long MenuOwner = 100;
   static void Add(long h, long root, long owner, long style, long ex, string cls, long pid, long tid) {
     W[h] = new long[] { root, owner, style, ex, pid, tid }; Class[h] = cls;
   }
@@ -88,7 +89,7 @@ public static class Clf {
   }
   static bool GetGUIThreadInfo(uint thread, ref GUITHREADINFO info) {
     if (thread == 0) thread = 1; // A's thread is the foreground thread
-    info.menuOwner = thread == 1 ? new IntPtr(100) : thread == 3 ? new IntPtr(302) : IntPtr.Zero;
+    info.menuOwner = thread == 1 ? new IntPtr(MenuOwner) : thread == 3 ? new IntPtr(302) : IntPtr.Zero;
     info.capture = thread == 1 ? new IntPtr(Capture) : IntPtr.Zero;
     return true;
   }
@@ -118,6 +119,10 @@ Expect-Hit 100 208 $false 'OTHER_WINDOW_MENU_ACCEPTED'
 Expect-Hit 100 304 $false 'OTHER_THREAD_MENU_ACCEPTED'
 Expect-Hit 100 305 $false 'FOREIGN_MENU_ACCEPTED'
 Expect-Hit 100 0 $false 'NULL_HIT_ACCEPTED'
+# A sibling window on the SAME GUI thread can open an ownerless menu; the GUI
+# thread by itself is insufficient evidence that this popup belongs to A.
+[Clf]::MenuOwner = 120; Expect-Hit 100 202 $false 'SIBLING_OWNERLESS_MENU_ACCEPTED'
+[Clf]::MenuOwner = 100; Expect-Hit 100 202 $true 'OWN_OWNERLESS_MENU_REJECTED_AFTER_SIBLING'
 # Mouse capture on the foreground thread overrides WindowFromPoint.
 [Clf]::Capture = 301; Expect-Hit 100 100 $false 'FOREIGN_CAPTURE_ACCEPTED'
 [Clf]::Capture = 110; Expect-Hit 100 100 $true 'TARGET_CAPTURE_REJECTED'
@@ -138,6 +143,15 @@ Write-Output 'OWNED_POPUP_ALLOWED_FOREIGN_OVERLAY_DENIED'
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 
+  it('rechecks the physical receiver after movement and before every click, wheel or drag down', () => {
+    const source = HELPER_SCRIPT.split('  public static void Click(int x, int y, string button, int times, long target) {')[1]?.split('  static INPUT Key(')[0] ?? '';
+    expect(source).toMatch(/Move\(x, y\);[\s\S]*?GuardPointerReceiver\(target, x, y\);[\s\S]*?Send\(batch\.ToArray\(\)\)/);
+    expect(source).toMatch(/public static void Scroll\([\s\S]*?Move\(x, y\);[\s\S]*?GuardPointerReceiver\(target, x, y\);[\s\S]*?Send\(batch\.ToArray\(\)\)/);
+    expect(source).toMatch(/Move\(xs\[0\], ys\[0\]\);[\s\S]*?GuardPointerReceiver\(target, xs\[0\], ys\[0\]\);[\s\S]*?Mouse\(down/);
+    expect(HELPER_SCRIPT).toContain('[Clf]::Click([int]$a.x, [int]$a.y, $a.button, (Get-RequestedClickCount $a), $actionTarget)');
+    expect(HELPER_SCRIPT).toContain('[Clf]::Scroll([int]$a.x, [int]$a.y, [int]$a.scroll_x, [int]$a.scroll_y, [bool]$a.rawWheel, $actionTarget)');
+  });
+
   it('rejects an overlay before physical indexed-click sends any OS input', () => {
     const hit = 'function Assert-PhysicalHit([int64]$id, [int]$x, [int]$y) {' +
       HELPER_SCRIPT.split('function Assert-PhysicalHit([int64]$id, [int]$x, [int]$y) {')[1]?.split('function Assert-CoordinateFrame(')[0];
@@ -150,7 +164,7 @@ public static class Clf {
   public static int Clicks=0;
   public static bool InputIsFocused(long id) { return true; }
   public static bool HitTargetsWindow(long id, int x, int y) { return false; }
-  public static void Click(int x, int y, string button, int times) { Clicks++; }
+  public static void Click(int x, int y, string button, int times, long target) { Clicks++; }
 }
 "@
 $script:UiActionNames=@('invoke')

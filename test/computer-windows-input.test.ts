@@ -29,7 +29,13 @@ describe.runIf(process.platform === 'win32')('compiled Windows input failure rec
       .replace('[DllImport("user32.dll")] static extern int GetSystemMetrics(int index);',
         'static int GetSystemMetrics(int index) { return index == 78 || index == 79 ? 1000 : 0; }')
       .replace('public static long ForeignInputRoot(long handle) {',
-        'public static long ForeignInputRoot(long handle) {\n    if (TestForeignRoot != 0) return TestForeignRoot;');
+        'public static long ForeignInputRoot(long handle) {\n    if (TestForeignRoot != 0) return TestForeignRoot;')
+      // The production guard is exercised after Move, but the synthetic Win32
+      // receiver is controlled: this test must never depend on the user's live
+      // foreground app or pointer capture while OS SendInput is stubbed.
+      .replace('static void GuardPointerReceiver(long target, int x, int y) {',
+        'public static bool TestPointerAllowed = true;\n  static void GuardPointerReceiver(long target, int x, int y) {')
+      .replace('(!InputIsFocused(target) || !HitTargetsWindow(target, x, y))', '!TestPointerAllowed');
     const assertions = String.raw`
 [Clf]::TestReset(3)
 try { [Clf]::Drag([int[]]@(1,2), [int[]]@(1,2), 'left'); throw 'drag unexpectedly succeeded' } catch {
@@ -77,6 +83,24 @@ $script:checks = 0
 $script:focuses = @()
 function Assert-Focused([int64]$id) { $script:focuses += $id }
 function Assert-PhysicalHit([int64]$id, [int]$x, [int]$y) { }
+# Earlier PowerShell preflight may pass, then pointer movement opens a foreign
+# overlay. The native guard MUST refuse the button/wheel/down with no such event
+# entering SendInput; only a harmless pointer MOVE may already have happened.
+foreach ($type in @('click','scroll','drag')) {
+  [Clf]::TestReset(0)
+  [Clf]::TestPointerAllowed = $false
+  $request = switch ($type) {
+    click { '{"op":"act","targetWindow":42,"frame":{"id":1},"actions":[{"type":"click","x":10,"y":20}]}' | ConvertFrom-Json }
+    scroll { '{"op":"act","targetWindow":42,"frame":{"id":1},"actions":[{"type":"scroll","x":10,"y":20,"scroll_y":1}]}' | ConvertFrom-Json }
+    drag { '{"op":"act","targetWindow":42,"frame":{"id":1},"actions":[{"type":"drag","xs":[10,900],"ys":[20,30],"durationMs":50}]}' | ConvertFrom-Json }
+  }
+  $result = Handle-Request $request
+  if ($result.ok -ne $false -or $result.error_code -ne 'OCCLUDED_TARGET' -or $result.completed_count -ne 0 -or
+      @([Clf]::TestEvents | Where-Object { $_ -match '^mouse:(2|4|8|16|32|64|2048|4096)$' }).Count -ne 0) {
+    throw ('POST_MOVE_RECEIVER_REDIRECT_APPLIED_INPUT: ' + $type)
+  }
+}
+[Clf]::TestPointerAllowed = $true
 function Assert-CoordinateFrame($frame) {
   if ($script:focuses.Count -ne $script:checks) { throw 'frame focus occurred before ownership validation' }
   $script:checks++
@@ -190,6 +214,31 @@ if ($result.ok -ne $true -or ($script:focuses -join ',') -ne '42' -or [Clf]::Tes
   throw ('PROVEN_POPUP_OWNER_REFUSED: ' + ($result | ConvertTo-Json -Compress))
 }
 [Clf]::TestForeignRoot = 0
+# Owner identity must be checked before and after a distinct popup capture,
+# even if its HWND still appears related and its process matches its old row.
+function Get-WindowRow([int64]$id) {
+  $time = if ($id -eq 77) { '133000000000000202' } else { '133000000000000101' }
+  return @{ id=$id; app='fixture.exe'; processId=101; processPath='C:\Apps\fixture.exe'; processStartTime=$time }
+}
+$script:didCapture = 0
+function Capture-Target($request, $forcedWindow) { $script:didCapture++; return @{ width=10; height=10 } }
+try {
+  $null = Handle-Request ('{"op":"capture","id":42,"ownerWindow":77,"expectedOwnerProcessStartTime":"133000000000000101"}' | ConvertFrom-Json)
+  throw 'PARENT_REPLACEMENT_WAS_ACCEPTED'
+} catch { if ($_.Exception.Message -notmatch 'STALE_FRAME:') { throw } }
+if ($script:didCapture -ne 0) { throw 'PARENT_REPLACEMENT_RAN_CAPTURE' }
+$script:parentNow = '133000000000000101'
+function Get-WindowRow([int64]$id) {
+  return @{ id=$id; app='fixture.exe'; processId=101; processPath='C:\Apps\fixture.exe'; processStartTime= $(if ($id -eq 77) { $script:parentNow } else { '133000000000000101' }) }
+}
+function Capture-Target($request, $forcedWindow) {
+  $script:parentNow = '133000000000000202'
+  return @{ width=10; height=10 }
+}
+try {
+  $null = Handle-Request ('{"op":"capture","id":42,"ownerWindow":77,"expectedOwnerProcessStartTime":"133000000000000101"}' | ConvertFrom-Json)
+  throw 'PARENT_REPLACEMENT_DURING_CAPTURE_ACCEPTED'
+} catch { if ($_.Exception.Message -notmatch 'STALE_FRAME:') { throw } }
 Write-Output 'WINDOWS_INPUT_PROBE_OK'
 `;
     const dir = mkdtempSync(path.join(tmpdir(), 'cos-input-test-'));

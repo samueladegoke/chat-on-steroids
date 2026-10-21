@@ -175,8 +175,22 @@ public static class Clf {
   }
 
   public static void Click(int x, int y, string button, int times) {
+    Click(x, y, button, times, 0);
+  }
+
+  // The caller's first hit test precedes pointer movement. Moving can open a
+  // tooltip/overlay or change mouse capture; recheck after Move, immediately
+  // before the irreversible button/wheel input, without restricting drag drops.
+  static void GuardPointerReceiver(long target, int x, int y) {
+    if (target > 0 && (!InputIsFocused(target) || !HitTargetsWindow(target, x, y))) {
+      throw new InvalidOperationException("OCCLUDED_TARGET: receiver changed after pointer movement; observe again");
+    }
+  }
+
+  public static void Click(int x, int y, string button, int times, long target) {
     if (times < 1 || times > 3) throw new ArgumentException("BAD_ACTION: click count must be between 1 and 3");
     Move(x, y);
+    GuardPointerReceiver(target, x, y);
     uint down, up;
     ButtonFlags(button, out down, out up);
     List<INPUT> batch = new List<INPUT>();
@@ -197,7 +211,12 @@ public static class Clf {
   }
 
   public static void Scroll(int x, int y, int dx, int dy, bool rawWheel) {
+    Scroll(x, y, dx, dy, rawWheel, 0);
+  }
+
+  public static void Scroll(int x, int y, int dx, int dy, bool rawWheel, long target) {
     Move(x, y);
+    GuardPointerReceiver(target, x, y);
     List<INPUT> batch = new List<INPUT>();
     // Positive scroll_y means "scroll down" for the caller; the wheel API is the
     // other way round, hence the negation.
@@ -212,6 +231,10 @@ public static class Clf {
   }
 
   public static void Drag(int[] xs, int[] ys, string button, int durationMs) {
+    Drag(xs, ys, button, durationMs, 0);
+  }
+
+  public static void Drag(int[] xs, int[] ys, string button, int durationMs, long target) {
     if (xs == null || ys == null || xs.Length != ys.Length || xs.Length < 2 || xs.Length > 64 || durationMs < 50 || durationMs > 2000)
       throw new ArgumentException("BAD_ACTION: drag requires 2-64 points and a 50-2000 ms duration");
     double[] distance = new double[xs.Length];
@@ -222,6 +245,7 @@ public static class Clf {
     uint down, up;
     ButtonFlags(button, out down, out up);
     Move(xs[0], ys[0]);
+    GuardPointerReceiver(target, xs[0], ys[0]);
     try {
       Send(new INPUT[] { Mouse(down, 0, 0, 0) });
       int steps = Math.Min(256, Math.Max(2, (int)Math.Ceiling(durationMs / 10.0)));
@@ -436,7 +460,14 @@ public static class Clf {
     uint receiverThread = GetWindowThreadProcessId(receiverRoot, out receiverProcess);
     uint targetThread = GetWindowThreadProcessId(targetRoot, out targetProcess);
     if (receiverProcess == 0 || receiverProcess != targetProcess || !IsTransientPopup(receiverRoot) || InputRoot(targetRoot) != targetRoot) return false;
-    return OwnedBy(receiverRoot, targetRoot) || (GetWindow(receiverRoot, 4) == IntPtr.Zero && receiverThread == targetThread);
+    if (OwnedBy(receiverRoot, targetRoot)) return true;
+    if (GetWindow(receiverRoot, 4) != IntPtr.Zero || receiverThread != targetThread) return false;
+    if (!IsMenu(receiverRoot)) return true;
+    // A second top-level window on the very same GUI thread can own an
+    // ownerless #32768 menu. Attribute that menu by its live GUI menuOwner.
+    GUITHREADINFO gui = new GUITHREADINFO();
+    gui.cbSize = (uint)Marshal.SizeOf(typeof(GUITHREADINFO));
+    return GetGUIThreadInfo(receiverThread, ref gui) && gui.menuOwner != IntPtr.Zero && OwnedBy(gui.menuOwner, targetRoot);
   }
 
   // WindowFromPoint resolves the top-level receiver, but mouse capture on the foreground
@@ -905,7 +936,7 @@ function Act-UiElement($request) {
       $px = [int][Math]::Round($r.X + $r.Width / 2)
       $py = [int][Math]::Round($r.Y + $r.Height / 2)
       Assert-PhysicalHit $id $px $py
-      [Clf]::Click($px, $py, $button, $count)
+      [Clf]::Click($px, $py, $button, $count, $id)
       $route = 'sendinput'
     }
   } else {
@@ -1111,6 +1142,7 @@ function Capture-Target($request, [Nullable[int64]]$forcedWindow) {
   # Capture the named window's compositor surface, never pixels of an occluding window.
   # DWM excludes invisible resize borders, so preserve outer geometry separately.
   if ($null -ne $id -and $request.file) {
+    Assert-CaptureParent $request
     if ($request.ownerWindow -and -not [Clf]::IsRelatedWindow([int64]$id, [int64]$request.ownerWindow)) {
       throw 'RELATED_WINDOW_GONE: popup no longer belongs to the observed window'
     }
@@ -1130,6 +1162,7 @@ function Capture-Target($request, [Nullable[int64]]$forcedWindow) {
     if ($request.ownerWindow -and -not [Clf]::IsRelatedWindow([int64]$id, [int64]$request.ownerWindow)) {
       throw 'RELATED_WINDOW_GONE: popup ownership changed during capture'
     }
+    Assert-CaptureParent $request
     $x = [int]$direct[0]; $y = [int]$direct[1]; $w = [int]$direct[2]; $h = [int]$direct[3]
     $out = @($direct[4], $direct[5])
     $mode = 'window'
@@ -1251,6 +1284,18 @@ function Assert-SnapshotOwner($original, $current) {
   }
 }
 
+function Assert-CaptureParent($request) {
+  if (-not $request.ownerWindow) { return }
+  # Ownership of a reused HWND is not proof that the parent is the *observed*
+  # process. Require its FILETIME independently of the popup's own incarnation.
+  $expected = [string]$request.expectedOwnerProcessStartTime
+  $parent = Get-WindowRow ([int64]$request.ownerWindow)
+  if ($expected -notmatch '^[0-9]{8,20}$' -or $null -eq $parent -or
+      [string]$parent.processStartTime -cne $expected) {
+    throw 'STALE_FRAME: related popup parent process incarnation changed during capture'
+  }
+}
+
 function Handle-Request($request) {
   [Clf]::EnsureDpiAware()
   # Clear request-scoped input proof even if a prior helper request failed.
@@ -1312,8 +1357,10 @@ function Handle-Request($request) {
       $result.route = $ui.route
     }
     'capture' {
+      Assert-CaptureParent $request
       $captureOwner = if ($request.id) { Get-WindowRow ([int64]$request.id) } else { $null }
       $capture = Capture-Target $request $null
+      Assert-CaptureParent $request
       if ($request.id) {
         $latestOwner = Get-WindowRow ([int64]$request.id)
         Assert-SnapshotOwner $captureOwner $latestOwner
@@ -1451,10 +1498,10 @@ function Handle-Request($request) {
               $routes += 'shell'
             }
             'move'         { [Clf]::Move([int]$a.x, [int]$a.y); $routes += 'sendinput' }
-            'click'        { [Clf]::Click([int]$a.x, [int]$a.y, $a.button, (Get-RequestedClickCount $a)); $routes += 'sendinput' }
-            'double_click' { [Clf]::Click([int]$a.x, [int]$a.y, $a.button, 2); $routes += 'sendinput' }
-            'scroll'       { [Clf]::Scroll([int]$a.x, [int]$a.y, [int]$a.scroll_x, [int]$a.scroll_y, [bool]$a.rawWheel); $routes += 'sendinput' }
-            'drag'         { $duration = if ($null -ne $a.durationMs) { [int]$a.durationMs } else { 350 }; [Clf]::Drag([int[]]$a.xs, [int[]]$a.ys, $a.button, $duration); $routes += 'sendinput' }
+            'click'        { [Clf]::Click([int]$a.x, [int]$a.y, $a.button, (Get-RequestedClickCount $a), $actionTarget); $routes += 'sendinput' }
+            'double_click' { [Clf]::Click([int]$a.x, [int]$a.y, $a.button, 2, $actionTarget); $routes += 'sendinput' }
+            'scroll'       { [Clf]::Scroll([int]$a.x, [int]$a.y, [int]$a.scroll_x, [int]$a.scroll_y, [bool]$a.rawWheel, $actionTarget); $routes += 'sendinput' }
+            'drag'         { $duration = if ($null -ne $a.durationMs) { [int]$a.durationMs } else { 350 }; [Clf]::Drag([int[]]$a.xs, [int[]]$a.ys, $a.button, $duration, $actionTarget); $routes += 'sendinput' }
             'type'         { [Clf]::Type([string]$a.text); $routes += 'sendinput' }
             'keypress'     { [Clf]::Press([int[]]$a.resolvedKeys); $routes += 'sendinput' }
             'focus'        { Assert-InputRootOwner ([int64]$a.window); Assert-Focused ([int64]$a.window); Assert-InputOwner ([int64]$a.window) $request.ownerWindow $request.targetApp $request.ownerApp; $routes += 'focus' }
@@ -1462,7 +1509,9 @@ function Handle-Request($request) {
           }
           $completed += 1
         } catch {
-          $message = $_.Exception.Message
+          # .NET method invocation wraps OCCLUDED_TARGET and similar deliberate
+          # guards; retain the source error code instead of HELPER_ERROR.
+          $message = $_.Exception.GetBaseException().Message
           $code = 'HELPER_ERROR'
           if ($message -match '^([A-Z0-9_]+):\s*(.+)') {
             $code = $Matches[1]

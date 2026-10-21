@@ -1362,7 +1362,8 @@ export async function getWindowState(opts: {
           if (!Number.isSafeInteger(relatedWindow.id) || relatedWindow.id <= 0 || relatedWindow.id === window.id) continue;
           try {
             const relatedShot = includeScreenshot
-              ? await screenshotLocked({ window: relatedWindow.id, ownerWindow: window.id, maxWidth: limit }, undefined,
+              ? await screenshotLocked({ window: relatedWindow.id, ownerWindow: window.id,
+                  expectedOwnerProcessStartTime: window.processStartTime, maxWidth: limit }, undefined,
                   { generation: generationOfReply(reply), code: 'STALE_FRAME' })
               : null;
             // Enumeration precedes this distinct native capture; reject an
@@ -1551,6 +1552,8 @@ async function screenshotLocked(
     window?: number;
     /** Native capture rechecks the exact ownership of a related menu/popup. */
     ownerWindow?: number;
+    /** Observed parent FILETIME, independent from the related popup's identity. */
+    expectedOwnerProcessStartTime?: string;
     full?: boolean;
     maxWidth?: number;
     crop?: Rect;
@@ -1608,6 +1611,9 @@ async function screenshotLocked(
       ? Math.max(1, requestedWidth)
       : Math.max(320, Math.floor(requestedWidth))
   );
+  if (opts.ownerWindow !== undefined && !/^\d{8,20}$/.test(opts.expectedOwnerProcessStartTime ?? '')) {
+    throw new ComputerError('STALE_FRAME: related popup parent process incarnation is unavailable');
+  }
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'clf-shot-'));
   const file = path.join(dir, 'screen.png');
   try {
@@ -1618,6 +1624,7 @@ async function screenshotLocked(
       ...(cropRegion === undefined ? {} : { region: cropRegion }),
       ...(opts.window === undefined ? {} : { id: opts.window }),
       ...(opts.ownerWindow === undefined ? {} : { ownerWindow: opts.ownerWindow }),
+      ...(opts.expectedOwnerProcessStartTime === undefined ? {} : { expectedOwnerProcessStartTime: opts.expectedOwnerProcessStartTime }),
       ...(opts.full === true ? { full: true } : {})
     }, expected);
     // A crop is a fresh capture of visible display pixels, even when its coordinates came
