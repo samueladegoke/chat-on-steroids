@@ -519,25 +519,24 @@ public static class Clf {
     return (exStyle & 0x88) != 0 && (style & unchecked((int)0x80000000)) != 0 && (style & 0x00C00000) != 0x00C00000;
   }
 
-  // Menus, dropdown lists and autocomplete popups of the target cover its pixels while it stays
-  // foreground. Only such a popup from the target's own process may receive its input: owned by
-  // the target, or ownerless on its GUI thread. Never another process, an activatable dialog,
+  // Same-root children may receive input across processes (Store-app CoreWindow, WebView2).
+  // Under a different root, only the target's own-process transient popups qualify: owned by
+  // the target, or ownerless on its GUI thread. Never a foreign overlay, an activatable dialog,
   // or the owner/sibling of a popup target.
   static bool ReceiverIsTarget(IntPtr receiver, IntPtr target) {
     if (receiver == IntPtr.Zero) return false;
     IntPtr receiverRoot = GetAncestor(receiver, 2), targetRoot = GetAncestor(target, 2);
     if (receiverRoot == IntPtr.Zero || targetRoot == IntPtr.Zero) return false;
-    // GA_ROOT can be the target even when a different process hosts the hit
-    // child (or owns mouse capture). Check the actual receiver, not only root.
     uint actualProcess, rootProcess, targetOwnProcess;
     GetWindowThreadProcessId(receiver, out actualProcess);
     GetWindowThreadProcessId(targetRoot, out rootProcess);
     GetWindowThreadProcessId(target, out targetOwnProcess);
-    // A child target can itself be reparented under a foreign top-level HWND.
-    // Neither that foreign root nor its own children are authorized receivers.
+    // Refuse a target reparented under a foreign root, but allow same-root receivers
+    // from another process, including a Store-app CoreWindow hit or mouse capture.
     if (actualProcess == 0 || rootProcess == 0 || targetOwnProcess == 0 ||
-        rootProcess != targetOwnProcess || actualProcess != targetOwnProcess) return false;
+        rootProcess != targetOwnProcess) return false;
     if (receiverRoot == targetRoot) return true;
+    if (actualProcess != targetOwnProcess) return false;
     uint receiverProcess, targetProcess;
     uint receiverThread = GetWindowThreadProcessId(receiverRoot, out receiverProcess);
     uint targetThread = GetWindowThreadProcessId(targetRoot, out targetProcess);

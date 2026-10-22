@@ -5282,7 +5282,10 @@ clicks validate the actual pointer hit receiver and foreground mouse capture, no
 the foreground owner. Only the target or a non-activating popup of its own process
 (owned by it, or ownerless on its GUI thread: menus, dropdown lists, autocomplete)
 may receive them; another process's overlay, even one owned by the target, an
-activatable dialog, or a popup target's owner/sibling fails closed. The native guard checks
+activatable dialog, or a popup target's owner/sibling fails closed. A child under the target's
+own top-level window (same GA_ROOT) may belong to another process (Store apps' CoreWindow
+under ApplicationFrameHost, WebView2 content) and is accepted, while the target's own root
+must still be in the target's process. The native guard checks
 the target HWND's own PID against its root PID, rejecting a target reparented
 under a foreign root; an ordinary captionless owned popup needs an additional
 tool-window/topmost hint and cannot rely on WS_POPUP alone. A drag checks
