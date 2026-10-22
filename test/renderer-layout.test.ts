@@ -47,7 +47,10 @@ it('finds settings on every settings page by name, description and section, neve
   expect([finish!.title, finish!.page, finish!.section, finish!.tab]).toEqual(['Session finish', 'Agents & automation', 'Keep the turn open', 'settings']);
   expect(finish!.target.contains(document.getElementById('finishTool'))).toBe(true);
   // Names come before descriptions; words match in any order, across a name and its section.
-  expect(searchSettings(entries, 'privacy', 'en').map(entry => entry.title).slice(0, 2)).toEqual(['Privacy', 'Privacy screenshots']);
+  const privacy = searchSettings(entries, 'privacy', 'en').map(entry => entry.title);
+  expect(privacy[0]).toBe('Privacy');
+  // Its one setting is found by its description ("For privacy, …"), after every name.
+  expect(privacy).toContain('Screenshot only the active window');
   expect(searchSettings(entries, 'typography font', 'en').map(entry => entry.title)).toEqual(['Font']);
   // A Setup step is found by its name, although only the open step shows.
   expect(searchSettings(entries, 'api key', 'en')[0]!.target.dataset.railStep).toBe('key');
@@ -170,6 +173,12 @@ it('does not expose a periodic Astra continuation outside session_finish', () =>
   expect(chatSource).not.toContain("number('goalImpulseMinutes'");
 });
 
+it('fades a block an answer gains by opacity alone, and not under reduced motion', () => {
+  expect(rule('.msg.rich > .is-entering')).toBe('animation: round-title 350ms ease-out both;');
+  expect(css).toContain('@keyframes round-title { from { opacity: 0; } to { opacity: 1; } }');
+  expect(css).toMatch(/@media \(prefers-reduced-motion: reduce\) \{\s*[^{}]*\.msg\.rich > \.is-entering[^{}]*\{ animation: none; \}/);
+});
+
 /** The declarations of one selector, whitespace-normalised. */
 function rule(selector: string): string {
   const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -245,6 +254,13 @@ describe('the session card header', () => {
     expect(title).toContain('text-overflow: ellipsis');
     // The title is the first child of the header, which is what that selector relies on.
     expect(document.querySelector('#chatTitle')!.closest('header')!.firstElementChild!.id).toBe('chatTitle');
+  });
+
+  it('lets the language name of a code block shrink and never its Copy, Wrap and Save buttons', () => {
+    // The panel clips what overflows its header, so a long name beside three buttons would cut Save off.
+    const name = rule('.msg.rich .markdown-code .tool-output-header strong');
+    for (const declaration of ['min-width: 0', 'overflow: hidden', 'text-overflow: ellipsis', 'white-space: nowrap']) expect(name).toContain(declaration);
+    expect(rule('.msg.rich .markdown-code .tool-output-header .ico, .msg.rich .markdown-code .tool-copy')).toContain('flex: none');
   });
 
   it('has a place to say what is happening without opening the Activity log', () => {
@@ -392,11 +408,11 @@ describe('the session-row chat actions', () => {
    */
   it('blocks the Unattributed row through the one switch that can answer for it', () => {
     expect(chatSource).toMatch(
-      /if \(summary\.conversationId === null\)[\s\S]{0,2200}toggleUnattributedBlock\(!blocked\)/
+      /if \(isUnattributedSession\(summary\)\)[\s\S]{0,2200}toggleUnattributedBlock\(!blocked\)/
     );
     // In strict mode the row offers no Allow the kernel would ignore: only Remove.
     expect(chatSource).toMatch(
-      /strictChatAllowlist !== true\) \{[\s\S]{0,1200}toggleUnattributedBlock\(!blocked\)[\s\S]{0,120}\n  \} else \{/
+      /strictChatAllowlist !== true\) \{[\s\S]{0,1200}toggleUnattributedBlock\(!blocked\)[\s\S]{0,120}\n  \} else if \(summary\.conversationId === null\) \{/
     );
     expect(chatSource).toMatch(
       /toggleUnattributedBlock[\s\S]{0,400}\$<HTMLInputElement>\('allowUnattributedCalls'\)\.checked = !blocked/
@@ -411,7 +427,7 @@ describe('the session-row chat actions', () => {
 
 describe('the live worker list', () => {
   it('shows the exact broker id instead of a generic worker role chip', () => {
-    expect(chatSource).toMatch(/if \(label !== agent\.id\)[^\n]*agent\.id/);
+    expect(chatSource).toMatch(/!== agent\.id\)[^\n]*'chip', agent\.id/);
     expect(chatSource).not.toContain("el('span', 'chip', agent.role)");
   });
 });

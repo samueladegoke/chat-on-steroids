@@ -1,5 +1,6 @@
-import { nextWorkerArchive, settleWorkerArchive } from './worker-archive.js';
-import { considerTurnRotation, type RotationDeps } from './turn-rotation.js';
+import { nextWorkerArchive, onWorkerChatReady, readyForWake, settleWorkerArchive } from './worker-archive.js';
+import { considerTurnRotation, noteRotationDeclined, noteStopFallback, stopFallbackDue, type RotationDeps } from './turn-rotation.js';
+import { armRotationFence, clearRotationFence, rotationFenced, rotationFenceTurn } from './rotation-fence.js';
 import { conversationProgress } from './session/progress.js';
 import { cosSignInTransfer, SignInTransferError } from './cos-browser/sign-in-transfer.js';
 import { externalBrowserProof, noteExternalInstalled, noteExternalSignedIn, resetBrowserProofForTests } from './browser-proof.js';
@@ -13,18 +14,21 @@ import { goalErrorKey, goalErrorMessage } from '../shared/goal-errors.js';
 import { MAX_CHATGPT_MESSAGE_CHARS, userPromptText } from '../shared/user-prompt.js';
 import { CONVERSATION_DELETED } from '../shared/chat-error.js';
 import { prepareSessionPrompt } from './session/prompt.js';
+import { NEW_CHAT, noteAutomaticReply } from './session/automatic-replies.js';
 import { pendingChatModelRequest, observeChatModels, requestChatModels } from './chat-models.js';
+import { resumeModelSelection } from './resume-model.js';
 import { isDeliberateEffort, isProModel } from '../shared/chat-models.js';
 import { supportsFinishAutomation } from '../shared/finish.js';
 import { injectedUserMessage, recordedRequestTurn, responseTurnId, type TimelineTurns } from '../shared/chronology.js';
 import type { SessionSummary } from '../shared/session.js';
 import { messageReferences } from '../shared/session.js';
 import { turnTrace } from '../shared/turn-trace.js';
-import { publishBrowserDecision, authorizeBrowserInput, sessionInputPolicy, collectRecordedBrowserDecision, fileRotationInput, type InputActivity } from './session/input.js';
+import { publishBrowserDecision, authorizeBrowserInput, sessionInputPolicy, collectRecordedBrowserDecision, fileRotationInput, fileRotationContinueAfterStop, rotationDelivery, withdrawUnsentRotation, type InputActivity } from './session/input.js';
+import { callHoldOpen, holdCalls } from './rotation-hold.js';
 import { authorizedPluginRefreshPublications, hasRequestedPluginRefresh, pendingPluginRefreshes, claimPluginRefresh, requireManualPluginRefresh, completePluginRefresh, failPluginRefresh } from './plugin-refresh.js';
 import { attachBrowserWake, wakeBrowserWork } from './browser-wake.js';
 import { tunnelRouteSettling } from './tunnel/route-settle.js';
-import { armProjectCreate, claimProjectCreate, completeProjectCreate, failProjectCreate, getProject, markProjectGone, pendingProjectCreates } from './projects.js';
+import { armProjectCreate, bindChatToLinkedProject, claimProjectCreate, completeProjectCreate, failProjectCreate, getProject, markProjectGone, pendingProjectCreates } from './projects.js';
 import { wakeBrowserUrl } from './browser-startup.js';
 let browserWake: ReturnType<typeof attachBrowserWake> | null = null;
 import { browserWindowBounds, currentBrowserWorkArea } from './browser-window-layout.js';
@@ -87,6 +91,7 @@ import {
   goalProgressFor,
   goalDraftBusy,
   goalArmedFor,
+  GOAL_HOLD_TOOLS,
   goalObjectiveFor,
   goalPendingReplyFor,
   goalReplySourceTurn,
@@ -124,6 +129,7 @@ import {
 } from './session/recorder.js';
 import { noticeApprovalWaiting, noticeChatStopped } from './stuck-notice.js';
 import { approvalAnswerFor, approvalCardWaiting, noteApprovalCard, parseApprovalCard, parseApprovalResult, resetApprovalWaits, settleApprovalAnswer, type ApprovalWaitDeps } from './approval-wait.js';
+import { APPROVAL_PROGRESS_PREFIX, APPROVAL_WAITING_TEXT } from '../shared/approval-wait.js';
 import {
   autoCompactionReady,
   automaticCompactionAllowed,
@@ -143,7 +149,7 @@ import {
   turnEndedDurably,
   requestTurnOwnershipCutoff
 } from './session/store.js';
-import { inFlightMcpRequests, inFlightToolCalls, runningToolCalls, runningToolProgress, settlingToolCalls } from './mcp/call-context.js';
+import { inFlightMcpRequests, inFlightToolCalls, runningToolCalls, runningToolProgress, sentResults, settlingToolCalls } from './mcp/call-context.js';
 import { nativeHandoffPrompt } from './session/handoff-prompt.js';
 import { DEFAULT_HANDOFF_PROMPT } from '../shared/handoff.js';
 import { briefShortfall, resumeBootstrapText } from './session/handoff.js';
@@ -162,7 +168,9 @@ import { ownCoreHint,
   closableWorkerConversations,
   activeRunIds,
   swarmRunning,
+  adoptLateWorker,
   failAgent,
+  LATE_START_WINDOW_MS,
   finishSilentCeilingWorker,
   WORKER_SILENCE_MS,
   failWorkerRevival,
@@ -255,6 +263,8 @@ export const STALE_SWARM_MS = 2 * 60_000;
  */
 /** Per-conversation floor between browser reload/open actions, regardless of why they were requested. */
 export const BROWSER_RECOVERY_COOLDOWN_MS = 3 * 60_000;
+/** Navigation normally settles within seconds; retry after 20 seconds without stacking reloads. */
+export const NAVIGATION_RECOVERY_COOLDOWN_MS = 20_000;
 const STALE_SWARM_SWEEP_MS = 30_000;
 /** /events batches currently between parse and durable/session+worker lifecycle completion. */
 let observationWritesInFlight = 0;
@@ -283,6 +293,12 @@ export const COMMAND_DEADLINE_MS = 90_000;
  * 90th percentile, and two worker tabs loading beside other tabs both missed 20 s (VM, 2026-10-06). */
 export const WORKER_REDEEM_MS = 45_000;
 export const WORKER_BOOTSTRAP_LIMIT_MS = 120_000;
+/**
+ * How long a worker's page that reported Send has for its receipt (#1086). On a loaded machine
+ * pages said "sending the task" and the app gave the workers up at the ordinary deadline anyway,
+ * while their chats received the task. The page is told this deadline in the step's reply.
+ */
+export const WORKER_SENDING_GRACE_MS = 120_000;
 /** A worker may occupy the broker's `waking` state for one short, absolute attempt. */
 /**
  * How long the browser has to prove it typed a wake into a sleeping worker's chat.
@@ -654,7 +670,7 @@ function staleCompanion(req: http.IncomingMessage): boolean {
   // Firefox updates its signed add-on itself, up to a day after the app, while a Chromium copy
   // updates within minutes. Where ChatGPT runs in Firefox, refusing its add-on meanwhile would
   // leave every new chat unclaimed (measured 2026-10-14), so the chosen Firefox keeps working.
-  if (req.headers['x-extension-engine'] === 'gecko' && getConfig().ui.chatBrowser === 'firefox') return false;
+  if (geckoExtension(req) && getConfig().ui.chatBrowser === 'firefox') return false;
   const stamp = extensionBuildOf(req);
   const shipped = shippedExtensionBuild();
   if (!stamp || !shipped || stamp === shipped) return false;
@@ -1037,6 +1053,17 @@ export async function bridgeStatus(): Promise<BridgeStatus> {
   };
 }
 
+/**
+ * Whether the request comes from Firefox's add-on. It says so in `x-extension-engine` since 2.1.38.
+ * An older add-on is told by its moz-extension:// origin or, on requests Firefox sends without one
+ * (see originOf), by its user agent; its update banner must not ask for a reload from the app's
+ * folder, which a signed add-on cannot do.
+ */
+function geckoExtension(req: http.IncomingMessage): boolean {
+  return req.headers['x-extension-engine'] === 'gecko' || String(req.headers.origin ?? '').startsWith('moz-extension://') ||
+    /\bFirefox\/\d/.test(String(req.headers['user-agent'] ?? ''));
+}
+
 function versionStatus(): Pick<BridgeStatus, 'extensionVersion' | 'extensionEngine'> {
   const reported = reportedExtension();
   return { extensionVersion: reported?.version ?? null, ...(reported?.engine ? { extensionEngine: reported.engine } : {}) };
@@ -1106,7 +1133,7 @@ function keepsExternalRecord(req: http.IncomingMessage): boolean {
   const chosen = getConfig().ui.chatBrowser;
   if (chosen === 'cos') return false;
   const fits = (gecko: boolean) => (chosen === 'firefox') === gecko;
-  return fits(externalExtension.engine === 'gecko') && !fits(req.headers['x-extension-engine'] === 'gecko');
+  return fits(externalExtension.engine === 'gecko') && !fits(geckoExtension(req));
 }
 
 function noteExternalExtension(req: http.IncomingMessage): boolean {
@@ -1124,7 +1151,7 @@ function noteExternalExtension(req: http.IncomingMessage): boolean {
   const sameBrowser = browserId !== undefined && externalExtension?.browserId === browserId && externalExtensionPresent();
   const appeared = !sameBrowser || externalExtension?.version !== version;
   // Firefox runs a signed add-on it updates itself (x-extension-engine: gecko); Chromium sends none.
-  const engine = req.headers['x-extension-engine'] === 'gecko' ? 'gecko' as const : undefined;
+  const engine = geckoExtension(req) ? 'gecko' as const : undefined;
   externalExtension = { ...(sameBrowser ? externalExtension : {}), seenAt: Date.now(), version, browserId, engine };
   // Lasting evidence for Setup: this browser has the extension, in this version.
   const proved = browserId !== undefined && version !== null && noteExternalInstalled(browserId, version);
@@ -1279,19 +1306,28 @@ const EXTENSION_UPDATE_HOLDS: Record<string, string> = {
   'browser-updates-itself': 'Firefox updates the signed add-on itself (about:addons → Check for Updates)'
 };
 /**
- * The hold last logged per browser. With two browsers reporting in turn, one shared value made the
- * browser without a hold reset the other's, and the same reason was logged every round (2.1.39).
+ * The hold last logged per browser, for the build this app ships. With two browsers reporting in turn,
+ * one shared value made the browser without a hold reset the other's (2.1.39). A report without a hold
+ * no longer resets it either: Firefox suspends the add-on between polls, each wake first reported no
+ * hold, and the same reason was logged 907 times in 36 hours (VM, 2026-10-21).
  */
-const extensionUpdateHoldLogged = new Map<string, string | null>();
+const extensionUpdateHoldLogged = new Map<string, { reason: string; build: string | null; at: number }>();
+/** The same reason is said again after this long, so a long wait still shows in a recent log. */
+const EXTENSION_UPDATE_HOLD_RELOG_MS = 6 * 60 * 60_000;
 
-/** Logs once per change and browser why an offered extension update is waiting; silence resets it. */
+/** Logs once per browser and shipped build why an offered extension update is waiting, again when the reason changes. */
 export function noteExtensionUpdateHold(hold: unknown, browser: string | null = null): void {
   const reason = typeof hold === 'string' && Object.hasOwn(EXTENSION_UPDATE_HOLDS, hold) ? hold : null;
+  if (!reason) return;
   const key = browser ?? '';
-  if (reason === (extensionUpdateHoldLogged.get(key) ?? null)) return;
-  extensionUpdateHoldLogged.set(key, reason);
+  const build = shippedExtensionBuild();
+  const last = extensionUpdateHoldLogged.get(key);
+  const now = Date.now();
+  if (last && last.reason === reason && last.build === build && now - last.at < EXTENSION_UPDATE_HOLD_RELOG_MS) return;
+  extensionUpdateHoldLogged.delete(key);
+  extensionUpdateHoldLogged.set(key, { reason, build, at: now });
   if (extensionUpdateHoldLogged.size > 16) extensionUpdateHoldLogged.delete(extensionUpdateHoldLogged.keys().next().value!);
-  if (reason) logInfo(`bridge: the browser extension waits to update: ${EXTENSION_UPDATE_HOLDS[reason]}`);
+  logInfo(`bridge: the browser extension waits to update: ${EXTENSION_UPDATE_HOLDS[reason]}`);
 }
 
 /**
@@ -1327,7 +1363,7 @@ function noteExtensionVersion(req: http.IncomingMessage): void {
   const before = reportedExtension();
   const source = browserOf(req) ?? (req.headers['x-extension-host'] === 'cos' ? 'cos' : 'unknown');
   extensionVersions.delete(source);
-  extensionVersions.set(source, { version: extensionVersion, ...(req.headers['x-extension-engine'] === 'gecko' ? { engine: 'gecko' as const } : {}), seenAt: Date.now() });
+  extensionVersions.set(source, { version: extensionVersion, ...(geckoExtension(req) ? { engine: 'gecko' as const } : {}), seenAt: Date.now() });
   if (extensionVersions.size > 16) extensionVersions.delete(extensionVersions.keys().next().value!);
   const after = reportedExtension();
   const reportChanged = before?.version !== after?.version || before?.engine !== after?.engine;
@@ -1347,7 +1383,7 @@ function noteExtensionVersion(req: http.IncomingMessage): void {
     if (shipped && stamp && stamp !== shipped) {
       // Expected after every app update: the extension updates itself once no chat is busy.
       // Only an extension loaded from some other folder stays behind and needs a manual reload.
-      logInfo(req.headers['x-extension-engine'] === 'gecko'
+      logInfo(geckoExtension(req)
         ? `bridge: Firefox is running add-on build ${stamp}, but this app ships ${shipped}. Firefox updates the ` +
           'add-on by itself; to do it now, choose Check for Updates on its about:addons page.'
         : `bridge: the browser is running extension build ${stamp}, but this app ships ${shipped}. ` +
@@ -2061,8 +2097,15 @@ async function stopUserAnchor(sessionId: string, turnId: string): Promise<string
   }
   return undefined;
 }
-/** Stop is a request against one exact live turn, never a predicted final boundary. */
-export async function stopSessionTurn(sessionId: string, expectedTurnId: string): Promise<SessionControlsView> {
+/** After a call is recorded, how long until its answer has gone out and the fallback's Stop may follow. */
+const ROTATION_STOP_DELAY_MS = 500;
+
+/**
+ * Stop is a request against one exact live turn, never a predicted final boundary. `rotation`: the
+ * app stops the turn to continue it in a fresh one (`ui.rotateStopFallback`), so Goal or Loop and a
+ * pending Compact & Resume stay as they are.
+ */
+export async function stopSessionTurn(sessionId: string, expectedTurnId: string, options: { rotation?: boolean } = {}): Promise<SessionControlsView> {
   const id = await controlledConversation(sessionId);
   const assertCurrent = async () => {
     const latest = await getSession(sessionId);
@@ -2070,9 +2113,11 @@ export async function stopSessionTurn(sessionId: string, expectedTurnId: string)
         await conversationWasSuperseded(id) || (await sessionControlsFor(sessionId)).activeTurnId !== expectedTurnId) throw new Error('active_turn_changed');
   };
   await assertCurrent();
-  await setSessionAutomation(sessionId, 'off');
-  await assertCurrent();
-  if (continuationForSession(sessionId)) { await cancelResumeNow(sessionId); await assertCurrent(); }
+  if (!options.rotation) {
+    await setSessionAutomation(sessionId, 'off');
+    await assertCurrent();
+    if (continuationForSession(sessionId)) { await cancelResumeNow(sessionId); await assertCurrent(); }
+  }
   const userMessageId = await stopUserAnchor(sessionId, expectedTurnId);
   await assertCurrent();
   const alreadyQueued = commands.some(entry => entry.spec.type === 'stop' && entry.spec.sessionId === sessionId && entry.spec.turnId === expectedTurnId);
@@ -2091,18 +2136,26 @@ export async function stopSessionTurn(sessionId: string, expectedTurnId: string)
   await revokeSilenceInputs(sessionId);
   endActivity(id);
   repairsInFlight.delete(id);
-  if (!alreadyQueued) logInfo(`bridge: desktop Stop requested for session ${sessionId}, conversation ${id}, turn ${expectedTurnId}, command ${command.id}; native cancellation is unconfirmed`);
+  if (!alreadyQueued) logInfo(`bridge: ${options.rotation ? 'fresh-turn' : 'desktop'} Stop requested for session ${sessionId}, conversation ${id}, turn ${expectedTurnId}, command ${command.id}; native cancellation is unconfirmed`);
   wakeBrowserWork();
   changed();
   if (!alreadyQueued) {
     const lifecycle = bridgeLifecycleEpoch;
     // The shared startup owner launches only on positive process absence. An
     // existing browser remains the extension election's responsibility.
-    await wakeBrowserUrl(chatUrl(id), false, getConfig().ui.backgroundChats === true, {
-      current: () => bridgeLifecycleEpoch === lifecycle && !bridgeShutdownRequested && commands.includes(command) &&
-        Date.now() < command.createdAt + STOP_COMMAND_TIMEOUT_MS &&
-        liveConversations().some(row => row.sessionId === sessionId && row.conversationId === id && row.activeTurnId === expectedTurnId)
-    });
+    // The Stop is queued and saved by now, so a browser that cannot be opened does not undo it: the
+    // extension takes it when it next connects (or it times out). Throwing here made the opt-in
+    // fallback lift its fence under a Stop still on its way (2.1.44 publish, Linux arm64), and
+    // showed the person an error for a Stop that was in fact requested.
+    try {
+      await wakeBrowserUrl(chatUrl(id), false, getConfig().ui.backgroundChats === true, {
+        current: () => bridgeLifecycleEpoch === lifecycle && !bridgeShutdownRequested && commands.includes(command) &&
+          Date.now() < command.createdAt + STOP_COMMAND_TIMEOUT_MS &&
+          liveConversations().some(row => row.sessionId === sessionId && row.conversationId === id && row.activeTurnId === expectedTurnId)
+      });
+    } catch (error) {
+      logWarn(`bridge: could not open the browser for the Stop of conversation ${id}, turn ${expectedTurnId}: ${error instanceof Error ? error.message : String(error)}; the Stop stays queued for the extension's next pass`);
+    }
   }
   return sessionControlsFor(sessionId);
 }
@@ -2669,8 +2722,11 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     const otherBrowser = notChosenBrowser(req), chosenBuiltIn = chosenBuiltInBrowser(req);
     // A companion the claim route would refuse as out of date is not offered inputs either: being
     // offered one first made it the owner of a new chat it could never claim, and the current
-    // browser was never offered it (2.1.39 release round, Windows VM).
+    // browser was never offered it (2.1.39 release round, Windows VM). Nor a worker's tab or a
+    // wake: Firefox on an old add-on opened two of three workers per run, and the redeem route
+    // then refused their pages (VM, 2026-10-19).
     const refusedAsStale = staleCompanion(req);
+    const takesWork = !otherBrowser && !refusedAsStale;
     const pendingInputs = otherBrowser ? [] : await pendingBrowserInputs();
     const pendingIds = new Set((await pendingBrowserInputs()).map(input => input.id));
     for (const id of openingCustody.keys()) if (!pendingIds.has(id)) openingCustody.delete(id);
@@ -2717,9 +2773,9 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         commands: commands.length,
         // Rendering custody follows the actual command ledger, including its retirement.
         commandIds: commands.map(command => command.id),
-        revival: otherBrowser ? null : revival,
-        revivals: otherBrowser ? [] : revivals,
-        placement: pendingBrowserPlacement(null, browser),
+        revival: takesWork ? revival : null,
+        revivals: takesWork ? revivals : [],
+        placement: takesWork ? pendingBrowserPlacement(null, browser) : null,
         ...(canReveal ? { reveals: takeReveals(browser) } : {}),
         ...(follow ? { follow } : {}),
         ...(req.method === 'POST' && imageExportRequested ? { imageExports: pendingImageExports() } : {}),
@@ -2777,16 +2833,20 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     return json(res, 200, { ok: true, ended }, origin);
   }
 
-  // Worker chats of ended runs, archived in ChatGPT from one of the browser's ChatGPT tabs (#1460).
+  // Worker chats archived in ChatGPT from one of the browser's ChatGPT tabs (#1460), and restored
+  // before a wake (#1701). A restore travels as `unarchive`: an extension that predates it reads
+  // no chat to archive and leaves the job for a newer one.
   if (route === '/worker-archive/next' && req.method === 'POST') {
-    return json(res, 200, { conversationId: nextWorkerArchive() }, origin);
+    const job = nextWorkerArchive();
+    if (job && !job.archive) return json(res, 200, { conversationId: null, unarchive: job.conversationId }, origin);
+    return json(res, 200, { conversationId: job?.conversationId ?? null }, origin);
   }
   if (route === '/worker-archive/result' && req.method === 'POST') {
     const raw = await readBody(req);
     const body = raw && typeof raw === 'object' ? raw as Record<string, unknown> : {};
     const id = conversationId(body['conversationId']);
     const outcome = body['outcome'];
-    if (!id || (outcome !== 'archived' && outcome !== 'failed' && outcome !== 'deferred')) return json(res, 400, { error: 'invalid_request' }, origin);
+    if (!id || (outcome !== 'archived' && outcome !== 'unarchived' && outcome !== 'failed' && outcome !== 'deferred')) return json(res, 400, { error: 'invalid_request' }, origin);
     settleWorkerArchive(id, outcome);
     return json(res, 200, { ok: true }, origin);
   }
@@ -3155,6 +3215,15 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     // silence ticket was already filed. Publish its receipt-anchored listening
     // deadline into that same outbox row before acknowledging the observation.
     if (activeUntil.get(id)?.thinkingFailed) await fileSilenceInputTicket(id, Date.now());
+    // #1744: the tab showed this chat inside a ChatGPT Project. When that Project is a CoS
+    // project's own, the chat joins it, so its commands run in that folder (projects.ts decides).
+    const chatgptProject = typeof body['chatgptProject'] === 'string' ? body['chatgptProject'] : null;
+    const recordedSession = committed?.sessionId;
+    // A worker's first events can land before its origin is recorded; workers follow their prime.
+    if (chatgptProject && recordedSession && (!reportedAgent || reportedAgent === PRIME_ID)) {
+      await bindChatToLinkedProject(recordedSession, chatgptProject).catch(error =>
+        logWarn(`projects: chat ${recordedSession} stays outside the project linked to ${chatgptProject}: ${error instanceof Error ? error.message : String(error)}`));
+    }
     if (committed?.wake) wakeBrowserWork();
     return json(res, 200, { sessionId: committed!.sessionId, stored: committed!.stored }, origin);
   }
@@ -3419,6 +3488,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     if (!automaticCompactionAllowed(summary)) await cancelAutomaticResumesNow(live.sessionId);
     // Worker chats and user-blocked chats alike: neither may auto-compact — see goalBlockReason.
     const workerBlocked = goalFencedChat(id);
+    const recordedQuestionId = live.activeTurnId && !sleptOverTurn ? summary?.timelineTurns?.[live.activeTurnId]?.questionId ?? null : null;
     const requestedSince = Number.isFinite(since) ? Math.max(0, since) : 0;
     // A page reload begins at cursor zero. Never turn that into a full JSONL parse/response:
     // large audited sessions used to freeze the Electron main process here for tens of
@@ -3664,6 +3734,11 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         // REQUEST_ID_GRACE_MS to file its history cannot change the workspace and must not add
         // a cross-chat 15-second tax to the machine-settle barrier.
         pendingTools: runningToolCalls(live.conversationId),
+        // Results this app has fully sent to ChatGPT in the open turn, at least SENT_RESULT_GRACE_MS ago.
+        // ChatGPT's page no longer sees a running turn's results, so the compaction barrier falls
+        // back to this when the page can see none at all (#1643 follow-up).
+        ...(live.activeTurnId && live.activeTurnStartedAt !== null
+          ? { sentResults: sentResults(live.conversationId, live.activeTurnStartedAt, SENT_RESULT_GRACE_MS) } : {}),
         progress: conversationProgress(live.conversationId),
         // Diagnostic only. A finished unattributed call is still being placed into durable
         // history; unknown ownership is conservatively projected onto every chat until that
@@ -3676,7 +3751,11 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         // Durable answer identity survives a quiet deadline and app/extension restart.
         // Boot adoption must not mint a replacement turn merely because liveness expired.
         recordedTurnId: sleptOverTurn ? null : live.activeTurnId ?? null,
-        recordedQuestionId: live.activeTurnId && !sleptOverTurn ? summary?.timelineTurns?.[live.activeTurnId]?.questionId ?? null : null,
+        recordedQuestionId: recordedQuestionId,
+        // The recorded question is its conversation's first (ChatGPT's own parent "root"). A chat's
+        // first exchange can run without showing it, and this is what proves which question it is.
+        ...(recordedQuestionId && await questionIsFirst(live.sessionId, recordedQuestionId, live.conversationId)
+          ? { recordedQuestionFirst: true } : {}),
         // The question whose turn this app has already ended, while nothing is running. See
         // settledQuestionOf(): a reloaded page must not reopen it as a turn nobody recorded.
         settledQuestionId: live.activeTurnId ? null : settledQuestionOf(summary?.timelineTurns),
@@ -3825,6 +3904,20 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       if (repairsInFlight.get(id)?.reason === 'compaction') repairsInFlight.delete(id);
       changed();
       return json(res, 200, { aborted: true, sessionId: entry.sessionId, job: resumeJobFor(entry.sessionId) }, origin);
+    }
+    // An automatic attempt the source page stopped before asking: the ticket stays for a later
+    // pickup, and the page's reason is logged and shown until that pickup lets it try again.
+    if (body['sourceDeferred'] === true) {
+      const entry = continuationByToken(checkpointToken);
+      if (!entry || entry.from !== id) return json(res, 409, { error: 'no_such_continuation' }, origin);
+      if (!entry.automatic || entry.state !== 'awaiting-summary' || !sendUnattempted(entry.sourceSend)) {
+        return json(res, 409, { error: 'source_send_not_deferrable' }, origin);
+      }
+      const reason = typeof body['sourceError'] === 'string' ? body['sourceError'].trim().slice(0, 500) : '';
+      compactionDeferrals.set(entry.token, reason);
+      logInfo(`bridge: compaction ticket ${entry.token.slice(0, 8)} for ${id} — the page could not ask for the handoff yet: ${reason || 'no reason given'}`);
+      changed();
+      return json(res, 200, { deferred: true, job: resumeJobFor(entry.sessionId) }, origin);
     }
     // The last durable write before the click, quoting the claim handed out above. A false
     // answer means this document was reclaimed while it was composing and must submit nothing.
@@ -3996,6 +4089,8 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         return json(res, 503, { error: 'continuation_not_durable', retryable: true, sessionId }, origin);
       }
       const { opened, started } = ticket;
+      // A new attempt on the open ticket: the page is asking again, so its last reason is gone (#1643).
+      if (compactionDeferrals.delete(opened.token)) changed();
       return json(
         res,
         202,
@@ -4360,6 +4455,8 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     if (!(await goalKeyPresent(opening ?? goalModeFor()))) return goalJson(res, 409, { error: 'no_api_key' }, origin);
     const drafted = await draftOpeningMessage(text, opening);
     if ('error' in drafted) return goalJson(res, 502, drafted, origin);
+    // The page types it into a new chat; the message it comes back as is the app's (#1655).
+    noteAutomaticReply(NEW_CHAT, drafted.reply);
     return goalJson(res, 200, drafted, origin);
   }
 
@@ -4788,6 +4885,11 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     if (!step || !command || !allowed) return json(res, 200, { ok: false }, origin);
     command.progress = { ...command.progress, step, stepAt: Date.now() };
     if (command.spec.type === 'resume' && command.timer && continuationByToken(command.spec.token)?.automatic) armDeadline(command);
+    // A worker about to send gets its receipt window, and its page learns the new deadline (#1086).
+    if (command.spec.type === 'worker' && step === 'sending') {
+      armDeadline(command);
+      return json(res, 200, { ok: true, expiresAt: Date.now() + Math.max(1, commandDeadlineDelay(command)) }, origin);
+    }
     return json(res, 200, { ok: true }, origin);
   }
   if (route === '/commands/ack' && req.method === 'POST') {
@@ -4829,6 +4931,13 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     // been cancelled or been superseded, accepting the late ACK as success strands a real
     // tab whose model can never be bound to the worker/session it was opened for. Legacy
     // protocol pages omitted client and keep their old idempotent no-op response.
+    if (!ownedCommand && client && status === 'sent' && conversation) {
+      const late = lateStartFor(id);
+      if (late && late.client === client) {
+        const [code, reply] = await settleLateStart(id, late, conversation);
+        return json(res, code, reply, origin);
+      }
+    }
     if (!ownedCommand && client) {
       return json(res, 404, { error: 'no_such_command' }, origin);
     }
@@ -5483,6 +5592,7 @@ let bridgeError: string | null = null;
 const bridgeDrains = new Set<Promise<void>>();
 let dropSpawnRequestListener: (() => void) | null = null;
 let dropReviveRequestListener: (() => void) | null = null;
+let dropWorkerChatReadyListener: (() => void) | null = null;
 
 function runStaleSwarmSweep(): Promise<boolean> {
   if (staleSweepInFlight) return staleSweepInFlight;
@@ -5701,7 +5811,17 @@ async function startBridgeOnce(epoch: number, prepared?: PreparedBridge): Promis
   // is the first moment anything can reopen that tab for it.
   dropReviveRequestListener?.();
   dropReviveRequestListener = onReviveRequest((revivals: WorkerRevival[]) => {
-    for (const revival of revivals) queueWorkerRevival(revival.id, revival.conversationId, revival.messageIds, revival.runId);
+    for (const revival of revivals) {
+      // ChatGPT shows no message box in an archived chat: one this app archived is restored first.
+      if (!readyForWake(revival.conversationId)) continue;
+      queueWorkerRevival(revival.id, revival.conversationId, revival.messageIds, revival.runId);
+    }
+  });
+  dropWorkerChatReadyListener?.();
+  dropWorkerChatReadyListener = onWorkerChatReady((conversationId) => {
+    for (const revival of pendingWorkerRevivals()) {
+      if (revival.conversationId === conversationId) queueWorkerRevival(revival.id, revival.conversationId, revival.messageIds, revival.runId);
+    }
   });
   // When a run ends — cleared in the app, finished, or taken over by another chat —
   // its worker chats must stop existing everywhere at once. A queued bootstrap that
@@ -5852,6 +5972,8 @@ export async function stopBridge(): Promise<void> {
     dropSpawnRequestListener = null;
     dropReviveRequestListener?.();
     dropReviveRequestListener = null;
+    dropWorkerChatReadyListener?.();
+    dropWorkerChatReadyListener = null;
     if (staleSwarmTimer) clearInterval(staleSwarmTimer);
     staleSwarmTimer = null;
     if (silenceTimer) clearTimeout(silenceTimer);
@@ -6830,7 +6952,8 @@ function pendingBrowserPlacement(conversationId: string | null, browser: string 
   command.progress = { ...command.progress, opened: 'browser' };
   const spec = command.spec;
   const worker = spec.type === 'worker';
-  const selection = spec.type === 'resume' ? continuationByToken(spec.token)?.requestedModel : null;
+  // Only what this ChatGPT account offers: a Free plan has no picker to confirm a model with (#1766).
+  const selection = spec.type === 'resume' ? resumeModelSelection(continuationByToken(spec.token)?.requestedModel, spec.token) : null;
   return {
     id: command.id, model: worker ? spec.model : selection?.model ?? null,
     reasoningEffort: worker ? spec.reasoningEffort : selection?.reasoningEffort ?? null,
@@ -6965,8 +7088,25 @@ const approvalWaitDeps: ApprovalWaitDeps = {
   notify: noticeApprovalWaiting,
   log: logInfo,
   // The session list's `approval`; a catalog-only push, since no transcript changed.
-  changed: () => notifyChanged()
+  changed: () => notifyChanged(),
+  previous: latestWaitingApprovalRow
 };
+
+/** The session's newest approval row, if its latest text still says waiting (see `ApprovalWaitDeps.previous`). */
+export async function latestWaitingApprovalRow(sessionId: string): Promise<{ progressId: string; anchor: { seq: number; time: number } } | null> {
+  const rows = (await readRecentEvents(sessionId, 256, { kinds: ['progress'] }))
+    .filter(event => event.kind === 'progress' && !!event.progressId?.startsWith(APPROVAL_PROGRESS_PREFIX))
+    .sort((a, b) => a.seq - b.seq);
+  // A rewrite is a later event naming its row's first snapshot as `origin`; that snapshot keeps the place.
+  const byRow = new Map<string, { anchor: { seq: number; time: number }; text: string }>();
+  for (const event of rows) {
+    if (event.kind !== 'progress' || !event.progressId) continue;
+    const first = byRow.get(event.progressId)?.anchor ?? { seq: event.origin ?? event.seq, time: event.time };
+    byRow.set(event.progressId, { anchor: first, text: event.message.text });
+  }
+  const newest = [...byRow].sort(([, a], [, b]) => b.anchor.seq - a.anchor.seq)[0];
+  return newest && newest[1].text === APPROVAL_WAITING_TEXT ? { progressId: newest[0], anchor: newest[1].anchor } : null;
+}
 /**
  * How long tool calls of no known chat may hold one silent chat's recovery (#1086).
  *
@@ -7524,7 +7664,8 @@ async function sessionRecoveryCountdowns(sessionId: string, conversationId: stri
     const compaction = compactionWatch.get(conversationId);
     // Only before the request goes out: from then on the chat's own Compact & Resume row shows
     // the brief being written, saved and the new chat opening, and a second row repeated it.
-    const phase = compaction?.phase !== 'asking' ? null : sessionInputActivity(session).exact ? 'waiting' : 'asking';
+    const phase = compaction?.phase !== 'asking' ? null : sessionInputActivity(session).exact ? 'waiting'
+      : compactionDeferrals.has(compaction.token) ? 'held' : 'asking';
     return compaction && phase && pendingContinuations().some(entry => entry.from === conversationId && entry.token === compaction.token)
       ? [{ kind: 'compaction', phase, deadline: Math.max(compaction.nextAt, Date.now()) }] : [];
   }
@@ -8302,6 +8443,17 @@ async function noteRecoveryObservations(
     }
   }
   const lastEnd = ended?.outcome ?? null;
+  // The turn the app stopped to continue in a fresh one (`ui.rotateStopFallback`) shows stopped:
+  // calls may run again, and the continue goes as an ordinary message.
+  const fencedTurn = rotationFenceTurn(conversationId);
+  if (lastEnd === 'stopped' && sessionId && fencedTurn && ended?.turnId === fencedTurn) {
+    clearRotationFence(conversationId);
+    void fileRotationContinueAfterStop(sessionId, fencedTurn).then(row => {
+      logInfo(row ? `turn rotation: ${conversationId} — turn ${fencedTurn} stopped; continuing in a fresh turn`
+        : `turn rotation: ${conversationId} — turn ${fencedTurn} stopped; a message was already waiting, so it goes instead of the continue`);
+      changed();
+    }).catch(error => logWarn(`turn rotation: ${String(error)}`));
+  }
   let terminalGrant = activeUntil.get(conversationId);
   if (thinkingFailed && ended.turnId && sessionId && activity.terminal) {
     // Keep the exact work owner through an error observation, including a reload
@@ -8996,6 +9148,11 @@ const COMPACTION_PICKUPS: Record<CompactionPhase, { every: number; attempts: num
   opening: { every: 15 * 60_000, attempts: 3 }
 };
 const compactionWatch = new Map<string, { token: string; phase: CompactionPhase; nextAt: number; attempts: number; backoffs?: number; told?: boolean; streamLost?: boolean }>();
+/**
+ * Why the source page last stopped an automatic ticket's attempt before asking (#1643), by token.
+ * Kept until the next pickup lets the page try again, so the chat says it is held, not asking.
+ */
+const compactionDeferrals = new Map<string, string>();
 const AUTOMATIC_ASKING_RETRY_PAUSE_MS = 10 * 60_000;
 /**
  * How many slowed extra bursts an automatic pre-Send ticket gets before it is abandoned like a
@@ -9005,6 +9162,29 @@ const AUTOMATIC_ASKING_RETRY_PAUSE_MS = 10 * 60_000;
  * next working turn opens a fresh ticket, as before.
  */
 const AUTOMATIC_ASKING_RETRY_BURSTS = 2;
+
+/**
+ * How long a fully sent result must have been out before the compaction barrier counts it as received.
+ * ChatGPT starts its next call 4–7 s after a result (measured live, 2026-10-19), so a longer grace
+ * never sees a moment with nothing running; delivery through the tunnel takes well under a second.
+ */
+const SENT_RESULT_GRACE_MS = 1_500;
+
+/** Whether a recorded question is its conversation's first, by ChatGPT's own parent ("root"), by question. */
+const firstQuestions = new Map<string, boolean>();
+async function questionIsFirst(sessionId: string, messageId: string, conversationId: string): Promise<boolean> {
+  const key = `${sessionId}\n${conversationId}\n${messageId}`;
+  const known = firstQuestions.get(key);
+  if (known !== undefined) return known;
+  const rows = await readRecentEvents(sessionId, 400, { kinds: ['user_message'] }).catch(() => []);
+  const question = rows.find(event => event.kind === 'user_message' && event.messageId === messageId);
+  // Not recorded yet, or recorded without a parent: unknown, so asked again on the next pull.
+  if (question?.kind !== 'user_message' || !question.parentId) return false;
+  const first = question.parentId === 'root';
+  firstQuestions.set(key, first);
+  if (firstQuestions.size > 256) firstQuestions.delete(firstQuestions.keys().next().value!);
+  return first;
+}
 
 function compactionPhaseOf(entry: ContinuationView): CompactionPhase {
   if (entry.state !== 'awaiting-summary') return 'opening';
@@ -9200,6 +9380,9 @@ async function inspectOwedPickups(now: number): Promise<boolean> {
 async function inspectOwedCompactions(now: number): Promise<boolean> {
   if (compactionWatchFloor === null) return false;
   const owed = new Map(pendingContinuations().map((entry) => [entry.from, entry]));
+  for (const token of compactionDeferrals.keys()) {
+    if (![...owed.values()].some((entry) => entry.token === token)) compactionDeferrals.delete(token);
+  }
   for (const [conversationId, watch] of compactionWatch) {
     if (owed.get(conversationId)?.token === watch.token) continue;
     compactionWatch.delete(conversationId);
@@ -9302,6 +9485,8 @@ async function inspectOwedCompactions(now: number): Promise<boolean> {
         0,
         now
       );
+      // This pickup lets the page try again; its last reason no longer describes the chat.
+      if (acted) compactionDeferrals.delete(entry.token);
     } else if (
       sendUnattempted(entry.destinationSend) &&
       !commands.some((command) => command.spec.type === 'resume' && command.spec.token === entry.token)
@@ -9491,6 +9676,50 @@ function retireSpentRepairs(): void {
  * out is kept until exactly this line runs, so that a reload which did not help is not repeated
  * — see `retireSpentRepairs`. This call is the proof that it did help.
  */
+/** How long a held call waits for its continue to be sent; once Send is authorized, as long again. */
+let rotationHoldMs = 15_000;
+/** Test seam. */
+export function setRotationHoldForTests(ms: number): void { rotationHoldMs = ms; }
+
+/**
+ * Waits, bounded, until the page has sent a fresh-turn continue into the call held for it (#1662).
+ * Not taken in time, it is withdrawn so it cannot land after the call's answer.
+ */
+async function awaitRotationDelivery(conversationId: string, id: string): Promise<void> {
+  const started = Date.now();
+  changed();
+  for (;;) {
+    const state = await rotationDelivery(id);
+    if (state === 'settled') return;
+    if (state === 'declined') {
+      const turnId = (await listInputs()).find(row => row.id === id)?.queuedTurn?.turnId;
+      if (turnId) noteRotationDeclined(conversationId, turnId);
+      changed();
+      return;
+    }
+    const waited = Date.now() - started;
+    if (state === 'pending' && waited >= rotationHoldMs) {
+      const where = await withdrawUnsentRotation(id);
+      if (where) {
+        const seconds = Math.round(rotationHoldMs / 1000);
+        // Two different faults (2026-10-21): a page that never picked the continue up, often a
+        // browser worker that had stopped answering, and one that picked it up but never reached Send.
+        const why = where === 'queued'
+          ? `the page did not pick up the continue within ${seconds} s (the browser is ${browserWakeConnected() ? 'connected' : 'not connected'})`
+          : `the page picked up the continue but did not reach Send within ${seconds} s`;
+        logInfo(`turn rotation: ${conversationId} — ${why}; the call answers and a later one tries again`);
+        changed();
+      }
+      return;
+    }
+    if (waited >= rotationHoldMs * 2) {
+      logWarn(`turn rotation: ${conversationId} — the continue's Send was not confirmed within ${Math.round(rotationHoldMs * 2 / 1000)} s; the call answers now`);
+      return;
+    }
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+}
+
 /** When each running turn started, read once per turn from its own `turn_start`. */
 const turnStarts = new Map<string, number>();
 const turnRotationDeps: RotationDeps = {
@@ -9519,7 +9748,8 @@ function noteCallAttribution(
   completedFinalAt: number | null = null,
   requestId: string | null = null,
   reopenedTurnId: string | null = null,
-  filedSession: SessionSummary | null = null
+  filedSession: SessionSummary | null = null,
+  tool: string | null = null
 ): void {
   if (conversationId) {
     // MCP truth can grow while a Pro page emits no new observation. The just-filed
@@ -9589,12 +9819,38 @@ function noteCallAttribution(
     grantActivity(conversationId, sessionId, continuingMcp ? Date.now() : pro ? Math.min(Date.now(), startedAt) : Date.now(), CHAT_SILENCE_MS,
       { turnId: sourceTurnId, model: pro ? 'pro' : previous?.model ?? 'unknown', mcpBacked: true });
     // #1402: a long turn continues in a fresh one, right after this tool result. Pro thinks long on
-    // purpose; a worker's or helper's turn end is its report, and Goal/Loop decide on turn ends.
+    // purpose, and a worker's or helper's turn end is its report. Goal and Loop chats rotate too
+    // (2.1.43): the rotated turn ends with no final answer, so they decide only at the fresh turn's
+    // end. Never at a hold tool's result, which is Loop's next instruction (GOAL_HOLD_TOOLS).
+    // #1662: only while this call's answer is still held (callHoldOpen), so the continue goes in
+    // while the call runs; the answer waits until it is sent or withdrawn.
     if (!pro && sourceTurnId && filedSession?.activeTurnId === sourceTurnId &&
         filedSession.origin?.kind !== 'worker' && filedSession.origin?.kind !== 'helper' &&
-        !isWorkerConversation(conversationId) && !goalArmedFor(conversationId)) {
-      void considerTurnRotation(conversationId, sessionId, sourceTurnId, turnRotationDeps)
-        .catch(error => logWarn(`turn rotation: ${String(error)}`));
+        !isWorkerConversation(conversationId) && !(tool && GOAL_HOLD_TOOLS.has(tool)) && callHoldOpen(conversationId)) {
+      if (stopFallbackDue(conversationId, sourceTurnId, getConfig().ui.rotateStopFallback === true, Date.now()) && !rotationFenced(conversationId)) {
+        // ChatGPT offered no Send for this turn's continue twice: stop the turn once this result has
+        // gone out, refusing (not running) any call that comes meanwhile, and continue after the stop.
+        noteStopFallback(conversationId, sourceTurnId, Date.now());
+        armRotationFence(conversationId, sourceTurnId);
+        logInfo(`turn rotation: ${conversationId} — ChatGPT offered no Send for the continue; stopping turn ${sourceTurnId} after this result to continue in a fresh one`);
+        const timer = setTimeout(() => {
+          void stopSessionTurn(sessionId, sourceTurnId, { rotation: true }).catch(error => {
+            clearRotationFence(conversationId);
+            logWarn(`turn rotation: ${conversationId} — could not stop turn ${sourceTurnId}: ${String(error)}`);
+          });
+        }, ROTATION_STOP_DELAY_MS);
+        timer.unref?.();
+      } else {
+      let filedId: string | null = null;
+      const deps: RotationDeps = { ...turnRotationDeps, file: async (session, turn) => {
+        const row = await fileRotationInput(session, turn);
+        filedId = row?.id ?? null;
+        return row;
+      } };
+      holdCalls(conversationId, considerTurnRotation(conversationId, sessionId, sourceTurnId, deps)
+        .then(filed => filed && filedId ? awaitRotationDelivery(conversationId, filedId) : undefined)
+        .catch(error => logWarn(`turn rotation: ${String(error)}`)));
+      }
     }
     // Exact calls are visible work even without a page. They cannot turn that
     // display into a worker wake, browser repair or continuation after departure.
@@ -10112,6 +10368,11 @@ async function failRepairAttempt(
     if (repairsInFlight.get(conversationId) !== repair) return;
     if (repair.reason === 'assistant-error' && turnRepairSpent.get(conversationId)?.token === token)
       turnRepairSpent.delete(conversationId);
+    if (why === 'changed' && changeDetail === 'navigating' &&
+        (repair.reason === 'assistant-error' || repair.reason === 'no-tab' || repair.reason === 'compaction')) {
+      // Navigation is transient; keep the same repair episode and retry after the short navigation cooldown.
+      repair.notBefore = Math.max(repair.notBefore, Date.now() + NAVIGATION_RECOVERY_COOLDOWN_MS);
+    }
     if (repair.reason === 'unattributed') repair.state = 'done';
     else {
       repair.state = 'queued';
@@ -10412,7 +10673,10 @@ function commandDeadlineDelay(command: Command, now = Date.now()): number {
       const redeemBy = Math.max(command.claimedAt + WORKER_REDEEM_MS, lastBrowserLaunchAt + BROWSER_LAUNCH_GRACE_MS);
       return Math.min(redeemBy, limit) - now;
     }
-    return Math.min(command.claimedAt + COMMAND_DEADLINE_MS, limit) - now;
+    const ordinary = Math.min(command.claimedAt + COMMAND_DEADLINE_MS, limit);
+    // A page that said it is sending may already have delivered the task; its receipt gets a window.
+    const { step, stepAt } = command.progress ?? {};
+    return (step === 'sending' && stepAt !== undefined ? Math.max(ordinary, stepAt + WORKER_SENDING_GRACE_MS) : ordinary) - now;
   }
   const claimedAt = command.claimedAt ?? now;
   return claimedAt + COMMAND_DEADLINE_MS - now;
@@ -10506,7 +10770,11 @@ function expire(command: Command): void {
     retire(command, 'its worker is no longer waiting to be woken');
     return;
   }
-  drop(command, commandExpiryReason(command));
+  // A page that claimed its worker and reported no failure may still have sent its task: its
+  // reports can be minutes late on a starved machine (#1086). Its late receipt is adopted.
+  drop(command, commandExpiryReason(command), {
+    startTimedOut: spec.type === 'worker' && command.owner !== null && !command.lastError
+  });
   deliver();
 }
 
@@ -10629,7 +10897,8 @@ function revivalFor(agent: string, runId: string): WorkerRevival | null {
  */
 function describe(command: Command, client: string | null, claimedSummary?: string): BridgeCommand {
   const spec = command.spec;
-  const selection = spec.type === 'resume' ? continuationByToken(spec.token)?.requestedModel : null;
+  // Only what this ChatGPT account offers: a Free plan has no picker to confirm a model with (#1766).
+  const selection = spec.type === 'resume' ? resumeModelSelection(continuationByToken(spec.token)?.requestedModel, spec.token) : null;
   const expiresAt = Date.now() + Math.max(1, commandDeadlineDelay(command));
   if (spec.type === 'stop') return { id: command.id, expiresAt, kind: 'stop-turn', type: 'stop', text: '', agent: null, model: null, reasoningEffort: null, conversationId: spec.conversationId, turnId: spec.turnId, ...(spec.userMessageId ? { userMessageId: spec.userMessageId } : {}) };
   // A resume's claim is persisted by /commands/redeem before this renderer is called. A
@@ -10657,7 +10926,7 @@ function describe(command: Command, client: string | null, claimedSummary?: stri
   };
 }
 
-function drop(command: Command, why: string): boolean {
+function drop(command: Command, why: string, options: { startTimedOut?: boolean } = {}): boolean {
   if (!commands.includes(command)) return false;
   const automaticEntry = command.spec.type === 'resume' ? continuationByToken(command.spec.token) : null;
   const automaticResume =
@@ -10709,7 +10978,10 @@ function drop(command: Command, why: string): boolean {
   // limit, it held the one in-flight agent-bearing bootstrap so the next worker never
   // opened, it kept the run looking alive to takeover, and the prime went on waiting for
   // a report from a chat that does not exist.
-  if (command.spec.type === 'worker') failAgent(command.spec.agent, why, undefined, {}, command.spec.runId);
+  if (command.spec.type === 'worker') {
+    const failed = failAgent(command.spec.agent, why, undefined, { startTimedOut: options.startTimedOut }, command.spec.runId);
+    if (failed && options.startTimedOut && command.owner !== null) noteLateStartCandidate(command.id, command.owner, command.spec);
+  }
   // A revival that never happened is not a worker that failed. Nothing was typed into its
   // chat, so it goes back to sleeping with its inbox intact and its slot released, and the
   // prime is told the message it sent is still waiting to be delivered.
@@ -10822,9 +11094,70 @@ function nextDeliverable(): Command | null {
  */
 type AckStatus = 'sent' | 'failed';
 
+/**
+ * Worker commands given up for time whose page had claimed them (#1086), by command id.
+ *
+ * Their chat may still have received the task: on a starved machine a page's reports reached
+ * the app 20–90 s after it sent. The page that claimed the command is the only one whose late
+ * receipt counts. In memory and bounded: after a restart a late receipt is refused as before.
+ */
+type WorkerCommandSpec = Extract<CommandSpec, { type: 'worker' }>;
+interface LateStartCandidate { client: string; spec: WorkerCommandSpec; droppedAt: number; settling: Promise<[number, Record<string, unknown>]> | null }
+const lateStarts = new Map<string, LateStartCandidate>();
+const MAX_LATE_STARTS = 32;
+
+function noteLateStartCandidate(id: string, client: string, spec: WorkerCommandSpec): void {
+  lateStarts.set(id, { client, spec, droppedAt: Date.now(), settling: null });
+  while (lateStarts.size > MAX_LATE_STARTS) lateStarts.delete(lateStarts.keys().next().value!);
+}
+
+function lateStartFor(id: string): LateStartCandidate | null {
+  const late = lateStarts.get(id);
+  if (late && Date.now() - late.droppedAt > LATE_START_WINDOW_MS) lateStarts.delete(id);
+  return lateStarts.get(id) ?? null;
+}
+
+/** One final answer per late receipt, durable before it is given, shared by a concurrent retry. */
+function settleLateStart(id: string, late: LateStartCandidate, conversation: string): Promise<[number, Record<string, unknown>]> {
+  late.settling ??= (async (): Promise<[number, Record<string, unknown>]> => {
+    const result = adoptLateWorker(late.spec.agent, conversation, late.spec.runId);
+    const adopted = result.outcome === 'adopted';
+    if (adopted) {
+      const opened = await specOrigin(late.spec);
+      if (opened) await noteChatOrigin(conversation, opened).catch((err: Error) =>
+        logWarn(`could not record the origin of a late-started worker chat: ${err.message}`));
+    }
+    const receipt: CommandReceipt = {
+      id,
+      client: late.client,
+      conversationId: conversation,
+      outcome: adopted ? 'committed' : 'terminal-failure',
+      committed: adopted,
+      error: adopted ? null : `the worker's chat started after the app had given up on it, and ${result.outcome === 'stray' ? result.why : ''}`,
+      completedAt: Date.now()
+    };
+    try {
+      await writeDurableNow(COMMANDS_STATE, commandSnapshot({ addReceipt: receipt }));
+    } catch (err) {
+      late.settling = null;
+      logWarn(`bridge: could not persist the late receipt for worker:${late.spec.runId}:${late.spec.agent} — ${err instanceof Error ? err.message : String(err)}`);
+      return [503, { error: 'command_receipt_not_durable', retryable: true }];
+    }
+    commandReceipts = [...commandReceipts.filter((entry) => entry.id !== id), receipt].slice(-MAX_COMMAND_RECEIPTS);
+    lateStarts.delete(id);
+    logInfo(`bridge: worker:${late.spec.runId}:${late.spec.agent} started late — ${adopted ? 'its chat rejoined the run' : 'its chat was fenced as a stray'}`);
+    changed();
+    return [200, receiptReply(receipt)];
+  })();
+  return late.settling;
+}
+
 /** What a queued command says the chat it opened is for. Null once the command is gone. */
 async function commandOrigin(id: string): Promise<SessionOrigin | null> {
-  const spec = commands.find((entry) => entry.id === id)?.spec;
+  return specOrigin(commands.find((entry) => entry.id === id)?.spec);
+}
+
+async function specOrigin(spec: CommandSpec | undefined): Promise<SessionOrigin | null> {
   if (!spec || spec.type === 'stop') return null;
   if (spec.type === 'worker')
     return {

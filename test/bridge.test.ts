@@ -49,6 +49,7 @@ vi.mock('electron', () => ({
 const { safeStorage } = await import('electron');
 
 const { defaultConfig, getConfig, initConfigPath, saveConfig } = await import('../src/main/config.js');
+const { queueWorkerArchives, resetWorkerArchiveForTests } = await import('../src/main/worker-archive.js');
 const { initSecretsPath, resetSecretsCacheForTests, setSecret } = await import('../src/main/secrets.js');
 const {
   bridgePort,
@@ -82,8 +83,10 @@ const {
   REVIVAL_ACTIVITY_MS,
   REVIVAL_DEADLINE_MS,
   WORKER_BOOTSTRAP_LIMIT_MS,
+  WORKER_SENDING_GRACE_MS,
   WORKER_REDEEM_MS,
   BROWSER_RECOVERY_COOLDOWN_MS,
+  NAVIGATION_RECOVERY_COOLDOWN_MS,
   DEFAULT_PORTS,
   revealChatInBrowser,
   followChatInBackground,
@@ -167,6 +170,7 @@ const {
   resetSwarm,
   restoreSwarm,
   snapshotSwarm,
+  swarmRunning,
   swarmState,
   swarmStateForCaller,
   WORKER_CONTEXT_CEILING_TOKENS,
@@ -265,7 +269,7 @@ interface Reply {
 function request(
   method: string,
   path: string,
-  options: { body?: unknown; origin?: string | null; auth?: string | null; raw?: string; extensionVersion?: string; protocol?: number; extensionBuild?: string; browser?: string; host?: string; engine?: string } = {}
+  options: { body?: unknown; origin?: string | null; auth?: string | null; raw?: string; extensionVersion?: string; protocol?: number; extensionBuild?: string; browser?: string; host?: string; engine?: string; userAgent?: string } = {}
 ): Promise<Reply> {
   const url = new URL(path, base);
   const payload = options.raw ?? (options.body === undefined ? null : JSON.stringify(options.body));
@@ -279,6 +283,7 @@ function request(
   if (options.browser) headers['x-extension-browser'] = options.browser;
   if (options.host) headers['x-extension-host'] = options.host;
   if (options.engine) headers['x-extension-engine'] = options.engine;
+  if (options.userAgent) headers['user-agent'] = options.userAgent;
   if (payload !== null) {
     headers['content-type'] = 'application/json';
     headers['content-length'] = String(Buffer.byteLength(payload));
@@ -670,6 +675,33 @@ describe('who is allowed to talk to it', () => {
     expect((await bridgeStatus()).externalExtension?.engine).toBeUndefined();
     await request('GET', '/status', { host: 'browser' });
     expect((await bridgeStatus()).externalExtension?.engine).toBeUndefined();
+  });
+
+  // 2.1.42 work, Windows VM: a Firefox add-on from before the engine header (2.1.37.1002) showed the
+  // Chrome banner "Reload the extension from this app's folder", which a signed add-on cannot do.
+  // Its moz-extension:// origin says it is Firefox too.
+  it('tells an older Firefox add-on apart by its origin', async () => {
+    await pair();
+    const firefox = 'moz-extension://3f0e5b1a-0c1d-4e2f-8a9b-0c1d2e3f4a5b';
+    await request('GET', '/status', { host: 'browser', origin: firefox, extensionVersion: '2.1.37.1002' });
+    expect((await bridgeStatus()).externalExtension).toMatchObject({ present: true, engine: 'gecko' });
+    expect(await bridgeStatus()).toMatchObject({ extensionVersion: '2.1.37.1002', extensionEngine: 'gecko' });
+  });
+
+  // VM, 2026-10-19: with #1669 installed the banner still asked Firefox for a folder reload. Like
+  // Chrome, Firefox leaves the Origin off some of an add-on's requests, and each request rewrote the
+  // record. Its user agent is on every one.
+  it('keeps an older Firefox add-on apart on requests that carry no origin', async () => {
+    await pair();
+    const firefox = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:152.0) Gecko/20100101 Firefox/152.0';
+    await request('GET', '/status', { host: 'browser', origin: 'moz-extension://3f0e5b1a-0c1d-4e2f-8a9b-0c1d2e3f4a5b', extensionVersion: '2.1.37.1002', userAgent: firefox });
+    await request('GET', '/status', { host: 'browser', origin: null, extensionVersion: '2.1.37.1002', userAgent: firefox });
+    expect((await bridgeStatus()).externalExtension).toMatchObject({ present: true, engine: 'gecko' });
+    expect(await bridgeStatus()).toMatchObject({ extensionVersion: '2.1.37.1002', extensionEngine: 'gecko' });
+    // Chrome's user agent says "like Gecko"; that is not Firefox.
+    const chrome = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/152.0.0.0 Safari/537.36';
+    await request('GET', '/status', { host: 'browser', origin: null, extensionVersion: '2.1.37.1002', userAgent: chrome });
+    expect((await bridgeStatus()).extensionEngine).toBeUndefined();
   });
 
   // Chrome and Firefox both connected (VM, 2026-10-14): Setup showed whichever polled last, not the
@@ -1318,9 +1350,42 @@ describe('extension update holds', () => {
     expect(lines().at(-1)!.message).toContain('already tried this update once; reload it in chrome://extensions');
     await status('browser-updates-itself');
     expect(lines().at(-1)!.message).toContain('Firefox updates the signed add-on itself');
-    // An unknown reason is not logged, and a report without a hold resets it.
+    // An unknown reason is not logged; going back to an earlier reason is a change and is logged.
     await status('made-up'); await status(); await status('chat-busy');
     expect(lines().slice(before)).toHaveLength(4);
+  });
+
+  // VM, 2026-10-20/21: Firefox suspends the add-on's background page between polls, and each wake
+  // reported no hold first, so the same "Firefox updates the signed add-on itself" was logged 907
+  // times in 36 hours. A report without a hold no longer forgets the reason already logged.
+  it('logs a hold once while its browser keeps reporting no hold in between, and again after six hours', async () => {
+    await pair();
+    const lines = () => getLog().filter(entry => entry.message.includes('browser extension waits to update'));
+    const before = lines().length;
+    const status = (updateHold?: string) => request('POST', '/status', { browser: 'firefoxbrowser0000002',
+      body: { openConversations: [], ...(updateHold ? { updateHold } : {}) } });
+    for (let round = 0; round < 5; round += 1) { await status(); await status('browser-updates-itself'); }
+    expect(lines().slice(before)).toHaveLength(1);
+    const now = Date.now();
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(now + 6 * 60 * 60_000 + 1);
+    try {
+      await status('browser-updates-itself');
+      expect(lines().slice(before)).toHaveLength(2);
+    } finally { clock.mockRestore(); }
+  });
+
+  it('logs the same hold again when this app ships a different extension build', async () => {
+    await pair();
+    const lines = () => getLog().filter(entry => entry.message.includes('browser extension waits to update'));
+    const before = lines().length;
+    const status = () => request('POST', '/status', { browser: 'firefoxbrowser0000003', body: { openConversations: [], updateHold: 'browser-updates-itself' } });
+    try {
+      setShippedExtensionBuildForTest('aaaaaaaaaaaa');
+      await status(); await status();
+      setShippedExtensionBuildForTest('bbbbbbbbbbbb');
+      await status(); await status();
+      expect(lines().slice(before)).toHaveLength(2);
+    } finally { setShippedExtensionBuildForTest(); }
   });
 
   // 2.1.39 release round: Chrome (updated) and Firefox (waiting for its signed add-on) both report
@@ -3665,6 +3730,84 @@ describe('automatic compaction', () => {
     }
   });
 
+  // #1643: five pickups were "resumed" and none reached Send. The page knew why each attempt
+  // stopped (shown only on its own control); the app logged nothing and said "asking ChatGPT".
+  it('logs and shows why the source page could not ask for an automatic handoff', async () => {
+    vi.useFakeTimers();
+    try {
+      await pair();
+      const conversationId = 'a1a1a1a1-0000-4000-8000-00000000ac0d';
+      await request('POST', '/events', {
+        body: { conversationId, events: [{ kind: 'user_message', time: Date.now(), text: 'a chat whose page cannot ask yet', messageId: 'm-auto-deferred' }] }
+      });
+      const filed = await request('POST', '/compact', { body: { conversationId, ticket: true, automatic: true } });
+      const token = filed.body.token as string;
+      const sessionId = filed.body.sessionId as string;
+      const why = 'ChatGPT has not confirmed receiving the latest tool results. Nothing was compacted.';
+      const phase = async () => ((await sessionControlsFor(sessionId)).recovery ?? []).map(countdown => countdown.phase);
+      const takeRepair = async (): Promise<{ token: string; reason: string } | null> => {
+        await sweepStaleSwarm(Date.now());
+        return (await request('GET', '/status')).body.repairs?.[0] ?? null;
+      };
+      await sweepStaleSwarm(Date.now());
+      expect(await phase()).toEqual(['asking']);
+
+      const deferred = await request('POST', '/compact', { body: { conversationId, token, sourceDeferred: true, sourceError: why } });
+      expect(deferred.status).toBe(200);
+      expect(continuationByToken(token)).toMatchObject({ state: 'awaiting-summary', sourceSend: { state: 'not-attempted' } });
+      expect(getLog().map(entry => entry.message)).toContainEqual(expect.stringContaining(`could not ask for the handoff yet: ${why}`));
+      expect(await phase()).toEqual(['held']);
+
+      // The next pickup lets the page try again, so the app is asking once more.
+      await vi.advanceTimersByTimeAsync(2 * 60_000);
+      expect(await takeRepair()).toMatchObject({ reason: 'compaction' });
+      expect(await phase()).toEqual(['asking']);
+
+      // Only the open, still unsent automatic ticket of this chat takes a reason.
+      expect((await request('POST', '/compact', { body: { conversationId, token: 'not-a-ticket', sourceDeferred: true, sourceError: why } })).status).toBe(409);
+      expect((await request('POST', '/compact', { body: { conversationId: 'a1a1a1a1-0000-4000-8000-00000000ac0e', token, sourceDeferred: true, sourceError: why } })).status).toBe(409);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // #1643: the page tries again by itself once its helper answers, before the app's next pickup.
+  it('asks again, not held, when the source page starts a new attempt on its own', async () => {
+    vi.useFakeTimers();
+    try {
+      await pair();
+      const conversationId = 'a1a1a1a1-0000-4000-8000-00000000ac10';
+      await request('POST', '/events', {
+        body: { conversationId, events: [{ kind: 'user_message', time: Date.now(), text: 'a chat whose helper came back', messageId: 'm-auto-helper' }] }
+      });
+      const filed = await request('POST', '/compact', { body: { conversationId, ticket: true, automatic: true } });
+      const token = filed.body.token as string;
+      const sessionId = filed.body.sessionId as string;
+      const phase = async () => ((await sessionControlsFor(sessionId)).recovery ?? []).map(countdown => countdown.phase);
+      await sweepStaleSwarm(Date.now());
+      await request('POST', '/compact', { body: { conversationId, token, sourceDeferred: true, sourceError: 'ChatGPT has not confirmed receiving the latest tool results.' } });
+      expect(await phase()).toEqual(['held']);
+
+      const again = await request('POST', '/compact', { body: { conversationId, ticket: true, automatic: true } });
+      expect(again.body.token).toBe(token);
+      expect(await phase()).toEqual(['asking']);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('takes no deferral reason for a manual Compact & Resume', async () => {
+    await pair();
+    const conversationId = 'a1a1a1a1-0000-4000-8000-00000000ac0f';
+    await request('POST', '/events', {
+      body: { conversationId, events: [{ kind: 'user_message', time: Date.now(), text: 'a manual press', messageId: 'm-manual-deferred' }] }
+    });
+    const filed = await request('POST', '/compact', { body: { conversationId, ticket: true } });
+    const deferred = await request('POST', '/compact', { body: { conversationId, token: filed.body.token, sourceDeferred: true, sourceError: 'no' } });
+    expect(deferred.status).toBe(409);
+    expect(deferred.body.error).toBe('source_send_not_deferrable');
+  });
+
   it('abandons an automatic ticket that never reaches Send after its bounded retry bursts', async () => {
     vi.useFakeTimers();
     try {
@@ -4878,6 +5021,42 @@ describe('delivering a bootstrap', () => {
     expect(command.text).not.toContain('SCOPED_AGENTS_TAIL');
   });
 
+  it('puts a chat recorded inside a linked ChatGPT Project into its project before it runs commands (#1744)', async () => {
+    const fs = await import('node:fs/promises');
+    const path = await import('node:path');
+    const { addProject, armProjectCreate, claimProjectCreate, completeProjectCreate, getSessionProject } = await import('../src/main/projects.js');
+    const { getSession } = await import('../src/main/session/store.js');
+    const first = path.join(dir, 'first-root-1744');
+    const folder = path.join(dir, 'linked-project-1744');
+    await fs.mkdir(first, { recursive: true });
+    await fs.mkdir(folder, { recursive: true });
+    // Without the project, a command would run in the first approved folder.
+    await saveConfig({ ...suiteConfig, roots: [{ name: 'first', path: first }, { name: 'linked', path: folder }] });
+    const project = await addProject(folder);
+    const requestId = (project.chatgpt as { requestId: string }).requestId;
+    const chatgptProject = `g-p-${'c'.repeat(32)}`;
+    expect(await claimProjectCreate(requestId, 'page')).toBe(true);
+    expect(await armProjectCreate(requestId, 'page')).toBe(true);
+    expect(await completeProjectCreate(requestId, 'page', chatgptProject)).toBe(true);
+    await pair();
+    const record = (conversationId: string, extra: Record<string, unknown>) => request('POST', '/events', {
+      body: { conversationId, ...extra, events: [{ kind: 'user_message', time: Date.now(), text: 'list the files', messageId: `m-${conversationId}` }] }
+    });
+    const inside = await record('17440000-0000-4000-8000-000000000001', { chatgptProject });
+    expect(inside.body).toMatchObject({ stored: 1 });
+    expect((await getSession(inside.body.sessionId as string))?.projectId).toBe(project.id);
+    expect(await getSessionProject(inside.body.sessionId as string)).toMatchObject({ virtual: '/linked' });
+    // Outside any Project, or with a malformed value, a chat stays as it was.
+    const outside = await record('17440000-0000-4000-8000-000000000002', {});
+    expect((await getSession(outside.body.sessionId as string))?.projectId).toBeUndefined();
+    const odd = await record('17440000-0000-4000-8000-000000000003', { chatgptProject: 'g-p-../../x' });
+    expect(odd.status).toBe(200);
+    expect((await getSession(odd.body.sessionId as string))?.projectId).toBeUndefined();
+    // A worker's events (its origin may not be recorded yet) never pick a project this way.
+    const worker = await record('17440000-0000-4000-8000-000000000004', { chatgptProject, agent: 'worker-1' });
+    expect((await getSession(worker.body.sessionId as string))?.projectId).toBeUndefined();
+  });
+
   it('redeems a restored broker-owned worktree as the worker cwd, preserves source instructions and rejects a lost lease', async () => {
     const fs = await import('node:fs/promises');
     const path = await import('node:path');
@@ -5553,6 +5732,34 @@ describe('delivering a bootstrap', () => {
     expect(Date.now() - createdAt).toBeLessThan(30_000);
   });
 
+  it('unarchives a worker chat the app archived before it types the wake into it (#1701)', async () => {
+    await saveConfig({ ...suiteConfig, multiAgent: { ...suiteConfig.multiAgent, archiveWorkerChats: true } });
+    resetWorkerArchiveForTests();
+    await pair();
+    spawn({ workers: [{ task: 'write the audit' }], caller: { conversationId: PRIME_CHAT } });
+    const bootstrap = await redeem();
+    const conversationId = 'acacacac-7654-4210-8edc-ba9876543210';
+    await request('POST', '/commands/ack', {
+      body: { id: bootstrap.id, status: 'sent', conversationId, agent: 'worker-1' }
+    });
+    finishAgent({ conversationId }, 'the first half is done');
+    // The finished worker's chat was archived in the meantime.
+    queueWorkerArchives([conversationId]);
+    expect((await request('POST', '/worker-archive/next', { body: {} })).body).toEqual({ conversationId });
+    await request('POST', '/worker-archive/result', { body: { conversationId, outcome: 'archived' } });
+
+    wake([{ to: 'worker-1', text: 'now do the second half' }]);
+    // Nothing is opened or typed while the chat is still archived. An extension without
+    // unarchive support reads no chat to archive here.
+    expect((await request('GET', '/status')).body.revival ?? null).toBeNull();
+    expect(opened, 'only the bootstrap opened a page').toHaveLength(1);
+    expect((await request('POST', '/worker-archive/next', { body: {} })).body).toEqual({ conversationId: null, unarchive: conversationId });
+    expect((await request('POST', '/worker-archive/result', { body: { conversationId, outcome: 'unarchived' } })).status).toBe(200);
+
+    const revival = await waitForRevival();
+    expect(revival.conversationId).toBe(conversationId);
+  });
+
   it('wakes the same worker again after it has called, well inside the first wake', async () => {
     await pair();
     spawn({ workers: [{ task: 'write the audit' }], caller: { conversationId: PRIME_CHAT } });
@@ -5854,6 +6061,26 @@ describe('delivering a bootstrap', () => {
     // The second wake reaches the browser now, not only after the first one's page claims it.
     expect(status.body.revivals.map((entry: { conversationId: string }) => entry.conversationId).sort()).toEqual([...chats].sort());
     expect(status.body.revival).toEqual(status.body.revivals[0]);
+  });
+
+  it('offers a worker\'s wake only to a companion that may take work', async () => {
+    const SHIPPED = 'a0a0a0a0a0a0', chrome = 'c'.repeat(32), firefox = 'f'.repeat(32);
+    setShippedExtensionBuildForTest(SHIPPED);
+    try {
+      await pair();
+      spawn({ workers: [{ task: 'first audit' }], caller: { conversationId: PRIME_CHAT } });
+      const conversationId = 'abababab-7654-3210-fedc-ba9876543211';
+      const bootstrap = await redeem();
+      await request('POST', '/commands/ack', { body: { id: bootstrap.id, status: 'sent', conversationId, agent: 'worker-1' } });
+      finishAgent({ conversationId }, 'reported, waiting for more');
+      wake([{ to: 'worker-1', text: 'one more thing' }]);
+      await waitForRevival();
+      await request('GET', '/status', { extensionBuild: SHIPPED, browser: chrome });
+      const stale = (await request('GET', '/status', { extensionBuild: 'deadbeefcafe', browser: firefox })).body;
+      expect(stale.revival).toBeNull();
+      expect(stale.revivals).toEqual([]);
+      expect((await request('GET', '/status', { extensionBuild: SHIPPED, browser: chrome })).body.revival).toMatchObject({ conversationId });
+    } finally { setShippedExtensionBuildForTest(); }
   });
 
   // #1086: a page that redeemed the wake and failed before Send says so ("transient"); the
@@ -7945,6 +8172,35 @@ describe('a command that runs out of time says how far its page got', () => {
     } finally { vi.useRealTimers(); }
   });
 
+  // #1086 (2.1.41, Windows VM under load): pages reported "sending the task" and the app gave the workers
+  // up at the ordinary deadline anyway, while their chats received the task: workers ran that the app had
+  // written off. A page that says it is sending gets a bounded window for its receipt, and is told so.
+  it.each([true, false])('keeps a worker whose page reported Send for its receipt (receipt arrives %s)', async arrives => {
+    vi.useFakeTimers();
+    try {
+      await pair();
+      spawn({ workers: [{ task: 'write the audit' }], caller: { conversationId: PRIME_CHAT } });
+      const bootstrap = await redeem();
+      await vi.advanceTimersByTimeAsync(COMMAND_DEADLINE_MS - 10_000);
+      const sending = (await step(bootstrap.id, 'sending')).body;
+      expect(sending).toMatchObject({ ok: true });
+      expect(sending.expiresAt).toBeGreaterThanOrEqual(Date.now() + WORKER_SENDING_GRACE_MS - 1_000);
+      const prior = new Set(getLog());
+      await vi.advanceTimersByTimeAsync(30_000); // past the ordinary deadline
+      expect(giveUp(prior, 'worker:')).toBe('');
+      expect(swarmState().agents.find(agent => agent.id === 'worker-1')?.state).toBe('invited');
+      if (arrives) {
+        const conversationId = 'dededede-7654-3210-fedc-ba9876543211';
+        expect((await request('POST', '/commands/ack', { body: { id: bootstrap.id, status: 'sent', conversationId, agent: 'worker-1' } })).status).toBe(200);
+        expect(swarmState().agents.find(agent => agent.id === 'worker-1')?.state).toBe('active');
+      } else {
+        // The window is bounded: without a receipt the worker still ends, and says it got as far as Send.
+        await vi.advanceTimersByTimeAsync(WORKER_SENDING_GRACE_MS);
+        expect(giveUp(prior, 'worker:')).toContain('last step: sending the task');
+      }
+    } finally { vi.useRealTimers(); }
+  });
+
   it('ignores a step from a page that does not own the command, and unknown steps', async () => {
     vi.useFakeTimers();
     try {
@@ -8051,6 +8307,36 @@ describe('a worker chat that never opens', () => {
     expect(opened).toEqual([]);
     } finally { const closed = once(socket, 'close'); socket.close(); await closed; }
   });
+  // VM, 2026-10-19: two of three workers in every run failed with "the browser opened it, but the
+  // page never picked up its task". Firefox on an out-of-date add-on polled first and was handed
+  // their tabs to open, and the redeem route then refused its pages as out of date.
+  it('hands a worker tab only to a companion that may take work', async () => {
+    const SHIPPED = 'a0a0a0a0a0a0', chrome = 'c'.repeat(32), firefox = 'f'.repeat(32);
+    setShippedExtensionBuildForTest(SHIPPED);
+    await pair();
+    await request('GET', '/status', { extensionBuild: SHIPPED, browser: chrome });
+    const socket = new WebSocket(base.replace('http:', 'ws:') + '/wake', { origin: EXTENSION_ORIGIN });
+    await once(socket, 'open');
+    const authenticated = once(socket, 'message'); socket.send(token!); await authenticated;
+    try {
+      spawn({ workers: [{ task: 'one placement probe' }], caller: { conversationId: PRIME_CHAT } });
+      // The out-of-date browser polls through the whole time the tab is being offered.
+      for (let poll = 0; poll < 40; poll++) {
+        expect((await request('GET', '/status', { extensionBuild: 'deadbeefcafe', browser: firefox })).body.placement).toBeNull();
+        await new Promise(resolve => setTimeout(resolve, 25));
+      }
+      let placement: any;
+      await vi.waitFor(async () => {
+        placement ||= (await request('GET', '/status', { extensionBuild: SHIPPED, browser: chrome })).body.placement;
+        expect(placement?.id).toBeTruthy();
+      });
+      expect((await redeem(placement.id)).agent).toBe('worker-1');
+    } finally {
+      setShippedExtensionBuildForTest();
+      const closed = once(socket, 'close'); socket.close(); await closed;
+    }
+  });
+
   it('fails the worker definitively instead of leaving it invited, and lets the next one through', async () => {
     await pair();
     spawn({ workers: [{ task: 'first audit' }, { task: 'second audit' }], caller: { conversationId: PRIME_CHAT } });
@@ -8237,6 +8523,107 @@ describe('a worker chat that never opens', () => {
       vi.useRealTimers();
       await saveConfig(previous);
     }
+  });
+});
+
+// --------------------------------------------------- late starts
+
+/**
+ * A worker the app gave up on for time, whose chat received its task anyway (#1086).
+ *
+ * On a memory-starved Windows machine (2026-10-18, 250–430 MB free) pages sent their task
+ * within the deadline, but their reports reached the app 20–90 s late. The app failed the
+ * worker, its chat went on working, and nothing tracked it. The truth arriving late is
+ * accepted: the worker rejoins its run when it still can, and is fenced as a stray when not.
+ */
+describe('a worker whose chat starts after the app gave up on it', () => {
+  const ack = (id: string, conversationId: string, client = 'tab-1') =>
+    request('POST', '/commands/ack', { body: { id, status: 'sent', conversationId, agent: 'worker-1', client } });
+  const primeReports = (): string[] =>
+    snapshotSwarm()!.agents.find(entry => entry.info.id === 'prime')!.queue.map(message => message.text);
+  const workerOne = () => swarmState().agents.find(agent => agent.id === 'worker-1');
+  const LATE_CHAT = 'abababab-5555-4444-3333-222222222222';
+
+  it('rejoins its live run and the prime is told to expect its result', async () => {
+    vi.useFakeTimers();
+    try {
+      await pair();
+      spawn({ workers: [{ task: 'first half' }, { task: 'second half' }], caller: { conversationId: PRIME_CHAT } });
+      await vi.waitFor(() => expect(opened).toHaveLength(2));
+      const first = await redeem(new URL(opened[0]!).searchParams.get('clf')!);
+      const second = await redeem(new URL(opened[1]!).searchParams.get('clf')!, 'tab-2');
+      expect((await request('POST', '/commands/ack', { body: { id: second.id, status: 'sent',
+        conversationId: 'cdcdcdcd-5555-4444-3333-222222222222', agent: second.agent, client: 'tab-2' } })).status).toBe(200);
+      await vi.advanceTimersByTimeAsync(COMMAND_DEADLINE_MS + 1_000);
+      expect(workerOne()?.state).toBe('failed');
+
+      const late = await ack(first.id, LATE_CHAT);
+      expect(late.status).toBe(200);
+      expect(late.body).toMatchObject({ final: true, committed: true, conversationId: LATE_CHAT });
+      expect(workerOne()).toMatchObject({ state: 'active', conversationId: LATE_CHAT });
+      expect(primeReports().at(-1)).toMatch(/^\[worker-1 started late\] .*do not redo its work/);
+      // A retried ACK after a lost response gets the same final answer, and changes nothing.
+      expect((await ack(first.id, LATE_CHAT)).body).toEqual(late.body);
+      expect(primeReports().filter(text => text.startsWith('[worker-1 started late]'))).toHaveLength(1);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('wakes its parked run when it was the last worker', async () => {
+    vi.useFakeTimers();
+    try {
+      await pair();
+      spawn({ workers: [{ task: 'the only half' }], caller: { conversationId: PRIME_CHAT } });
+      const bootstrap = await redeem();
+      await vi.advanceTimersByTimeAsync(COMMAND_DEADLINE_MS + 1_000);
+      expect(swarmRunning()).toBe(false);
+
+      const late = await ack(bootstrap.id, 'abababab-7777-4444-3333-222222222222');
+      expect(late.body, JSON.stringify(late.body)).toMatchObject({ final: true, committed: true });
+      expect(swarmRunning()).toBe(true);
+      expect(workerOne()).toMatchObject({ state: 'active', conversationId: 'abababab-7777-4444-3333-222222222222' });
+      expect(primeReports().at(-1)).toMatch(/^\[worker-1 started late\]/);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('is fenced as a stray when its slot went to a replacement, and the prime is told', async () => {
+    vi.useFakeTimers();
+    try {
+      await pair();
+      spawn({ workers: [{ task: 'first half' }, { task: 'second half' }], caller: { conversationId: PRIME_CHAT } });
+      await vi.waitFor(() => expect(opened).toHaveLength(2));
+      const first = await redeem(new URL(opened[0]!).searchParams.get('clf')!);
+      const second = await redeem(new URL(opened[1]!).searchParams.get('clf')!, 'tab-2');
+      await request('POST', '/commands/ack', { body: { id: second.id, status: 'sent',
+        conversationId: 'cdcdcdcd-5555-4444-3333-222222222222', agent: second.agent, client: 'tab-2' } });
+      await vi.advanceTimersByTimeAsync(COMMAND_DEADLINE_MS + 1_000);
+      // The prime did what the failure report told it to: it started a replacement.
+      spawn({ workers: [{ task: 'first half, again' }], caller: { conversationId: PRIME_CHAT } });
+      await vi.waitFor(() => expect(opened).toHaveLength(3));
+      const replacement = await redeem(new URL(opened[2]!).searchParams.get('clf')!, 'tab-3');
+      await request('POST', '/commands/ack', { body: { id: replacement.id, status: 'sent',
+        conversationId: 'efefefef-5555-4444-3333-222222222222', agent: replacement.agent, client: 'tab-3' } });
+
+      const late = await ack(first.id, LATE_CHAT);
+      expect(late.status).toBe(200);
+      expect(late.body).toMatchObject({ final: true, committed: false, conversationId: LATE_CHAT });
+      expect(retiredWorkerForConversation(LATE_CHAT)).toMatchObject({ id: 'worker-1' });
+      expect(swarmState().agents.filter(agent => agent.conversationId === LATE_CHAT)).toEqual([]);
+      expect(primeReports().at(-1)).toMatch(/^\[worker-1 started late, outside the run\] .*tool calls are refused/);
+    } finally { vi.useRealTimers(); }
+  });
+
+  it('takes no late ACK from a page other than the one that claimed it', async () => {
+    vi.useFakeTimers();
+    try {
+      await pair();
+      spawn({ workers: [{ task: 'the only half' }], caller: { conversationId: PRIME_CHAT } });
+      const bootstrap = await redeem();
+      await vi.advanceTimersByTimeAsync(COMMAND_DEADLINE_MS + 1_000);
+      const otherChat = 'abababab-6666-4444-3333-222222222222';
+      expect((await ack(bootstrap.id, otherChat, 'another-tab')).status).toBe(404);
+      expect(swarmRunning()).toBe(false);
+      expect(retiredWorkerForConversation(otherChat)).toBeNull();
+    } finally { vi.useRealTimers(); }
   });
 });
 
@@ -8612,6 +8999,63 @@ describe('unattributed activity recovery', () => {
 
   /** The chat a pass was told to repair. */
   const chatOf = (repair: { conversationId: string } | null): string | null => repair?.conversationId ?? null;
+
+  it.each(['assistant-error', 'no-tab', 'compaction'] as const)(
+    'waits before retrying %s recovery after navigation', async reason => {
+      await pair();
+      let conversationId: string;
+
+      if (reason === 'assistant-error') {
+        conversationId = OTHER;
+        await events(conversationId, [openTurn('navigation-error-turn'), {
+          kind: 'chat_error', time: Date.now(), turnId: 'navigation-error-turn',
+          text: 'Connection interrupted', recoverable: true
+        }]);
+      } else if (reason === 'no-tab') {
+        conversationId = WORKER;
+        spawn({ workers: [{ task: 'check navigation recovery' }], caller: { conversationId: PRIME } });
+        const bootstrap = await redeem();
+        await request('POST', '/commands/ack', {
+          body: { id: bootstrap.id, status: 'sent', conversationId, agent: 'worker-1' }
+        });
+        await events(conversationId, [openTurn('navigation-missing-tab-turn')]);
+        await request('POST', '/closed', { body: { conversationId } });
+      } else {
+        conversationId = randomUUID();
+        const session = await createSession({ conversationId });
+        await compactSession(session.id);
+      }
+
+      const first = await maintenance();
+      expect(first).toMatchObject({ conversationId, reason });
+      vi.useFakeTimers();
+      try {
+        const failWhileNavigating = async (repair: { token: string }) => {
+          expect((await request('POST', '/repairs/claim', { body: { token: repair.token } })).body.allowed).toBe(true);
+          await request('GET', `/status?repairFailed=${encodeURIComponent(repair.token)}` +
+            '&repairAction=reloaded&why=changed&detail=navigating');
+        };
+        await failWhileNavigating(first!);
+
+        expect(await maintenance()).toBeNull();
+        await vi.advanceTimersByTimeAsync(NAVIGATION_RECOVERY_COOLDOWN_MS - 1);
+        expect(await maintenance()).toBeNull();
+        await vi.advanceTimersByTimeAsync(1);
+        const retry = await maintenance();
+        expect(retry).toMatchObject({ conversationId, reason });
+        expect(retry!.token).not.toBe(first!.token);
+
+        await failWhileNavigating(retry!);
+        expect(await maintenance()).toBeNull();
+        await vi.advanceTimersByTimeAsync(NAVIGATION_RECOVERY_COOLDOWN_MS - 1);
+        expect(await maintenance()).toBeNull();
+        await vi.advanceTimersByTimeAsync(1);
+        expect(await maintenance()).toMatchObject({ conversationId, reason });
+      } finally {
+        vi.useRealTimers();
+      }
+    }
+  );
 
   it('H2 records the machine reason and immediately offers the existing assistant-error episode', async () => {
     await pair();
@@ -9035,6 +9479,22 @@ describe('unattributed activity recovery', () => {
    * reloaded three times before it was born. The bootstrap this app typed is the durable
    * boundary: reloads before it are A's and leave the feed, reloads after it stay.
    */
+  it('finds the newest approval row only while it still says waiting', async () => {
+    // A restart while ChatGPT's card waited must take that row over, not add another (VM, 2026-10-20).
+    const { latestWaitingApprovalRow } = await import('../src/main/bridge.js');
+    const { APPROVAL_ANSWERED_TEXT, APPROVAL_WAITING_TEXT } = await import('../src/shared/approval-wait.js');
+    const session = await createSession({ conversationId: 'approval-rows-chat' });
+    expect(await latestWaitingApprovalRow(session.id)).toBeNull();
+    const first = await recordProgress(session.id, 'approval-wait:approval-rows-chat:1', APPROVAL_WAITING_TEXT);
+    await recordProgress(session.id, 'approval-wait:approval-rows-chat:1', APPROVAL_ANSWERED_TEXT, first!);
+    expect(await latestWaitingApprovalRow(session.id)).toBeNull();
+    await recordProgress(session.id, 'browser-repair:between', 'Reloaded chat to recover an interrupted response.');
+    const second = await recordProgress(session.id, 'approval-wait:approval-rows-chat:2', APPROVAL_WAITING_TEXT);
+    expect(await latestWaitingApprovalRow(session.id)).toEqual({ progressId: 'approval-wait:approval-rows-chat:2', anchor: second });
+    await recordProgress(session.id, 'approval-wait:approval-rows-chat:2', APPROVAL_ANSWERED_TEXT, second!);
+    expect(await latestWaitingApprovalRow(session.id)).toBeNull();
+  });
+
   it('keeps an earlier chat’s reload notices out of the chat that resumed it', async () => {
     await pair();
     await events(PRIME, [
@@ -9497,6 +9957,38 @@ describe('unattributed activity recovery', () => {
         vi.useRealTimers();
       }
     }
+  });
+
+  it('tells the page when the running turn answers its conversation\'s first question', async () => {
+    // A chat's first turn can run without ChatGPT showing its question; the page then proves the
+    // question by place, which needs the app's word that the recorded question is the first one.
+    await pair();
+    const chat = randomUUID();
+    await events(chat, [
+      { kind: 'user_message', messageId: 'first-question', parentId: 'root', text: 'Start the long task', time: Date.now(), authoredNow: true },
+      openTurn('first-turn')
+    ]);
+    const first = await request('GET', `/activity?conversationId=${chat}&since=0`);
+    expect(first.body.recordedQuestionId).toBe('first-question');
+    expect(first.body.recordedQuestionFirst).toBe(true);
+
+    await events(chat, [
+      { kind: 'turn_end', turnId: 'first-turn', outcome: 'completed', time: Date.now() + 1 },
+      { kind: 'user_message', messageId: 'second-question', parentId: 'first-answer-id', text: 'Go on', time: Date.now() + 2, authoredNow: true },
+      openTurn('second-turn')
+    ]);
+    const second = await request('GET', `/activity?conversationId=${chat}&since=0`);
+    expect(second.body.recordedQuestionId).toBe('second-question');
+    expect(second.body).not.toHaveProperty('recordedQuestionFirst');
+  });
+
+  it('reports the open turn\'s sent results, and none without an open turn', async () => {
+    await pair();
+    const chat = randomUUID();
+    await events(chat, [{ kind: 'user_message', messageId: 'sent-question', parentId: 'root', text: 'Work on it', time: Date.now(), authoredNow: true }]);
+    expect((await request('GET', `/activity?conversationId=${chat}&since=0`)).body).not.toHaveProperty('sentResults');
+    await events(chat, [openTurn('sent-turn')]);
+    expect((await request('GET', `/activity?conversationId=${chat}&since=0`)).body.sentResults).toEqual({ count: 0, settled: true });
   });
 
   it.each(['normal', 'pro'] as const)('does not continue or reload a %s final observed by another document of the same response', async model => {
@@ -15871,6 +16363,9 @@ describe('the goal loop over the bridge', () => {
         reply: humanReply('rewrite the parser in rust'),
         model: 'deepseek/deepseek-v4-flash'
       });
+      // The page types it into a chat that has no id yet: whichever new chat it arrives in marks it the app's.
+      const { takeAutomaticReply } = await import('../src/main/session/automatic-replies.js');
+      expect(takeAutomaticReply('c-any-new-chat', humanReply('rewrite the parser in rust'))).toBe(true);
       // The opening turn is the last *conversation* message; the closing reminder the goal
       // loop appends after the transcript is a system message and sits behind it.
       expect(seen.filter((message) => message.role !== 'system').at(-1)!.content).toContain(

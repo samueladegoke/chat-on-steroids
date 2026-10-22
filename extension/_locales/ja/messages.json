@@ -38,6 +38,9 @@
   "content_bootstrap_composer_replaced": {
     "message": "初期メッセージの挿入中に ChatGPT が入力欄を置き換えました"
   },
+  "content_bootstrap_composer_never_ready": {
+    "message": "ChatGPTが開始用の使用可能な入力欄を表示しませんでした"
+  },
   "content_bootstrap_composer_unavailable": {
     "message": "モデル選択後にChatGPTが使用可能な入力欄を再表示しませんでした"
   },
@@ -90,7 +93,7 @@
     "message": "チャットはブロックされています"
   },
   "content_chat_blocked_tip": {
-    "message": "このチャットは Chat On Steroids アプリでブロックされています。ツール呼び出しは拒否され、ゴール、ループ、自動圧縮も無効です。解除するにはアプリのチャットタブを開き、セッション一覧でこのチャットにカーソルを合わせてブロック解除アイコンを押してください。"
+    "message": "このチャットは Chat On Steroids アプリでブロックされています。ツール呼び出しは拒否され、ゴール、ループ、自動圧縮も無効です。解除するには、アプリのサイドバーでこのチャットの ⋯ メニューを開き、「ブロックを解除」を選んでください。"
   },
   "content_chat_still_opening": {
     "message": "このチャットはまだ開いています。もう一度お試しください"
@@ -337,9 +340,6 @@
   },
   "content_delivery_text_not_accepted": {
     "message": "ChatGPT がテキストを受け付けませんでした$1"
-  },
-  "content_delivery_rotation_not_stopped": {
-    "message": "ChatGPT は実行中の回答で送信を提供せず、自動続行のための停止も完了しませんでした。"
   },
   "content_delivery_turn_changed": {
     "message": "直接送信する前にターンが変わりました。"
@@ -1123,6 +1123,9 @@
   },
   "content_goal_error_nothing_to_open_with": {
     "message": "ヘルパーが開始メッセージを生成しませんでした。タスクをより具体的にして、もう一度お試しください。"
+  },
+  "content_goal_error_goal_helper_stop_unverified": {
+    "message": "ヘルパーは目標達成と判断していますが、確認されていません。フォローアップの返信は送信されていません。チャットを確認し、作業が残っていれば続けてください。"
   },
   "content_goal_error_loop_stop_refused": {
     "message": "ヘルパーがループの継続を書く代わりに停止を選び続けました。ループの指示を見直すか、別のヘルパーモデルを選択してください。"

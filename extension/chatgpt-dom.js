@@ -615,6 +615,21 @@ var CLF_DOM = (() => {
     if (!turn || !stamp?.startsWith(`${turn}:`)) return null;
     try { return decodeURIComponent(stamp.slice(turn.length + 1)) || null; } catch { return null; }
   }
+  /**
+   * Whether the page shows exactly one exchange, the chat's first, running without its question
+   * (fiber.js `data-clf-fiber-first`), and no user message anywhere. The stamp counts only under
+   * the exchange's current turn stamp, like every other MAIN stamp; a stale one is no evidence.
+   */
+  function firstQuestionPending() {
+    return safe(() => {
+      const all = turns();
+      if (all.length !== 1 || all[0].role !== 'assistant' || messages().some(message => message.role === 'user')) return false;
+      const section = all[0].node;
+      if (!section?.matches?.(SHELL_TURN)) return false;
+      const turn = section.getAttribute('data-clf-fiber-turn'), stamp = section.getAttribute('data-clf-fiber-first');
+      return !!turn && stamp === turn;
+    }, false);
+  }
   function turns() {
     return safe(() => {
       const out = [];
@@ -629,13 +644,17 @@ var CLF_DOM = (() => {
         if (node.matches?.(SHELL_TURN)) {
           const users = [...node.querySelectorAll('[data-content-search-unit-key$=":user"]')].filter(slot => slot.closest('[data-turn-key]') === node);
           const answered = node.querySelector('[data-chatgpt-agent-turn-start], [data-content-search-unit-key$=":assistant"]');
-          // Two user slots in one exchange are ambiguous and stay unread. A missing one is not: ChatGPT
-          // unmounts the question while its answer stays (#900), and skipping the whole exchange then
-          // hid that answer's final, so its turn never ended (#910). The answer keeps the exchange's
-          // own key; nothing here is joined by text or position.
+          // Two slots with the same key in one exchange are ambiguous and stay unread. Slots with
+          // their own keys are not: in a chat's later turns ChatGPT keeps a message sent into the
+          // running answer in the question's exchange, as its own slot (#1662). Skipping such an
+          // exchange hid the fresh turn's answer, and that turn never ended. A missing slot is not
+          // ambiguous either: ChatGPT unmounts the question while its answer stays (#900), and
+          // skipping the whole exchange then hid that answer's final, so its turn never ended (#910).
+          // The answer keeps the exchange's own key; nothing here is joined by text or position.
+          const keys = users.map(slot => slot.getAttribute('data-content-search-unit-key'));
           const unrendered = users.length ? null : unrenderedUserIdOf(node);
-          if (users.length > 1 || !id || (!users.length && !answered && !unrendered)) continue;
-          if (users.length) out.push({ node: users[0], nodes: [users[0]], id, role: 'user' });
+          if (new Set(keys).size !== keys.length || !id || (!users.length && !answered && !unrendered)) continue;
+          if (users.length) for (const slot of users) out.push({ node: slot, nodes: [slot], id, role: 'user' });
           else if (unrendered) out.push({ node, nodes: [node], id, role: 'user', unrenderedUserId: unrendered });
           if (answered) out.push({ node, nodes: [node], id, role: 'assistant' });
           previous = null; continue;
@@ -2495,7 +2514,7 @@ var CLF_DOM = (() => {
     channel.port2.postMessage(null);
   }
 
-  async function send({ acceptanceTimeoutMs = 30000, stillCurrent = () => true, matchesUser = null, observeEvidence = null, clearAcceptedDraft = true, beforeSend = null, acceptUserReceipt = null, receiptTimeoutMs = null, mention = null, explain = null, sentRequest = null, whileGenerating = false } = {}) {
+  async function send({ acceptanceTimeoutMs = 30000, stillCurrent = () => true, stillCurrentAfterClick = null, matchesUser = null, observeEvidence = null, clearAcceptedDraft = true, beforeSend = null, acceptUserReceipt = null, receiptTimeoutMs = null, mention = null, explain = null, sentRequest = null, whileGenerating = false } = {}) {
     // Why a Send ended without acceptance, as one short code for the caller's diagnostics (#820).
     // It names the first refusal only and never changes what Send does.
     const refused = (why) => { try { explain?.(why); } catch { /* Diagnostics never change Send. */ } return false; };
@@ -2626,7 +2645,10 @@ var CLF_DOM = (() => {
         };
         const check = () => {
           if (done) return;
-          if (!stillCurrent() || (beforeConversation && conversationId() !== beforeConversation)) return finish(false, 'chat-changed');
+          // A caller's deadline may forbid the click without disowning a click already made: its
+          // receipt is evidence the caller still has to report (#1086 worker starts).
+          const owned = attempted && stillCurrentAfterClick ? stillCurrentAfterClick : stillCurrent;
+          if (!owned() || (beforeConversation && conversationId() !== beforeConversation)) return finish(false, 'chat-changed');
           if (attempted) {
             if (accepted()) finish(true);
             return;
@@ -2824,7 +2846,7 @@ var CLF_DOM = (() => {
     const route = /^#settings\/Plugins\/plugin_(asdk_app_[a-zA-Z0-9_-]+)$/.exec(location.hash) ||
       (!location.hash ? /^\/(?:settings\/plugins-settings|plugins)\/plugin_(asdk_app_[a-zA-Z0-9_-]+)$/.exec(location.pathname) : null);
     if (!snapshot || snapshot.appId !== route?.[1] || (expectedAppId ? snapshot.appId !== expectedAppId : !ownSnapshot(snapshot, connectorName)) ||
-        !Array.isArray(snapshot.tools) || (snapshot.tools.length < 1 && !externalPlugins) || snapshot.tools.length > (externalPlugins ? 257 : 16) || JSON.stringify(snapshot.tools).length > 300000 ||
+        !Array.isArray(snapshot.tools) || (snapshot.tools.length < 1 && !externalPlugins) || snapshot.tools.length > (externalPlugins ? 257 : 64) || JSON.stringify(snapshot.tools).length > 300000 ||
         snapshot.tools.some(tool => !tool || typeof tool.name !== 'string' || !/^[a-z][a-z0-9_]{0,79}$/.test(tool.name) || typeof tool.description !== 'string' || tool.inputSchema?.type !== 'object') ||
         new Set(snapshot.tools.map(tool => tool.name)).size !== snapshot.tools.length) return null;
     const buttons = [...document.querySelectorAll('button[data-clf-plugin-refresh]')].filter(button => button.getAttribute('data-clf-plugin-refresh') === snapshot.appId && button.getClientRects().length > 0);
@@ -3350,6 +3372,15 @@ var CLF_DOM = (() => {
   }
   async function selectModelSettings(model, effort, stillCurrent = () => true) {
     if (!model && !effort) return true;
+    // The page's own picker state, read without opening anything. A worker tab opens with its model
+    // in the address and ChatGPT applies it; opening the picker only to prove that left its closing
+    // animation unfinished in a hidden, throttled tab, its focus scope hid the composer, and every
+    // worker failed "after model selection" (#1086). The same account-evaluated proof as below.
+    if (!document.querySelector(PICKER)) {
+      const passive = await readPickerState();
+      const now = passive?.choices.find(choice => choice.bucket === passive.currentBucket);
+      if (now?.available && (!model || now.id === model || now.familyId === model) && (!effort || now.effort === effort)) return stillCurrent();
+    }
     const ui = modelPickerAccess(stillCurrent), original = await ui.open();
     if (!original) { await ui.close(); return false; }
     // Account-evaluated exact selection is already proof; visiting unrelated
@@ -3726,6 +3757,7 @@ var CLF_DOM = (() => {
     turns,
     presentationTurns,
     messages,
+    firstQuestionPending,
     messagesIn,
     sectionSignature,
     generating,

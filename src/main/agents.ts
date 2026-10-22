@@ -358,6 +358,7 @@ let spawnRequest: ((workers: WorkerSpawn[]) => void) | null = null;
 const listeners = new Set<() => void>();
 const endListeners = new Set<(reason: string, retired: RetiredChat[], runId: string) => void>();
 const retireListeners = new Set<(conversationIds: readonly string[]) => void>();
+const finishListeners = new Set<(conversationId: string) => void>();
 let persist: (() => void) | null = null;
 let persistNow: ((snapshot: SwarmSnapshot | null) => Promise<void>) | null = null;
 let criticalMutationRevision = 0;
@@ -614,6 +615,15 @@ export function onSwarmEnd(listener: (reason: string, retired: RetiredChat[], ru
 export function onWorkerChatsRetired(listener: (conversationIds: readonly string[]) => void): () => void {
   retireListeners.add(listener);
   return () => retireListeners.delete(listener);
+}
+
+/**
+ * A worker's chat whose worker just reported its task done (#1701). The worker only sleeps: its
+ * prime can still give it more work. Used to archive the chat early in ChatGPT.
+ */
+export function onWorkerFinished(listener: (conversationId: string) => void): () => void {
+  finishListeners.add(listener);
+  return () => finishListeners.delete(listener);
 }
 
 function announceRetired(conversationIds: readonly string[]): void {
@@ -3163,6 +3173,8 @@ function publishFinish(agent: Agent, info: AgentInfo, report: AgentMessage, dura
   recount(prime);
   logInfo(`multi-agent: ${agent.info.id} ${info.state === 'finished' ? 'finished for good' : 'is sleeping'}`);
   changed(durability);
+  const conversationId = agent.info.conversationId;
+  if (agent.info.role === 'worker' && conversationId) for (const listener of finishListeners) listener(conversationId);
 }
 
 /** Whether this exact run object still owns its agent map, active or parked. */
@@ -3317,7 +3329,7 @@ export function failAgent(
   id: string,
   reason: string,
   note?: string,
-  options: { revivable?: boolean } = {}, runId?: string
+  options: { revivable?: boolean; startTimedOut?: boolean } = {}, runId?: string
 ): FinishResult | null {
   const run = scopedRun(runId);
   const agent = run?.agents.get(id);
@@ -3340,6 +3352,9 @@ export function failAgent(
   // A revivable failure keeps whatever the prime said to it. If the worker comes back, those
   // messages are still the instructions it never acknowledged; throwing them away here and
   // then reviving the worker would silently drop them.
+  // A start that only ran out of time may yet turn out to have happened (#1086): keep what the
+  // prime had said to it for adoptLateWorker(), which is the only reader.
+  if (options.startTimedOut) startTimeouts.set(agent, { queue: agent.queue.slice(), failedAt: Date.now() });
   if (!agent.info.revivable) agent.queue = [];
   recount(agent);
 
@@ -3356,6 +3371,107 @@ export function failAgent(
   logWarn(`multi-agent: ${id} failed — ${reason}`);
   changed();
   return { info: { ...agent.info }, report: { ...report }, repeat: false };
+}
+
+// ------------------------------------------------------------- late starts
+
+/** How long after a start ran out of time its chat may still turn out to have started. */
+export const LATE_START_WINDOW_MS = 15 * 60_000;
+
+/**
+ * Workers failed only because their chat did not report back in time, with the inbox they had.
+ *
+ * In memory on purpose: a late start is minutes, not restarts, and after a restart the chat is
+ * treated as it always was. Keyed by the agent object, so a replacement that reuses the
+ * friendly id is never mistaken for the worker that timed out.
+ */
+const startTimeouts = new WeakMap<Agent, { queue: AgentMessage[]; failedAt: number }>();
+
+export type LateStart = { outcome: 'adopted'; runId: string } | { outcome: 'stray'; why: string };
+
+/**
+ * A worker the app gave up on for time, whose chat then proved it received its task (#1086).
+ *
+ * On a memory-starved Windows machine (2026-10-18) pages sent their task within the deadline,
+ * but their reports reached the app 20–90 s late: the app failed the worker and its chat went
+ * on working, tracked by nothing. Heartbeats would have been late too, so the app cannot know
+ * sooner; it can only accept the truth when it arrives. The worker rejoins its run when that
+ * is still the same worker, its run (live or parked) still exists and a slot is free; the
+ * prime is told to expect its result. Otherwise its chat is fenced like a retired worker, so
+ * its next tool call tells it to stop, and the prime is told why.
+ */
+export function adoptLateWorker(id: string, conversationId: string, runId: string): LateStart {
+  const family = allFamilies().find((owner) => answersTo(owner, runId)) ?? null;
+  const agent = family?.agents.get(id) ?? null;
+  // A retried ACK whose first answer was lost: that first one already adopted it.
+  if (family && 'runId' in family && agent?.info.role === 'worker' && agent.info.conversationId === conversationId &&
+      !isOver(agent.info.state)) return { outcome: 'adopted', runId: family.runId };
+  const timedOut = agent ? startTimeouts.get(agent) : undefined;
+  const max = getConfig().multiAgent.maxWorkers;
+  const occupied = family ? [...family.agents.values()].filter((entry) =>
+    entry.info.role === 'worker' && occupiesSlot(entry.info.state) && !unpublishedAgents.has(entry)).length : 0;
+  const taken = boundAgent(conversationId) !== null || dormantAgentForConversation(conversationId) !== null ||
+    retiredWorkers.has(conversationId);
+  const why = !family ? 'its run has ended'
+    : !agent || agent.info.role !== 'worker' || !timedOut || agent.info.state !== 'failed' || agent.info.conversationId !== null
+      ? 'that worker has since been replaced or ended'
+      : Date.now() - timedOut.failedAt > LATE_START_WINDOW_MS ? 'it started more than fifteen minutes after it was reported as not started'
+        : family.transfer ? 'its main chat is being moved to a new chat'
+          : taken ? 'its chat is already in use'
+            : occupied >= max ? `all ${max} worker slots are in use`
+              : null;
+  // A chat that already belongs to somebody is theirs to keep; only a free chat is fenced.
+  if (why) return strayLateWorker(family, id, conversationId, why, !taken);
+  const run = 'runId' in family! ? family : reactivateDormantRun(family!);
+  if (!run) return strayLateWorker(family, id, conversationId, 'its run could not be resumed', true);
+  if (!bindWorkerConversation(agent!, conversationId)) {
+    if (run !== family) parkRun(run, 'a late-started worker could not rejoin it');
+    return strayLateWorker(family, id, conversationId, 'its chat could not be bound to it', false);
+  }
+  const worker = agent!;
+  const now = Date.now();
+  worker.info.state = 'active';
+  worker.info.activatedAt = now;
+  worker.info.finishedAt = null;
+  worker.info.detachedAt = null;
+  worker.info.lastSeenAt = now;
+  worker.info.result = null;
+  worker.info.revivable = false;
+  worker.queue = [...timedOut!.queue, ...worker.queue];
+  startTimeouts.delete(worker);
+  recount(worker);
+  bindAgentWorkspace(id, conversationId, run.runId);
+  const prime = primeAgent(run);
+  prime.queue.push(newMessage(id, PRIME_ID,
+    `[${id} started late] It was reported as not started, but its chat received its task after all and is working ` +
+      'on it now. Ignore that earlier report: do not redo its work or start a replacement for it, and expect its result normally.'));
+  recount(prime);
+  logInfo(`multi-agent: ${id} started late in conversation ${conversationId} — rejoined run ${run.runId}`);
+  changed();
+  return { outcome: 'adopted', runId: run.runId };
+}
+
+function strayLateWorker(family: Family | null, id: string, conversationId: string, why: string, fence: boolean): LateStart {
+  if (fence) {
+    retiredWorkers.set(conversationId, {
+      id,
+      conversationId,
+      reason: `its chat received its task after the app had given up on it, and ${why}`,
+      retiredAt: Date.now()
+    });
+    retiredPersist?.();
+  }
+  const prime = family?.agents.get(PRIME_ID);
+  if (prime) {
+    prime.queue.push(newMessage(id, PRIME_ID,
+      `[${id} started late, outside the run] It was reported as not started, but its chat received its task after all. ` +
+        `It could not rejoin because ${why}, so that chat's tool calls are refused and it will not report. Treat its part ` +
+        'of the work as not done.'));
+    recount(prime);
+  }
+  logWarn(`multi-agent: ${id}'s chat ${conversationId} started after the app gave up on it — not rejoined: ${why}`);
+  changed();
+  return { outcome: 'stray', why };
 }
 
 // -------------------------------------------------------------- sleep / wake
@@ -5634,4 +5750,5 @@ export function resetAgentsForTests(): void {
   listeners.clear();
   endListeners.clear();
   retireListeners.clear();
+  finishListeners.clear();
 }

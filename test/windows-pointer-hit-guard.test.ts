@@ -217,7 +217,7 @@ Write-Output 'OCCLUSION_FAILS_CLOSED_BEFORE_POINTER_DOWN'
   });
   it('preserves the native uncertainty code through the standalone UI action transport catch', () => {
     expect(HELPER_SCRIPT).toContain("'act_ui' {");
-    const loopStart = HELPER_SCRIPT.indexOf('while (($line = [Console]::In.ReadLine()) -ne $null) {');
+    const loopStart = HELPER_SCRIPT.indexOf("$script:FocusNotes = New-Object 'System.Collections.Generic.List[string]'");
     expect(loopStart).toBeGreaterThan(0);
     const protocolLoop = HELPER_SCRIPT.slice(loopStart);
     const source = String.raw`

@@ -38,6 +38,9 @@
   "content_bootstrap_composer_replaced": {
     "message": "ChatGPT đã thay thế ô soạn thảo khi chèn nội dung khởi tạo"
   },
+  "content_bootstrap_composer_never_ready": {
+    "message": "ChatGPT không hiển thị ô soạn thảo khả dụng để bắt đầu"
+  },
   "content_bootstrap_composer_unavailable": {
     "message": "ChatGPT không hiển thị lại ô soạn thảo khả dụng sau khi chọn mô hình"
   },
@@ -90,7 +93,7 @@
     "message": "Cuộc trò chuyện bị chặn"
   },
   "content_chat_blocked_tip": {
-    "message": "Cuộc trò chuyện này bị chặn trong ứng dụng Chat On Steroids: các lệnh gọi công cụ bị từ chối, còn Goal, Loop và tự động thu gọn đều tắt. Để bỏ chặn, mở tab Chat của ứng dụng, di chuột lên cuộc trò chuyện này trong danh sách phiên rồi nhấn biểu tượng chặn."
+    "message": "Cuộc trò chuyện này bị chặn trong ứng dụng Chat On Steroids: các lệnh gọi công cụ bị từ chối, còn Goal, Loop và tự động thu gọn đều tắt. Để bỏ chặn, mở menu ⋯ của cuộc trò chuyện này ở thanh bên của ứng dụng và chọn “Bỏ chặn”."
   },
   "content_chat_still_opening": {
     "message": "cuộc trò chuyện này vẫn đang mở — hãy thử lại"
@@ -337,9 +340,6 @@
   },
   "content_delivery_text_not_accepted": {
     "message": "ChatGPT không chấp nhận văn bản$1"
-  },
-  "content_delivery_rotation_not_stopped": {
-    "message": "ChatGPT không hiển thị Gửi trong câu trả lời đang chạy, và việc dừng để tự động tiếp tục chưa hoàn tất."
   },
   "content_delivery_turn_changed": {
     "message": "Lượt đã thay đổi trước khi gửi trực tiếp."
@@ -1123,6 +1123,9 @@
   },
   "content_goal_error_nothing_to_open_with": {
     "message": "Trợ lý không tạo tin nhắn mở đầu. Hãy làm tác vụ cụ thể hơn rồi thử lại."
+  },
+  "content_goal_error_goal_helper_stop_unverified": {
+    "message": "Trợ lý cho biết mục tiêu đã hoàn thành nhưng điều đó chưa được kiểm tra. Chưa gửi phản hồi tiếp theo. Hãy kiểm tra cuộc trò chuyện và tiếp tục nếu còn việc."
   },
   "content_goal_error_loop_stop_refused": {
     "message": "Trợ lý liên tục chọn dừng thay vì viết nội dung tiếp tục cho Loop. Hãy xem lại chỉ dẫn Loop hoặc chọn mô hình trợ lý khác."
