@@ -551,15 +551,22 @@ public static class Clf {
     return GetGUIThreadInfo(receiverThread, ref gui) && gui.menuOwner != IntPtr.Zero && OwnedBy(gui.menuOwner, targetRoot);
   }
 
-  // WindowFromPoint resolves the top-level receiver, but mouse capture on the foreground
-  // thread overrides it, so both must belong to the target.
+  // WindowFromPoint must belong to the target; foreground capture must too, except
+  // a transient popup's same-process activation owner (or its child) may hold capture.
   public static bool HitTargetsWindow(long handle, int x, int y) {
     IntPtr target = new IntPtr(handle);
     POINT p = new POINT(); p.X = x; p.Y = y;
     if (!ReceiverIsTarget(WindowFromPoint(p), target)) return false;
     GUITHREADINFO gui = new GUITHREADINFO();
     gui.cbSize = (uint)Marshal.SizeOf(typeof(GUITHREADINFO));
-    return GetGUIThreadInfo(0, ref gui) && (gui.capture == IntPtr.Zero || ReceiverIsTarget(gui.capture, target));
+    if (!GetGUIThreadInfo(0, ref gui)) return false;
+    if (gui.capture == IntPtr.Zero || ReceiverIsTarget(gui.capture, target)) return true;
+    IntPtr targetRoot = GetAncestor(target, 2), inputRoot = InputRoot(targetRoot);
+    uint captureProcess, targetProcess;
+    GetWindowThreadProcessId(gui.capture, out captureProcess);
+    GetWindowThreadProcessId(target, out targetProcess);
+    return IsTransientPopup(targetRoot) && inputRoot != IntPtr.Zero && inputRoot != targetRoot &&
+      GetAncestor(gui.capture, 2) == inputRoot && captureProcess != 0 && captureProcess == targetProcess;
   }
 
   // Activation and keys for a no-activate popup reach its input root. Returns that root when it

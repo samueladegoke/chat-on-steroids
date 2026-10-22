@@ -141,6 +141,15 @@ Expect-Hit 100 0 $false 'NULL_HIT_ACCEPTED'
 [Clf]::Capture = 306; Expect-Hit 100 100 $true 'SAME_ROOT_FOREIGN_CHILD_CAPTURE_REJECTED'
 [Clf]::Capture = 110; Expect-Hit 100 100 $true 'TARGET_CAPTURE_REJECTED'
 [Clf]::Capture = 205; Expect-Hit 100 205 $true 'DROPPED_LIST_CAPTURE_REJECTED'
+# A popup frame can be clicked while its activation owner (or a child) holds capture.
+[Clf]::Capture = 100; Expect-Hit 201 201 $true 'POPUP_OWNER_CAPTURE_REJECTED'
+[Clf]::Capture = 110; Expect-Hit 201 201 $true 'POPUP_OWNER_CHILD_CAPTURE_REJECTED'
+[Clf]::Capture = 100; Expect-Hit 203 203 $true 'MENU_OWNER_CAPTURE_REJECTED'
+[Clf]::Capture = 120; Expect-Hit 201 201 $false 'POPUP_SIBLING_CAPTURE_ACCEPTED'
+[Clf]::Capture = 301; Expect-Hit 201 201 $false 'POPUP_FOREIGN_CAPTURE_ACCEPTED'
+# Matching the input root is insufficient when the capture window is foreign-process.
+[Clf]::Capture = 306; Expect-Hit 201 201 $false 'POPUP_FOREIGN_OWNER_CHILD_CAPTURE_ACCEPTED'
+[Clf]::Capture = 120; Expect-Hit 100 100 $false 'NONPOPUP_SIBLING_CAPTURE_ACCEPTED'
 [Clf]::Capture = 0
 if ($failures.Count) { throw ('HIT_MATRIX_FAILED: ' + ($failures -join ',')) }
 Write-Output 'OWNED_POPUP_ALLOWED_FOREIGN_OVERLAY_DENIED'
