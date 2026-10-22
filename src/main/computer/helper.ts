@@ -921,6 +921,15 @@ function Get-UiActions($element, $current) {
   return @($actions.ToArray())
 }
 
+function Invoke-UiMutation([string]$what, [scriptblock]$mutation) {
+  # A provider may apply the change before throwing, so completion is ambiguous.
+  try { & $mutation } catch {
+    $message = $_.Exception.GetBaseException().Message
+    if ($message -like 'INPUT_EFFECT_UNCONFIRMED:*') { throw $message }
+    throw "INPUT_EFFECT_UNCONFIRMED: UI Automation $what may have applied before failing: $message"
+  }
+}
+
 function Invoke-UiAction($element, [string]$action, [int64]$id, $owner, $targetApp, $ownerApp) {
   Write-UiaStage ("uia.action." + $action)
   # Explicit semantic actions never degrade to a click at guessed coordinates.
@@ -937,7 +946,7 @@ function Invoke-UiAction($element, [string]$action, [int64]$id, $owner, $targetA
   if ($action -eq 'focus') {
     if (-not $element.Current.IsKeyboardFocusable) { throw 'UI_ACTION_UNSUPPORTED: element is not keyboard focusable' }
     Assert-InputOwner $id $owner $targetApp $ownerApp
-    $element.SetFocus()
+    Invoke-UiMutation 'focus' { $element.SetFocus() }
     return
   }
   $pattern = $null
@@ -947,12 +956,12 @@ function Invoke-UiAction($element, [string]$action, [int64]$id, $owner, $targetA
   # Acquiring a pattern may invoke a hostile provider. Check after all reads.
   Assert-InputOwner $id $owner $targetApp $ownerApp
   switch ($action) {
-    'invoke' { ([System.Windows.Automation.InvokePattern]$pattern).Invoke() }
-    'toggle' { ([System.Windows.Automation.TogglePattern]$pattern).Toggle() }
-    'select' { ([System.Windows.Automation.SelectionItemPattern]$pattern).Select() }
-    'expand' { ([System.Windows.Automation.ExpandCollapsePattern]$pattern).Expand() }
-    'collapse' { ([System.Windows.Automation.ExpandCollapsePattern]$pattern).Collapse() }
-    'scroll_into_view' { ([System.Windows.Automation.ScrollItemPattern]$pattern).ScrollIntoView() }
+    'invoke' { Invoke-UiMutation $action { ([System.Windows.Automation.InvokePattern]$pattern).Invoke() } }
+    'toggle' { Invoke-UiMutation $action { ([System.Windows.Automation.TogglePattern]$pattern).Toggle() } }
+    'select' { Invoke-UiMutation $action { ([System.Windows.Automation.SelectionItemPattern]$pattern).Select() } }
+    'expand' { Invoke-UiMutation $action { ([System.Windows.Automation.ExpandCollapsePattern]$pattern).Expand() } }
+    'collapse' { Invoke-UiMutation $action { ([System.Windows.Automation.ExpandCollapsePattern]$pattern).Collapse() } }
+    'scroll_into_view' { Invoke-UiMutation $action { ([System.Windows.Automation.ScrollItemPattern]$pattern).ScrollIntoView() } }
     { $_ -in @('scroll_up','scroll_down','scroll_left','scroll_right') } {
       $scroll = [System.Windows.Automation.ScrollPattern]$pattern
       $horizontal = [System.Windows.Automation.ScrollAmount]::NoAmount
@@ -965,7 +974,7 @@ function Invoke-UiAction($element, [string]$action, [int64]$id, $owner, $targetA
         $horizontal = if ($action -eq 'scroll_left') { [System.Windows.Automation.ScrollAmount]::LargeDecrement } else { [System.Windows.Automation.ScrollAmount]::LargeIncrement }
       }
       Assert-InputOwner $id $owner $targetApp $ownerApp
-      $scroll.Scroll($horizontal, $vertical)
+      Invoke-UiMutation $action { $scroll.Scroll($horizontal, $vertical) }
     }
   }
 }
@@ -999,7 +1008,7 @@ function Act-UiElement($request) {
     $value = [System.Windows.Automation.ValuePattern]$pattern
     if ($value.Current.IsReadOnly) { throw "UI_VALUE_READONLY: the referenced element is read-only" }
     Assert-InputOwner $id $request.ownerWindow $request.targetApp $request.ownerApp
-    $value.SetValue([string]$request.value)
+    Invoke-UiMutation 'set_value' { $value.SetValue([string]$request.value) }
     $route = 'uia'
   } elseif ($action -eq 'click') {
     $button = if ($request.button) { [string]$request.button } else { 'left' }
@@ -1010,17 +1019,17 @@ function Act-UiElement($request) {
     if ($semanticClick -and $element.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$pattern)) {
       Write-UiaStage 'uia.action.invoke'
       Assert-InputOwner $id $request.ownerWindow $request.targetApp $request.ownerApp
-      ([System.Windows.Automation.InvokePattern]$pattern).Invoke()
+      Invoke-UiMutation 'invoke' { ([System.Windows.Automation.InvokePattern]$pattern).Invoke() }
       $route = 'uia'
     } elseif ($semanticClick -and $element.TryGetCurrentPattern([System.Windows.Automation.TogglePattern]::Pattern, [ref]$pattern)) {
       Write-UiaStage 'uia.action.toggle'
       Assert-InputOwner $id $request.ownerWindow $request.targetApp $request.ownerApp
-      ([System.Windows.Automation.TogglePattern]$pattern).Toggle()
+      Invoke-UiMutation 'toggle' { ([System.Windows.Automation.TogglePattern]$pattern).Toggle() }
       $route = 'uia'
     } elseif ($semanticClick -and $element.TryGetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern, [ref]$pattern)) {
       Write-UiaStage 'uia.action.select'
       Assert-InputOwner $id $request.ownerWindow $request.targetApp $request.ownerApp
-      ([System.Windows.Automation.SelectionItemPattern]$pattern).Select()
+      Invoke-UiMutation 'select' { ([System.Windows.Automation.SelectionItemPattern]$pattern).Select() }
       $route = 'uia'
     } else {
       # A semantic control without InvokePattern has to fall back to physical input. Make
