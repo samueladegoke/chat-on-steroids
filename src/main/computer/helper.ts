@@ -1545,25 +1545,36 @@ function Handle-Request($request) {
     'act' {
       # Resolve every key before focus, pointer or text effects. A typo in a later chord
       # must not leave the earlier half of a deterministic-invalid batch applied.
-      $keyTarget = if ($request.targetWindow) { [int64]$request.targetWindow } else { [Clf]::ForegroundId() }
-      foreach ($action in $request.actions) {
-        if ($action.type -eq 'focus') { $keyTarget = [int64]$action.window }
-        if ($action.type -eq 'keypress') {
-          try { $resolved = [CosWindowsKeys]::Resolve([string[]]$action.keys, $keyTarget) }
-          catch { throw $_.Exception.GetBaseException().Message }
-          $action | Add-Member -NotePropertyName resolvedKeys -NotePropertyValue $resolved -Force
+      try {
+        $keyTarget = if ($request.targetWindow) { [int64]$request.targetWindow } else { [Clf]::ForegroundId() }
+        foreach ($action in $request.actions) {
+          if ($action.type -eq 'focus') { $keyTarget = [int64]$action.window }
+          if ($action.type -eq 'keypress') {
+            try { $resolved = [CosWindowsKeys]::Resolve([string[]]$action.keys, $keyTarget) }
+            catch { throw $_.Exception.GetBaseException().Message }
+            $action | Add-Member -NotePropertyName resolvedKeys -NotePropertyValue $resolved -Force
+          }
+          if ($action.type -eq 'type' -and [string]$action.text -match '[\r\n]') {
+            throw 'MULTILINE_REQUIRES_PASTE: literal multiline text requires the clipboard paste action'
+          }
+          if ($action.type -eq 'ui_action' -and [string]$action.action -notin $script:UiActionNames) {
+            throw "BAD_ACTION: unsupported UI element action $($action.action)"
+          }
+          if ($action.type -in @('click','click_ui')) { $null = Get-RequestedClickCount $action }
+          if ($action.type -eq 'drag' -and $null -ne $action.durationMs -and
+              ([double]$action.durationMs -lt 50 -or [double]$action.durationMs -gt 2000 -or [double]$action.durationMs -ne [int]$action.durationMs)) {
+            throw 'BAD_ACTION: drag duration must be an integer between 50 and 2000 milliseconds'
+          }
         }
-        if ($action.type -eq 'type' -and [string]$action.text -match '[\r\n]') {
-          throw 'MULTILINE_REQUIRES_PASTE: literal multiline text requires the clipboard paste action'
+      } catch {
+        # Deterministic validation has no effect yet: return an exact zero receipt, not an unconfirmed outcome.
+        $message = $_.Exception.GetBaseException().Message
+        $code = 'HELPER_ERROR'
+        if ($message -match '^([A-Z0-9_]+):\s*(.+)') {
+          $code = $Matches[1]
+          $message = $Matches[2]
         }
-        if ($action.type -eq 'ui_action' -and [string]$action.action -notin $script:UiActionNames) {
-          throw "BAD_ACTION: unsupported UI element action $($action.action)"
-        }
-        if ($action.type -in @('click','click_ui')) { $null = Get-RequestedClickCount $action }
-        if ($action.type -eq 'drag' -and $null -ne $action.durationMs -and
-            ([double]$action.durationMs -lt 50 -or [double]$action.durationMs -gt 2000 -or [double]$action.durationMs -ne [int]$action.durationMs)) {
-          throw 'BAD_ACTION: drag duration must be an integer between 50 and 2000 milliseconds'
-        }
+        return @{ ok = $false; error_code = $code; message = $message; completed_count = 0; failed_index = 0; routes = @(); launches = @() }
       }
       $routes = @()
       $launches = @()

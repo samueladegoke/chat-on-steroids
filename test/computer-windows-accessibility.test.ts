@@ -170,13 +170,14 @@ try {
     if ($result.ok -ne $false -or $result.error_code -ne 'WINDOW_APP_MISMATCH' -or $result.completed_count -ne 0) { throw 'wrong native application identity permitted input' }
     if (((Read-State) -join '|') -ne ($state -join '|')) { throw 'application identity rejection changed fixture' }
   }
-  try {
-    $null = Handle-Request @{ op = 'act'; actions = @(
-      @{ type = 'ui_action'; window = $id; snapshotId = $snapshot.snapshotId; runtimeKey = $rows.invoke.runtimeKey; action = 'invoke' },
-      @{ type = 'ui_action'; window = $id; snapshotId = $snapshot.snapshotId; runtimeKey = $rows.invoke.runtimeKey; action = 'invented' }
-    ) }
-    throw 'unknown semantic action accepted'
-  } catch { if ($_.Exception.Message -notmatch 'BAD_ACTION') { throw } }
+  $result = Handle-Request @{ op = 'act'; actions = @(
+    @{ type = 'ui_action'; window = $id; snapshotId = $snapshot.snapshotId; runtimeKey = $rows.invoke.runtimeKey; action = 'invoke' },
+    @{ type = 'ui_action'; window = $id; snapshotId = $snapshot.snapshotId; runtimeKey = $rows.invoke.runtimeKey; action = 'invented' }
+  ) }
+  # Rejected before any action runs, so the helper reports an exact zero receipt.
+  if ($result.ok -ne $false -or $result.error_code -ne 'BAD_ACTION' -or $result.completed_count -ne 0 -or $result.failed_index -ne 0) {
+    throw ('unknown semantic action accepted: ' + ($result | ConvertTo-Json -Compress))
+  }
   if (((Read-State) -join '|') -ne ($state -join '|')) { throw 'invalid later action performed earlier effects' }
   $result = Act 'second' 'scroll_into_view'; if (-not $result.ok -or $result.routes[0] -ne 'uia') { throw 'scroll into view failed' }
   $result = Act 'expand' 'collapse'; if (-not $result.ok) { throw 'collapse failed' }

@@ -86,14 +86,13 @@ public static class OwnedConsoleTransport {
         const child = helper;
         await Promise.race([
           new Promise(resolve => child.once('exit', resolve)),
-          new Promise(resolve => setTimeout(resolve, 1500))
+          new Promise(resolve => setTimeout(resolve, 1000))
         ]);
         if (child.exitCode === null) child.kill();
       }
-      // The owned fixture exits by itself even if a failed assertion interrupted
-      // the transport test. No image-name-wide cleanup or installed app mutation.
-      await new Promise(resolve => setTimeout(resolve, 3200));
-      await rm(dir, { recursive: true, force: true });
+      // Retry removal while the owned fixture exits by itself, even after a failed
+      // assertion. No image-name-wide cleanup or installed app mutation.
+      await rm(dir, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
     }
   }, 50_000);
 });

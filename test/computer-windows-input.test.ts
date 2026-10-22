@@ -266,12 +266,25 @@ $result = Handle-Request $request
 if ($result.ok -ne $false -or $result.error_code -ne 'STALE_FRAME' -or $script:focuses.Count -ne 0 -or [Clf]::TestCalls -ne 0) {
   throw 'stale first frame focused or injected input before rejection'
 }
-[Clf]::TestReset(0)
-$request = '{"op":"act","frame":{"id":1},"actions":[{"type":"move","x":1,"y":1},{"type":"keypress","keys":["not-a-key"]}]}' | ConvertFrom-Json
-try { $null = Handle-Request $request; throw 'invalid key unexpectedly accepted' } catch {
-  if ($_.Exception.Message -notmatch 'BAD_KEY') { throw }
+# Preflight failures return a definite zero-effect receipt, even for a later action.
+foreach ($case in @(
+  @{ code='BAD_KEY'; json='{"op":"act","frame":{"id":1},"actions":[{"type":"move","x":1,"y":1},{"type":"keypress","keys":["not-a-key"]}]}' },
+  @{ code='MULTILINE_REQUIRES_PASTE'; json='{"op":"act","frame":{"id":1},"actions":[{"type":"move","x":1,"y":1},{"type":"type","text":"line one\nline two"}]}' },
+  @{ code='BAD_ACTION'; json='{"op":"act","frame":{"id":1},"actions":[{"type":"move","x":1,"y":1},{"type":"drag","xs":[10,20],"ys":[10,20],"durationMs":2001}]}' }
+)) {
+  [Clf]::TestReset(0)
+  $request = $case.json | ConvertFrom-Json
+  $result = Handle-Request $request
+  if ($result -isnot [hashtable]) { throw ('PREFLIGHT_RECEIPT_MISSING: ' + $case.code) }
+  if ($result.ok -ne $false -or $result.error_code -ne $case.code -or
+      -not $result.ContainsKey('completed_count') -or $null -eq $result.completed_count -or $result.completed_count -ne 0 -or
+      -not $result.ContainsKey('failed_index') -or $null -eq $result.failed_index -or $result.failed_index -ne 0 -or
+      -not $result.ContainsKey('routes') -or $null -eq $result.routes -or @($result.routes).Count -ne 0 -or
+      -not $result.ContainsKey('launches') -or $null -eq $result.launches -or @($result.launches).Count -ne 0 -or
+      [Clf]::TestCalls -ne 0) {
+    throw ('PREFLIGHT_FAILURE_NOT_REPORTED_AS_ZERO_EFFECT: ' + $case.code + ': ' + ($result | ConvertTo-Json -Compress))
+  }
 }
-if ([Clf]::TestCalls -ne 0) { throw 'invalid key applied earlier actions' }
 $aliases = [CosWindowsKeys]::ResolveForLayout([string[]]@('Control_L','Control_R','Prior','KP_5'), [IntPtr]::Zero, [Func[char,IntPtr,int16]]{ param($char, $layout) return 0 })
 if (($aliases -join ',') -ne '162,65699,65569,101') { throw ('keysym normalization failed: ' + ($aliases -join ',')) }
 function Get-WindowRow([int64]$id) { return @{ id = $id; title = 'Owned fixture'; app = 'fixture.exe'; processId = 101; processPath = 'C:\Apps\fixture.exe'; processStartTime = '133000000000000101' } }
