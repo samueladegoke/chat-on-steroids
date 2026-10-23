@@ -75,6 +75,7 @@ public static class Clf {
   [DllImport("user32.dll")] static extern bool GetCursorPos(out POINT p);
   [DllImport("user32.dll")] static extern IntPtr WindowFromPoint(POINT p);
   [DllImport("user32.dll")] static extern bool EnumWindows(EnumProc cb, IntPtr lp);
+  [DllImport("user32.dll")] static extern bool EnumChildWindows(IntPtr root, EnumProc cb, IntPtr lp);
   [DllImport("user32.dll", CharSet = CharSet.Unicode)]
   static extern int GetWindowTextW(IntPtr h, StringBuilder s, int max);
   [DllImport("user32.dll")] static extern int GetWindowTextLengthW(IntPtr h);
@@ -519,10 +520,23 @@ public static class Clf {
     return (exStyle & 0x88) != 0 && (style & unchecked((int)0x80000000)) != 0 && (style & 0x00C00000) != 0x00C00000;
   }
 
+  static bool EmbeddedProcess(IntPtr root, uint process) {
+    if (root == IntPtr.Zero || process == 0) return false;
+    bool found = false;
+    int remaining = 1024;
+    EnumChildWindows(root, delegate(IntPtr child, IntPtr lp) {
+      uint childProcess;
+      GetWindowThreadProcessId(child, out childProcess);
+      found = childProcess == process;
+      return !found && --remaining > 0;
+    }, IntPtr.Zero);
+    return found;
+  }
+
   // Same-root children may receive input across processes (Store-app CoreWindow, WebView2).
-  // Under a different root, only the target's own-process transient popups qualify: owned by
-  // the target, or ownerless on its GUI thread. Never a foreign overlay, an activatable dialog,
-  // or the owner/sibling of a popup target.
+  // Under a different root, transient popups from the target's own or embedded processes
+  // qualify: owned by the target, or ownerless on its GUI thread. Never a foreign overlay,
+  // an activatable dialog, or the owner/sibling of a popup target.
   static bool ReceiverIsTarget(IntPtr receiver, IntPtr target) {
     if (receiver == IntPtr.Zero) return false;
     IntPtr receiverRoot = GetAncestor(receiver, 2), targetRoot = GetAncestor(target, 2);
@@ -536,11 +550,12 @@ public static class Clf {
     if (actualProcess == 0 || rootProcess == 0 || targetOwnProcess == 0 ||
         rootProcess != targetOwnProcess) return false;
     if (receiverRoot == targetRoot) return true;
-    if (actualProcess != targetOwnProcess) return false;
+    if (actualProcess != targetOwnProcess && !EmbeddedProcess(targetRoot, actualProcess)) return false;
     uint receiverProcess, targetProcess;
     uint receiverThread = GetWindowThreadProcessId(receiverRoot, out receiverProcess);
     uint targetThread = GetWindowThreadProcessId(targetRoot, out targetProcess);
-    if (receiverProcess == 0 || receiverProcess != targetProcess || !IsTransientPopup(receiverRoot) || InputRoot(targetRoot) != targetRoot) return false;
+    if (receiverProcess == 0 || (receiverProcess != targetProcess && !EmbeddedProcess(targetRoot, receiverProcess)) ||
+        !IsTransientPopup(receiverRoot) || InputRoot(targetRoot) != targetRoot) return false;
     if (OwnedBy(receiverRoot, targetRoot)) return true;
     if (GetWindow(receiverRoot, 4) != IntPtr.Zero || receiverThread != targetThread) return false;
     if (!IsMenu(receiverRoot)) return true;

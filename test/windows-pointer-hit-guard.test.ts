@@ -57,11 +57,22 @@ public static class Clf {
     Add(303, 303, 100, DIALOG, 0, "#32770", 10, 1);             // A's activatable owned dialog
     Add(304, 304, 0, POPUP, 0x189, "#32768", 10, 2);            // ownerless menu of another thread
     Add(305, 305, 0, POPUP, 0x189, "#32768", 30, 3);            // another app's ownerless menu
-    Add(306, 100, 0, CHILD, 0, "ForeignChild", 30, 3);          // foreign embedded child under A's GA_ROOT
+    Add(306, 100, 0, CHILD, 0, "ForeignChild", 50, 5);          // foreign embedded child under A's GA_ROOT
+    Add(308, 308, 100, POPUP, NOACTIVATE, "Xaml_WindowedPopupClass", 50, 5); // embedded app's owned popup
+    Add(309, 309, 0, POPUP, NOACTIVATE, "Xaml_WindowedPopupClass", 50, 5);   // embedded app's unowned popup
+    Add(310, 310, 100, DIALOG, 0, "#32770", 50, 5);             // embedded app's activatable owned dialog
     Add(400, 400, 0, FRAME, 0, "HostFrame", 40, 4);              // unrelated new top-level host
     Add(130, 400, 0, CHILD, 0, "AppWindow", 10, 1);             // A target reparented into foreign host
     Add(401, 400, 0, CHILD, 0, "HostChild", 40, 4);             // foreign host's own receiver
     Add(402, 301, 0, CHILD, 0, "OverlayChild", 30, 3);          // foreign child under a DIFFERENT root
+  }
+  delegate bool EnumProc(IntPtr h, IntPtr lp);
+  static bool EnumChildWindows(IntPtr root, EnumProc callback, IntPtr lp) {
+    foreach (var row in W) {
+      if (row.Key != root.ToInt64() && row.Value[0] == root.ToInt64() &&
+          !callback(new IntPtr(row.Key), lp)) return false;
+    }
+    return true;
   }
   static IntPtr WindowFromPoint(POINT p) { return new IntPtr(p.X); }
   static bool IsWindow(IntPtr h) { return W.ContainsKey(h.ToInt64()); }
@@ -127,6 +138,9 @@ Expect-Hit 100 304 $false 'OTHER_THREAD_MENU_ACCEPTED'
 Expect-Hit 100 305 $false 'FOREIGN_MENU_ACCEPTED'
 # Store apps embed their cross-process CoreWindow inside an ApplicationFrameWindow.
 Expect-Hit 100 306 $true 'SAME_ROOT_FOREIGN_CHILD_REJECTED'
+Expect-Hit 100 308 $true 'EMBEDDED_PROCESS_OWNED_POPUP_REJECTED'
+Expect-Hit 100 309 $false 'EMBEDDED_PROCESS_UNOWNED_POPUP_ACCEPTED'
+Expect-Hit 100 310 $false 'EMBEDDED_PROCESS_ACTIVATABLE_DIALOG_ACCEPTED'
 Expect-Hit 100 402 $false 'DIFFERENT_ROOT_FOREIGN_CHILD_ACCEPTED'
 Expect-Hit 130 400 $false 'REPARENTED_TARGET_FOREIGN_ROOT_ACCEPTED'
 Expect-Hit 130 401 $false 'REPARENTED_TARGET_FOREIGN_CHILD_ACCEPTED'
