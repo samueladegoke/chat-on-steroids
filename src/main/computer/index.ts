@@ -2122,18 +2122,17 @@ async function actLocked(
         // from immediately crashing a fresh helper on the same proven provider identity.
         rememberWindowsUiaCrashIdentity(opts.window, requestedWindowsIdentity, uiaCrash);
       }
-      // Missing native acknowledgement is not evidence that no action executed.
-      // An exact partial receipt may be counted; a transport failure is ambiguous.
+      // Only Windows guarantees exact failure receipts; macOS preflight errors can omit counts.
       const exactPartial = err instanceof ComputerError && err.completedCount !== null && err.failedIndex !== null;
-      if (!exactPartial) {
+      if (process.platform === 'win32' && !exactPartial) {
         const message = err instanceof Error ? err.message : String(err);
         throw new ComputerError(
           `OUTCOME_UNCONFIRMED: acknowledged_prefix=${completedCount} routes=${routes.join('+') || 'none'}; native action completion is unknown. Do not repeat the unacknowledged input. ${message}`,
           { ...(routes.length ? { completedRoutes: [...routes] } : {}) }
         );
       }
-      const partial = err.completedCount!;
-      const failedBatchIndex = err.failedIndex!;
+      const partial = err instanceof ComputerError ? (err.completedCount ?? 0) : 0;
+      const failedBatchIndex = err instanceof ComputerError ? (err.failedIndex ?? partial) : partial;
       const helperRoutes = err instanceof ComputerError ? err.completedRoutes : null;
       const hasExactPartialRoutes = helperRoutes !== null && helperRoutes.length === partial;
       if (hasExactPartialRoutes) routes.push(...helperRoutes);

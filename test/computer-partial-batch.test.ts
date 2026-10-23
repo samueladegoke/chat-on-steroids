@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 const fake = vi.hoisted(() => {
   type Listener = { fn: (...args: any[]) => void; once: boolean };
@@ -85,7 +85,12 @@ vi.stubEnv('COS_MACOS_DESKTOP_HELPER', process.execPath);
 import { act } from '../src/main/computer/index.js';
 
 describe('desktop partial batch result', () => {
-  beforeEach(() => fake.resetResponse());
+  const platform = Object.getOwnPropertyDescriptor(process, 'platform')!;
+  beforeEach(() => {
+    fake.resetResponse();
+    Object.defineProperty(process, 'platform', { ...platform, value: 'win32' });
+  });
+  afterEach(() => Object.defineProperty(process, 'platform', platform));
 
   it('reports exactly what ran before a helper action failed', async () => {
     await expect(
@@ -98,6 +103,20 @@ describe('desktop partial batch result', () => {
       failedIndex: 1,
       completedRoutes: ['sendinput'],
       message: expect.stringMatching(/completed_count=1 failed_index=1 routes=sendinput/)
+    });
+  });
+
+  it('reports a macOS Accessibility failure without counts as an exact zero', async () => {
+    Object.defineProperty(process, 'platform', { ...platform, value: 'darwin' });
+    fake.setResponse({
+      ok: false,
+      error_code: 'ACCESSIBILITY_REQUIRED',
+      message: 'Accessibility permission is required'
+    });
+    await expect(act([{ type: 'type', text: 'not delivered' }])).rejects.toMatchObject({
+      completedCount: 0,
+      failedIndex: 0,
+      message: expect.stringMatching(/^PARTIAL_BATCH: completed_count=0 failed_index=0/)
     });
   });
 
