@@ -918,7 +918,15 @@ export async function stopComputerHelper(): Promise<void> {
 
 async function sendHelperRequest(request: Record<string, unknown>, expected?: ExpectedHelper): Promise<Record<string, any>> {
   if (useMacOSDesktopAddon()) return sendMacOSAddonRequest(request, expected);
-  const runtime = await startHelper();
+  let runtime: HelperRuntime;
+  try {
+    runtime = await startHelper();
+  } catch (error) {
+    // No request reached a helper, so no native action ran: report an exact zero receipt.
+    throw new ComputerError(error instanceof Error ? error.message : String(error), {
+      completedCount: 0, failedIndex: 0, completedRoutes: []
+    });
+  }
   assertHelperGeneration(runtime.generation, expected);
   if (runtime.pending) throw new ComputerError('Desktop helper received overlapping requests.');
 

@@ -1438,7 +1438,8 @@ function Assert-CaptureParent($request) {
 }
 
 function Handle-Request($request) {
-  [Clf]::EnsureDpiAware()
+  # An act request sets DPI awareness in its preflight, so a failure there gets a zero receipt.
+  if ($request.op -ne 'act') { [Clf]::EnsureDpiAware() }
   # Clear request-scoped input proof even if a prior helper request failed.
   $script:ExpectedInputStartTime = if ($request.op -eq 'act') { [string]$request.expectedProcessStartTime } else { '' }
   $script:ExpectedOwnerStartTime = if ($request.op -eq 'act') { [string]$request.expectedOwnerProcessStartTime } else { '' }
@@ -1577,6 +1578,7 @@ function Handle-Request($request) {
       # Resolve every key before focus, pointer or text effects. A typo in a later chord
       # must not leave the earlier half of a deterministic-invalid batch applied.
       try {
+        [Clf]::EnsureDpiAware()
         $keyTarget = if ($request.targetWindow) { [int64]$request.targetWindow } else { [Clf]::ForegroundId() }
         foreach ($action in $request.actions) {
           if ($action.type -eq 'focus') { $keyTarget = [int64]$action.window }

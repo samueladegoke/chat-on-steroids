@@ -42,6 +42,8 @@ describe.runIf(process.platform === 'win32')('compiled Windows input failure rec
         'static int GetSystemMetrics(int index) { return index == 78 || index == 79 ? 1000 : 0; }')
       .replace('[DllImport("user32.dll")] static extern bool GetCursorPos(out POINT p);',
         'static bool GetCursorPos(out POINT p) { p = new POINT(); p.X = TestCurrentX; p.Y = TestCurrentY; return true; }')
+      .replace('public static void EnsureDpiAware() {',
+        'public static bool TestDpiFail;\n  public static void EnsureDpiAware() {\n    if (TestDpiFail) throw new InvalidOperationException("DPI_AWARENESS_FAILED: cannot establish per-monitor physical coordinates");')
       .replace('public static long ForeignInputRoot(long handle) {',
         'public static long ForeignInputRoot(long handle) {\n    if (TestForeignRoot != 0) return TestForeignRoot;')
       // The production guard is exercised after Move, but the synthetic Win32
@@ -270,11 +272,13 @@ if ($result.ok -ne $false -or $result.error_code -ne 'STALE_FRAME' -or $script:f
 foreach ($case in @(
   @{ code='BAD_KEY'; json='{"op":"act","frame":{"id":1},"actions":[{"type":"move","x":1,"y":1},{"type":"keypress","keys":["not-a-key"]}]}' },
   @{ code='MULTILINE_REQUIRES_PASTE'; json='{"op":"act","frame":{"id":1},"actions":[{"type":"move","x":1,"y":1},{"type":"type","text":"line one\nline two"}]}' },
-  @{ code='BAD_ACTION'; json='{"op":"act","frame":{"id":1},"actions":[{"type":"move","x":1,"y":1},{"type":"drag","xs":[10,20],"ys":[10,20],"durationMs":2001}]}' }
+  @{ code='BAD_ACTION'; json='{"op":"act","frame":{"id":1},"actions":[{"type":"move","x":1,"y":1},{"type":"drag","xs":[10,20],"ys":[10,20],"durationMs":2001}]}' },
+  @{ code='DPI_AWARENESS_FAILED'; dpi=$true; json='{"op":"act","frame":{"id":1},"actions":[{"type":"move","x":1,"y":1}]}' }
 )) {
   [Clf]::TestReset(0)
   $request = $case.json | ConvertFrom-Json
-  $result = Handle-Request $request
+  [Clf]::TestDpiFail = [bool]$case.dpi
+  try { $result = Handle-Request $request } finally { [Clf]::TestDpiFail = $false }
   if ($result -isnot [hashtable]) { throw ('PREFLIGHT_RECEIPT_MISSING: ' + $case.code) }
   if ($result.ok -ne $false -or $result.error_code -ne $case.code -or
       -not $result.ContainsKey('completed_count') -or $null -eq $result.completed_count -or $result.completed_count -ne 0 -or

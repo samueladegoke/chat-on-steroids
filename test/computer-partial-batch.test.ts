@@ -38,8 +38,21 @@ const fake = vi.hoisted(() => {
   const setResponse = (next: Record<string, unknown>) => {
     response = next;
   };
+  let current: any = null;
+  let failStart = false;
+  // End the running helper; the next start then fails before any request is written.
+  const failNextStart = () => {
+    if (current) {
+      current.exitCode = 1;
+      current.emit('close');
+    }
+    failStart = true;
+  };
   const spawn = vi.fn(() => {
     const child = new Emitter() as any;
+    current = child;
+    const failing = failStart;
+    failStart = false;
     child.pid = 9300;
     child.exitCode = null;
     child.stdout = new Emitter();
@@ -58,10 +71,10 @@ const fake = vi.hoisted(() => {
       },
       end() {}
     };
-    queueMicrotask(() => child.emit('spawn'));
+    queueMicrotask(() => failing ? child.emit('error', new Error('spawn powershell.exe EACCES')) : child.emit('spawn'));
     return child;
   });
-  return { spawn, resetResponse, setResponse };
+  return { spawn, resetResponse, setResponse, failNextStart };
 });
 
 vi.mock('node:child_process', () => ({ spawn: fake.spawn }));
@@ -125,6 +138,15 @@ describe('desktop partial batch result', () => {
     await expect(act([{ type: 'type', text: 'may already be delivered' }])).rejects.toMatchObject({
       completedCount: null, failedIndex: null, completedRoutes: null,
       message: expect.stringMatching(/OUTCOME_UNCONFIRMED.*Do not repeat the unacknowledged input/)
+    });
+  });
+
+  it('reports a helper that could not start as an exact zero, since no request was sent', async () => {
+    fake.failNextStart();
+    await expect(act([{ type: 'type', text: 'never sent' }])).rejects.toMatchObject({
+      completedCount: 0,
+      failedIndex: 0,
+      message: expect.stringMatching(/^PARTIAL_BATCH: completed_count=0 failed_index=0 .*Could not start the desktop helper/)
     });
   });
 
