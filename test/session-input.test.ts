@@ -9,10 +9,11 @@ import {
   fileSilenceInput, deferSilenceInput, revokeSilenceInputs, pendingQueuedPickups, inputBeforeGoal, inputArgs, acknowledgeBrowserInput, cancelInput, claimBrowserInput, completeBrowserDecision, enqueueInput,
   failBrowserInput, listInputs, offerToolInput as offerToolInputBatch, acknowledgeToolInput, pendingBrowserInputs, requestBrowserDecision, resetInputForTests, configureInputDelivery,
   authorizeBrowserHelperRetry, pausedBrowserHelpers, hasEligibleToolInput, editQueuedInput, reorderQueuedInputs, setInputAutomation, authorizeBrowserInput, sessionInputPolicy, retryUnclaimedInput,
-  noteInputStartupError, fileRotationInput, failBranchInput, BRANCH_ERRORS
+  noteInputStartupError, fileRotationInput, failBranchInput, BRANCH_ERRORS, holdInputForSendCheck, ownUnsentTexts, noteInputHeld, withdrawOwnContinuesAfterStop
 } from '../src/main/session/input.js';
 import type { InputArgs, InputEntry } from '../src/main/session/input.js';
 import { editReplacement } from '../src/main/session/edits.js';
+import * as logger from '../src/main/logger.js';
 import { noteChatOrigin } from '../src/main/session/recorder.js';
 import { stageInputAttachment } from '../src/main/session/input-attachments.js';
 import { listUsageSessions, turnHasMcpCall } from '../src/main/session/store.js';
@@ -111,6 +112,81 @@ describe('durable user input ownership', () => {
     if (held) expect(after?.error).toBe(held);
     else expect(after?.error).toContain('did not pick up this message');
   });
+  // 2026-11-03 (Mac): the person's Continue reached the page, which held it back because ChatGPT was
+  // still answering; a minute later it failed as "the browser did not pick up this message".
+  it('keeps a message a page holds back while ChatGPT is still answering, and says so, instead of failing it', async () => {
+    binding.finishEnabled = false;
+    const row = await enqueueInput(input());
+    // Five minutes of a page reporting the hold every 45 seconds: far past the one-minute deadline.
+    for (let step = 0; step < 7; step++) {
+      now += 45_000;
+      // Every 45 s the window is told again, so its wording never lapses while the page holds it.
+      expect(await noteInputHeld(row.id, 'still-answering', 'conversation-a')).toBe('new');
+      expect((await listInputs()).find(entry => entry.id === row.id)).toMatchObject({ state: 'queued',
+        pageHold: { reason: 'still-answering', at: now } });
+    }
+    // Once no page has held it for a minute, the browser really did not take it.
+    now += 60_001;
+    expect((await listInputs()).find(entry => entry.id === row.id)).toMatchObject({ state: 'failed',
+      error: 'Not sent: the browser did not pick up this message within 60 seconds.' });
+    // A finished row is never marked held again.
+    expect(await noteInputHeld(row.id, 'still-answering', 'conversation-a')).toBeNull();
+  });
+  it('tells the window again only every 45 seconds, and takes a hold only from the message\'s own chat (CodeRabbit on #2054)', async () => {
+    binding.finishEnabled = false;
+    const row = await enqueueInput(input());
+    expect(await noteInputHeld(row.id, 'still-answering', 'conversation-b')).toBeNull();
+    expect(await noteInputHeld(row.id, 'still-answering', null)).toBeNull();
+    const told: string[] = [];
+    for (let step = 0; step < 5; step++) {
+      told.push(String(await noteInputHeld(row.id, 'still-answering', 'conversation-a')));
+      now += 15_000;
+    }
+    expect(told).toEqual(['new', 'held', 'held', 'new', 'held']);
+    // Another reason is news at once.
+    expect(await noteInputHeld(row.id, 'tool-running', 'conversation-a')).toBe('new');
+  });
+  it('takes a hold only from the chat the message goes to now, after the session moved on (CodeRabbit on #2054)', async () => {
+    binding.finishEnabled = false;
+    const info = vi.spyOn(logger, 'logInfo');
+    const row = await enqueueInput(input());
+    expect(await noteInputHeld(row.id, 'still-answering', 'conversation-a')).toBe('new');
+    // A Compact & Resume moved the session to a new chat: the old chat's page no longer keeps it.
+    binding.conversationId = 'conversation-moved';
+    expect(await noteInputHeld(row.id, 'still-answering', 'conversation-a')).toBeNull();
+    // The new chat's first hold is news, not a repeat of the old chat's.
+    expect(await noteInputHeld(row.id, 'still-answering', 'conversation-moved')).toBe('new');
+    expect(await noteInputHeld(row.id, 'still-answering', 'conversation-moved')).toBe('held');
+    expect(info).toHaveBeenCalledWith(`input ${row.id}: a hold from conversation-a does not keep it: it goes to conversation-moved`);
+    info.mockRestore();
+  });
+
+  it('counts an old chat\'s hold for nothing once the message goes to another chat (CodeRabbit on #2054)', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      binding.finishEnabled = false;
+      const row = await enqueueInput(input());
+      vi.setSystemTime(Date.now() + 50_000);
+      expect(await noteInputHeld(row.id, 'still-answering', 'conversation-a')).toBe('new');
+      binding.conversationId = 'conversation-moved';
+      // 61 s after it was queued, 11 s after A's hold: A's hold no longer keeps it.
+      vi.setSystemTime(Date.now() + 11_000);
+      expect((await listInputs()).find(entry => entry.id === row.id)?.state).toBe('failed');
+    } finally { vi.useRealTimers(); }
+  });
+  it.each([
+    ['turn-held', 'new', 'queued'], ['tool-running', 'new', 'queued'],
+    // A page with no usable message box, or one that moved on, will not send it by waiting: the minute still applies.
+    ['no-composer', null, 'failed'], ['page-moved', null, 'failed']
+  ] as const)('keeps it only for a page waiting on its own turn (%s)', async (reason, kept, state) => {
+    binding.finishEnabled = false;
+    const row = await enqueueInput(input());
+    now += 50_000;
+    expect(await noteInputHeld(row.id, reason, 'conversation-a')).toBe(kept);
+    // 80 seconds after it was queued, 30 after the hold.
+    now += 30_000;
+    expect((await listInputs()).find(entry => entry.id === row.id)?.state).toBe(state);
+  });
   it('requeues one proven pre-Send browser pickup timeout on the same row, then stops retrying', async () => {
     binding.model = 'gpt-5.6-sol'; binding.finishEnabled = false;
     const row = await enqueueInput(input());
@@ -128,6 +204,24 @@ describe('durable user input ownership', () => {
     now += 120_000;
     expect(await retryUnclaimedInput(row.id)).toBeNull();
   });
+  // #1878: a message no browser picked up became "Not sent" without a log line, so the report showed
+  // only the automatic requeue and nothing about the browser at that moment.
+  it('logs a pickup timeout once, with what the browser side looked like', async () => {
+    binding.model = 'gpt-5.6-sol'; binding.finishEnabled = false;
+    configureInputDelivery({ applyAutomation: automate, changed, recoveryAllowed: () => binding.recoveryAllowed,
+      pickupContext: () => 'wake channel connected; ChatGPT tabs 14 open, 3 discarded, 2 loading' });
+    const warn = vi.spyOn(logger, 'logWarn');
+    try {
+      const row = await enqueueInput(input());
+      now += 60_001;
+      await listInputs(); await listInputs();
+      const lines = warn.mock.calls.map(call => String(call[0])).filter(line => line.includes(row.id));
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toMatch(new RegExp(`^input ${row.id}: not sent, no browser picked it up within 60 s \\(wake channel connected; ChatGPT tabs 14 open, 3 discarded, 2 loading; [0-9.]+ GB of [0-9.]+ GB memory free\\)$`));
+    } finally {
+      warn.mockRestore();
+    }
+  });
   it('does not retry a pickup timeout after the user dismissed its browser chat', async () => {
     binding.model = 'gpt-5.6-sol'; binding.finishEnabled = false;
     const row = await enqueueInput(input());
@@ -143,6 +237,33 @@ describe('durable user input ownership', () => {
     expect(await retryUnclaimedInput(row.id)).toBeNull();
     expect((await listInputs()).find(entry => entry.id === row.id)).toMatchObject({ state: 'failed' });
     expect((await listInputs()).find(entry => entry.id === row.id)).not.toHaveProperty('pickupRetryCount');
+  });
+  // 2.1.47 round: a message sent as the person closed the chat's tab expired unclaimed. The page
+  // reports the close a moment late, so the message counted as accepted before the departure.
+  it.each([[1_500, true], [9_000, false]] as const)('a typed message %i ms before the reported close is offered: %s', async (gap, offered) => {
+    binding.model = 'gpt-5.6-sol'; binding.finishEnabled = false;
+    const typed = await enqueueInput(input());
+    openings.set(sessionId, Object.assign({ id: sessionId, conversationId: binding.conversationId, origin: { kind: binding.origin } },
+      { browserRecoveryDismissedAt: now + gap }));
+    now += gap + 500;
+    expect((await pendingBrowserInputs()).some(row => row.id === typed.id)).toBe(offered);
+  });
+  // CodeRabbit on #1910: the grace is for what the person typed, and it carries through the claim.
+  it('gives no close grace to a scheduled run', async () => {
+    binding.model = 'gpt-5.6-sol'; binding.finishEnabled = false;
+    const run = await enqueueInput(input({ scheduled: { scheduleId: randomUUID(), dueAt: now, late: false } } as Partial<InputArgs>));
+    openings.set(sessionId, Object.assign({ id: sessionId, conversationId: binding.conversationId, origin: { kind: binding.origin } }, { browserRecoveryDismissedAt: now + 1_500 }));
+    now += 2_000;
+    expect((await pendingBrowserInputs()).some(row => row.id === run.id)).toBe(false);
+  });
+  it('lets a message typed just before the reported close through its claim and its final send check', async () => {
+    binding.model = 'gpt-5.6-sol'; binding.finishEnabled = false;
+    const typed = await enqueueInput(input());
+    openings.set(sessionId, Object.assign({ id: sessionId, conversationId: binding.conversationId, origin: { kind: binding.origin } }, { browserRecoveryDismissedAt: now + 1_500 }));
+    now += 2_000;
+    expect(await claimBrowserInput(typed.id, 'reopened-page', binding.conversationId, true)).not.toBeNull();
+    now += 1_000;
+    expect(await authorizeBrowserInput(typed.id, 'reopened-page', binding.conversationId)).toBe(true);
   });
   it('does not requeue a never-claimed input after Automatic Continue is turned off', async () => {
     binding.model = 'gpt-5.6-sol'; binding.finishEnabled = false;
@@ -294,6 +415,26 @@ describe('durable user input ownership', () => {
   });
   // #1402: turns past ~35 minutes break; a native send into the running turn ends it as interrupted
   // and continues in a fresh one, a command in flight keeping its result (measured 2026-10-09).
+  it('does not count time held by the send check against the 60-second browser pickup deadline (CodeRabbit)', async () => {
+    binding.model = 'gpt-5.6-sol'; binding.activeTurnId = 'plain-turn';
+    binding.end = { kind: 'turn_start', outcome: '', turnId: 'plain-turn', time: 900 };
+    const row = await fileRotationInput(sessionId, 'plain-turn');
+    expect(row).toMatchObject({ purpose: 'rotation', transportIntent: 'browser', state: 'queued' });
+    // Held at 50 s and again at 80 s, as the program keeps saying no.
+    now += 50_000;
+    expect(await holdInputForSendCheck(row!.id, 1, 'not now', true)).toBe(true);
+    now += 30_000;
+    expect(await holdInputForSendCheck(row!.id, 2, 'not now', true)).toBe(true);
+    now += 25_000;
+    expect((await listInputs()).find(entry => entry.id === row!.id)).toMatchObject({ state: 'queued' });
+    // Released at 110 s: the browser gets its full minute from there, and no more.
+    now += 5_000 + 59_000;
+    expect((await listInputs()).find(entry => entry.id === row!.id)).toMatchObject({ state: 'queued' });
+    now += 2_000;
+    expect((await listInputs()).find(entry => entry.id === row!.id)).toMatchObject({ state: 'failed',
+      error: 'Not sent: the browser did not pick up this message within 60 seconds.' });
+  });
+
   it('files one rotation into the running turn as an automatic message, only when nothing else waits', async () => {
     binding.model = 'gpt-5.6-sol'; binding.activeTurnId = 'plain-turn';
     binding.end = { kind: 'turn_start', outcome: '', turnId: 'plain-turn', time: 900 };
@@ -1348,6 +1489,17 @@ describe('browser decision lifetime', () => {
     await rejection;
     expect((await listInputs())[0]?.state).toBe('failed');
   });
+  // 2026-11-01: only the picker failed; nothing was typed, so Goal may ask again.
+  it('rejects a helper whose model the page could not confirm with its own retryable code', async () => {
+    const controller = new AbortController();
+    const answer = requestBrowserDecision('Choose one', controller.signal);
+    const rejection = expect(answer).rejects.toThrow('goal_helper_model_unconfirmed: Requested model or reasoning could not be confirmed');
+    const row = (await listInputs())[0]!;
+    await claimBrowserInput(row.id, 'document', null);
+    await failBrowserInput(row.id, 'document', 'Requested model or reasoning could not be confirmed', 'model-unconfirmed');
+    await rejection;
+    expect((await listInputs())[0]?.state).toBe('failed');
+  });
   it('rejects cancellation that races a persisted answer', async () => {
     const controller = new AbortController();
     const answer = requestBrowserDecision('Choose one', controller.signal);
@@ -2328,5 +2480,62 @@ describe('edit and resubmit (#365)', () => {
     const edited = randomUUID();
     expect(await acknowledgeBrowserInput(entry.id, claim!.owner!, 'conversation-a', edited)).toBe(true);
     expect(editReplacement(edited)).toBe(later);
+  });
+});
+
+// #1922: which of the app's own messages a page may replace when it finds one left in the composer.
+describe('own messages that never reached Send', () => {
+  it('lists only claimed, never-authorized, attachment-free messages of that chat from the last day, newest first', async () => {
+    const base = { sessionId, mode: 'auto' as const, dueAt: 0, model: null, reasoningEffort: null, owner: null, conversationId: 'conversation-a', offeredAt: now, requiresAuthorization: true };
+    const row = (text: string, extra: Partial<InputEntry> = {}): InputEntry =>
+      ({ ...base, id: randomUUID(), text, state: 'cancelled', createdAt: now - 1_000, ...extra } as InputEntry);
+    const rows = [
+      row('withdrawn continue'),
+      row('failed with frozen text', { state: 'failed', deliveryText: 'frozen delivery text', createdAt: now - 500 }),
+      row('authorized, then lost', { sendAuthorizedAt: now }),
+      row('delivered', { state: 'sent', deliveredAt: now }),
+      row('never claimed', { offeredAt: undefined }),
+      row('other chat', { conversationId: 'conversation-b' }),
+      row('with an image', { images: [{ name: 'a.webp', dataUrl: 'data:image/webp;base64,AAAA' }] }),
+      row('yesterday', { createdAt: now - 25 * 60 * 60_000 }),
+      // An older saved claim that never needed Send authorization may have been sent.
+      row('old claim without authorization', { requiresAuthorization: undefined }),
+      // A message and its companion went out as one text: neither alone is listed.
+      row('combined root', { companionInputId: '00000000-0000-4000-8000-000000000001' }),
+      row('its companion', { id: '00000000-0000-4000-8000-000000000001' })
+    ];
+    await writeDurableNow('session-input', rows);
+    resetInputForTests();
+    expect(await ownUnsentTexts('conversation-a', 'someone-else', now)).toEqual(['frozen delivery text', 'withdrawn continue']);
+    // A message is never its own leftover.
+    expect(await ownUnsentTexts('conversation-a', rows[0]!.id, now)).toEqual(['frozen delivery text']);
+  });
+});
+
+// CodeRabbit on #2066: Stop for an answer that already ended withdraws the app's own unsent Continues,
+// counted in the step that withdraws them; the person's own messages and authorized sends stay.
+describe('withdrawing the app\'s own Continues after a Stop', () => {
+  it('cancels a converted Continue and the named turn\'s fresh-turn Continue, and counts only those', async () => {
+    const mine = await seedLegacyInput(input({ text: 'My own next step' }));
+    const converted = await seedLegacyInput(input({ text: 'Continue until you are fully finished.' }));
+    const rotation = await seedLegacyInput(input({ text: 'Continue the task from where you are.' }));
+    const otherTurn = await seedLegacyInput(input({ text: 'Continue the task from where you are.' }));
+    const authorized = await seedLegacyInput(input({ text: 'Continue until you are fully finished.' }));
+    const rows = await listInputs();
+    await writeDurableNow('session-input', rows.map(row =>
+      row.id === converted.id ? { ...row, continuedFrom: 'recovery' as const }
+      : row.id === rotation.id ? { ...row, purpose: 'rotation' as const, queuedTurn: { conversationId: binding.conversationId, turnId: 'ended-turn' } }
+      : row.id === otherTurn.id ? { ...row, purpose: 'rotation' as const, queuedTurn: { conversationId: binding.conversationId, turnId: 'next-turn' } }
+      : row.id === authorized.id ? { ...row, continuedFrom: 'recovery' as const, state: 'browser' as const, owner: 'page', sendAuthorizedAt: now }
+      : row));
+    resetInputForTests();
+    expect(await withdrawOwnContinuesAfterStop(sessionId, 'ended-turn')).toBe(2);
+    const after = new Map((await listInputs()).map(row => [row.id, row]));
+    expect(after.get(converted.id)).toMatchObject({ state: 'cancelled', error: 'Automatic Continue cancelled: you pressed Stop.' });
+    expect(after.get(rotation.id)?.state).toBe('cancelled');
+    expect(after.get(otherTurn.id)?.state).toBe('queued');
+    expect(after.get(mine.id)?.state).toBe('queued');
+    expect(after.get(authorized.id)?.state).toBe('browser');
+    expect(await withdrawOwnContinuesAfterStop(sessionId, 'ended-turn')).toBe(0);
   });
 });

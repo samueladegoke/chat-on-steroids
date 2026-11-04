@@ -211,6 +211,38 @@ it('keeps plugin connection setup local, preserves a draft and saves through the
   expect(document.querySelector('#pluginDialog .plugin-tools')).toBeNull();
 });
 
+// #1872: a saved Plugins tunnel ID that OpenAI doesn't know kept a failing Plugins connection with no way to remove it.
+it('turns off a saved Plugins connection by clearing only its tunnel ID, and offers it only while one is saved', async () => {
+  const next = { hasApiKey: true, config: { tunnel: { kind: 'openai', tunnelId: 'core-original', desktopTunnelId: 'desktop-original', pluginsTunnelId: 'plugins-original' }, ui: { theme: 'dark' } }, status: { surfaces: [{ id: 'plugins', state: 'error', detail: 'OpenAI refused the tunnel (HTTP 404)', tools: [], connectorName: 'Chat On Steroids Plugins', description: 'External tools' }] } } as unknown as AppState;
+  initPlugins(); applyPluginsState(next); await tick();
+  document.getElementById('pluginsSetupLink')!.click();
+  const off = () => [...document.querySelectorAll<HTMLButtonElement>('#pluginDialog button')].find(node => node.textContent === 'Turn off Plugins connection');
+  expect(off()).toBeDefined();
+  const cleared = structuredClone(next); cleared.config.tunnel.pluginsTunnelId = '';
+  api.saveSettings!.mockResolvedValue({ ok: true, data: cleared });
+  off()!.click(); await tick();
+  expect(api.saveSettings).toHaveBeenCalledExactlyOnceWith(
+    expect.objectContaining({ tunnel: expect.objectContaining({ tunnelId: 'core-original', desktopTunnelId: 'desktop-original', pluginsTunnelId: '' }) }),
+    expect.objectContaining({ tunnel: expect.objectContaining({ pluginsTunnelId: 'plugins-original' }) }));
+  expect(api.connect).not.toHaveBeenCalled();
+  expect(api.pluginsUninstall).not.toHaveBeenCalled();
+  expect(document.getElementById('pluginDialog')).toBeNull();
+  expect(document.querySelector('.toast')!.textContent).toContain('Plugins connection turned off');
+  // Nothing saved: nothing to turn off.
+  document.getElementById('pluginsSetupLink')!.click();
+  expect(off()).toBeUndefined();
+});
+
+it('keeps the Plugins connection when turning it off fails', async () => {
+  const next = { hasApiKey: true, config: { tunnel: { kind: 'openai', tunnelId: 'core-original', pluginsTunnelId: 'plugins-original' }, ui: { theme: 'dark' } }, status: { surfaces: [{ id: 'plugins', state: 'error', detail: 'OpenAI refused the tunnel (HTTP 404)', tools: [] }] } } as unknown as AppState;
+  initPlugins(); applyPluginsState(next); await tick();
+  document.getElementById('pluginsSetupLink')!.click();
+  api.saveSettings!.mockResolvedValue({ ok: false, error: 'Settings changed elsewhere.' });
+  [...document.querySelectorAll<HTMLButtonElement>('#pluginDialog button')].find(node => node.textContent === 'Turn off Plugins connection')!.click(); await tick();
+  expect(document.getElementById('pluginDialog')).not.toBeNull();
+  expect(document.body.textContent).not.toContain('Plugins connection turned off');
+});
+
 it('explains starting enabled runtimes and tool publication conflicts', async () => {
   state.plugins[0]!.status = 'connecting';
   state.plugins[0]!.tools = [{ name: 'get_scene_info', exposedName: 'get_scene_info', enabled: true, published: false, exposureError: 'Another installed plugin declares get_scene_info.' }];
@@ -383,4 +415,48 @@ it('asks before uninstalling like removing a skill: Cancel first and focused, th
   [...document.querySelectorAll<HTMLButtonElement>('.plugin-card button')].find(node => node.textContent === 'Uninstall')!.click();
   [...document.querySelectorAll<HTMLButtonElement>('#pluginDialog .pet-delete-actions button')].find(node => node.textContent === 'Uninstall plugin')!.click(); await tick();
   expect(api.pluginsUninstall).toHaveBeenCalledExactlyOnceWith('one');
+});
+
+// Design audit 2026-11-01: a failed first load kept saying "Loading…" for good.
+it('says the plugins could not be loaded when the first load fails, and lists them once a retry works', async () => {
+  vi.resetModules();
+  const fresh = await import('../src/renderer/plugins.js');
+  api.pluginsSnapshot!.mockImplementationOnce(async () => ({ ok: false, error: 'Plugin store unavailable' }));
+  // The page's own start, so its search box is wired as in the app.
+  fresh.initPlugins(); await tick(); await tick();
+  expect(document.getElementById('pluginsCount')!.textContent).toBe('');
+  expect(document.getElementById('pluginsInstalled')!.textContent).toBe('Plugins could not be loaded.');
+  // Typing in the search repaints the list, and the failure stays (CodeRabbit on #2002).
+  const search = document.getElementById('pluginsSearch') as HTMLInputElement;
+  search.value = 'mem'; search.dispatchEvent(new (window as any).Event('input'));
+  expect(document.getElementById('pluginsInstalled')!.textContent).toBe('Plugins could not be loaded.');
+  expect(document.getElementById('pluginsCount')!.textContent).toBe('');
+  search.value = ''; search.dispatchEvent(new (window as any).Event('input'));
+  await fresh.refreshPlugins();
+  expect(document.querySelectorAll('#pluginsInstalled .plugin-card')).toHaveLength(1);
+  // Once a list has shown, a later failed refresh keeps it and only says so in the toast.
+  api.pluginsSnapshot!.mockImplementationOnce(async () => ({ ok: false, error: 'Plugin store unavailable' }));
+  await fresh.refreshPlugins();
+  expect(document.querySelectorAll('#pluginsInstalled .plugin-card')).toHaveLength(1);
+});
+
+// CodeRabbit on #2002: a refresh that a newer one replaced says nothing while the newer one is on its way.
+// Either order: the older failure arriving first, or only after the newer list is already shown (CodeRabbit on #2002).
+it.each(['before', 'after'] as const)('shows no load error for a plugin refresh that a newer one replaced (failure %s the list)', async order => {
+  vi.resetModules();
+  const fresh = await import('../src/renderer/plugins.js');
+  const replies: Array<(reply: unknown) => void> = [];
+  api.pluginsSnapshot!.mockImplementation(() => new Promise(resolve => replies.push(resolve)));
+  const first = fresh.refreshPlugins();
+  const second = fresh.refreshPlugins();
+  const fail = async () => {
+    replies[0]!({ ok: false, error: 'Plugin store unavailable' });
+    await first;
+    expect(document.getElementById('pluginsInstalled')!.textContent).not.toBe('Plugins could not be loaded.');
+  };
+  if (order === 'before') await fail();
+  replies[1]!({ ok: true, data: state });
+  await second;
+  if (order === 'after') await fail();
+  expect(document.querySelectorAll('#pluginsInstalled .plugin-card')).toHaveLength(1);
 });

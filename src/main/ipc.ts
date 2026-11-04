@@ -1,3 +1,4 @@
+import { MAX_CHAT_STYLE_CHARS } from '../shared/chat-style.js';
 import { registerWorkspaceTerminalIpc } from './workspace-terminal-ipc.js';
 import { forgetSurfaceTokens } from './mcp/persistent-paths.js';
 import { firefoxAddonUrl } from '../shared/firefox-addon.js';
@@ -8,6 +9,7 @@ import { setStopNoticeTranslations } from './stuck-notice.js';
 import { dialogLabel, mainText, setMainTextTranslations } from './main-texts.js';
 import { MAIN_TEXTS } from '../shared/main-texts.js';
 import { MAX_TASK_REQUEST_CHARS } from '../shared/task-progress.js';
+import { restoreCheckpoint } from './checkpoints/index.js';
 import { applyLoginStartup, supportsLoginStartup } from './window-lifecycle.js';
 import { startControlApi, stopControlApi } from './control-api.js';
 import { appearanceSchema } from './appearance-schema.js';
@@ -30,14 +32,20 @@ import { GOAL_MARKER_INSTRUCTION } from '../shared/goal-templates.js';
 import { validateInputImages } from './session/input-images.js';
 import { stageInputAttachment, stageInputAttachments, type AttachmentSource } from './session/input-attachments.js';
 import { recordDeliveredInput, recordedInputImage } from './session/input-history.js';
-import { UI_BASE_ZOOM, titleBarOverlayForTheme, windowBackgroundForTheme } from './window-layout.js';
+import { UI_BASE_ZOOM } from './window-layout.js';
+import { paintWindowTheme } from './theme.js';
 import { usageOverview } from './session/usage.js';
 import { exportUsageCsv } from './session/usage-export.js';
 import { readProviderUsage } from './provider-usage.js';
-import { inputArgs, listInputs, editQueuedInput, sendQueuedInputNow, reorderQueuedInputs, setInputAutomation, configureInputDelivery, pausedBrowserHelpers, cancelFinishInputs } from './session/input.js';
+import { inputArgs, listInputs, editQueuedInput, sendQueuedInputNow, reorderQueuedInputs, setInputAutomation, configureInputDelivery, pausedBrowserHelpers, cancelFinishInputs, type InputEntry } from './session/input.js';
 import { draftOpeningMessage, onGoalChange, nativeGoalFailure } from './goal.js';
 import { cancelTaskRequest, runTaskRequest } from './task-request.js';
 import { randomUUID } from 'node:crypto';
+import { promises as fs } from 'node:fs';
+import path from 'node:path';
+import { isValidTopic, normalizeServer, testPhonePush } from './phone-push.js';
+
+import { DEFAULT_PHONE_PUSH, type PhonePushSettings } from '../shared/phone-push.js';
 import { retryGoalBrowserHelper } from './goal.js';
 import { requestBrowserPreferences } from './browser-preferences.js';
 import { sendDesktopInput, cancelDesktopInput, retryQueuedInputBrowser } from './session/start-input.js';
@@ -57,8 +65,10 @@ import { confirmedPluginSchemas, pluginRefreshPublications, pluginRefreshStatuse
  * key but can never read it back.
  */
 
-import { app, BrowserWindow, clipboard, desktopCapturer, dialog, ipcMain, nativeTheme, shell } from 'electron';
+import { answerDesktopAsk, currentDesktopAsk, mirrorDesktopAsk } from './desktop-ask-window.js';
+import { app, BrowserWindow, clipboard, desktopCapturer, dialog, ipcMain, nativeTheme, shell, type IpcMainInvokeEvent } from 'electron';
 import { repairMacOSPermissions, resetMacOSPermissions } from './computer/macos-grants.js';
+import { testLinuxScreenshotConsent } from './computer/linux-screenshot-consent.js';
 import { z } from 'zod';
 import {
   CAPABILITIES,
@@ -68,7 +78,8 @@ import {
   GOAL_PROVIDERS,
   GOAL_REASONING_LEVELS,
   type AppState,
-  type Config
+  type Config,
+  type SettingsBackupChoice
 } from '../shared/types.js';
 import { MAX_GOAL_SYSTEM_PROMPT_CHARS } from '../shared/goal.js';
 import { DEFAULT_HANDOFF_LENGTH, HANDOFF_LENGTHS, MAX_HANDOFF_PROMPT_CHARS } from '../shared/handoff.js';
@@ -76,7 +87,8 @@ import { CUSTOM_CONTINUE_MAX_CHARS } from '../shared/recovery.js';
 import { applySettings, connect, disconnect, getStatus, onStatusChange, rememberRunningSurfaceTokens } from './connection.js';
 import { effectiveCapabilities, getConfig, updateConfig, MAX_MCP_INSTRUCTIONS_CHARS, browserBridgePortSchema, settingsRecovered } from './config.js';
 import { UI_LANGUAGES } from '../shared/ui-language.js';
-import { PROJECT_COLORS } from '../shared/projects.js';
+import { CHATGPT_PROJECT_ID, PROJECT_COLORS } from '../shared/projects.js';
+import { chatgptProjectChoices } from './chatgpt-project-catalog.js';
 import { bridgePortSelection } from './bridge-ports.js';
 import { clearAllGoalSwitches, draftTaskPlan, listGoalModels, MODEL_PAGE_SIZE, retireGoalDrafts, goalBackendFor, goalSwitchFor, setGoalSwitchNow, setGoalReplyActiveNow, setGoalObjectiveNow } from './goal.js';
 import { forgetExposedSurface } from './mcp/server.js';
@@ -85,19 +97,22 @@ import { onBackgroundExecChange, runningExecProcesses, stopExecProcess } from '.
 import { keychainNoticeReady } from './keychain-notice.js';
 import { runDiagnostics } from './diagnostics.js';
 import { collectReportFacts, readRecentLog, renderDiagnosticsReport, saveDiagnosticsReport, systemFacts, memoryFacts } from './diagnostics-report.js';
-import { listSessions, readTurnTraces } from './session/store.js';
+import { clearProjectNote, listSessions, readTurnTraces } from './session/store.js';
+import { deleteSchedule, listSchedules, saveSchedule, scheduleRepeatSchema, setSchedulePaused } from './scheduled-runs.js';
 import { formatLogAsJson, formatLogForClipboard, getLog, logInfo, logWarn, onLog } from './logger.js';
+import { markStartup } from './startup-timing.js';
 import { managedWorktreeCleanupOffers, acknowledgeManagedWorktreeCleanupOffer } from './agents.js';
 import { listOfferedWorkerWorktrees, disposeOfferedWorkerWorktree, WorkerWorktreeError } from './worktrees/index.js';
 import type { WorkerWorktreeCleanupOffer } from '../shared/session.js';
 import { unifiedExecManager } from './codex/manager.js';
 import { inFlightToolCalls } from './mcp/call-context.js';
 import { RESERVED_ROOT_NAMES, uniqueRootName, validateNewRoot, SandboxError, resolvePath } from './sandbox.js';
-import { addProject, addRemoteProject, expireArmedProjectCreates, getSessionProject, listProjects, localProjectPath, onProjectLinkChange, projectWorkspace, removeProject, retryProjectCreate, setProjectColor } from './projects.js';
+import { addProject, addRemoteProject, createChatgptProjectFor, linkChatgptProject, unlinkChatgptProject, expireArmedProjectCreates, getSessionProject, listProjects, localProjectPath, moveChatWithGroup, onProjectLinkChange, projectWorkspace, relatedFolderViews, removeProject, retryProjectCreate, setProjectColor, setProjectSecretsShieldOff, setRelatedFolders } from './projects.js';
 import { createProjectEntry, listProjectDirectory, previewProjectFile, projectFileTarget, renameProjectEntry, revalidateProjectFileTarget, saveProjectTextFile, serverFileSnapshot } from './project-files.js';
 import { ProjectFileWatchSet } from './project-file-watcher.js';
 import { ProjectGitWatchSet, readProjectGitDiff, readProjectGitSnapshot } from './project-git.js';
-import { hasSecret, isEncryptionAvailable, secureStorageStatus, setAsideUnreadableSecrets, setSecret, storedSecretsUnreadable } from './secrets.js';
+import { hasSecret, isEncryptionAvailable, readSecretsFor, secureStorageStatus, setAsideUnreadableSecrets, setSecret, setSecrets, storedSecretsUnreadable, type SecretKey } from './secrets.js';
+import { BackupError, buildBackup, changedSettings, widerAccess, exportableSecret, openSecrets, overlaySettings, passphraseLongEnough, pickByShape, readBackup, settingsForBackup, type ParsedBackup } from './settings-backup.js';
 import { setupApiKeySlot } from '../shared/setup-profile.js';
 import { addSetupProfile, removeSetupProfile, switchSetupProfile } from './setup-profiles.js';
 import { bundledVersion, locateBinary } from './tunnel/locate.js';
@@ -108,7 +123,7 @@ import {
   companionDiagnostics,
   sessionInputActivity,
   recoveryHeldByCalls, recoveryInputAllowed,
-  sessionControlsFor, cancelAssistantRecovery, stopSessionTurn, setSessionAutomation, setSessionObjective, compactSession, resumeFromSavedSummary, cancelSessionCompaction,
+  sessionControlsFor, cancelAssistantRecovery, pickupNow, stopSessionTurn, endOwnWorkAfterStop, setSessionAutomation, setSessionObjective, compactSession, resumeFromSavedSummary, cancelSessionCompaction,
   cancelWorkerCommands,
   chatUrl,
   revealChatInBrowser,
@@ -118,7 +133,8 @@ import {
   stopBridge,
   sweepStaleSwarm,
   unpair,
-  followChatInBackground
+  followChatInBackground,
+  browserPickupContext
 } from './bridge.js';
 import { extensionDir } from './extension-path.js';
 import { APP_VERSION, extensionDownloadUrl } from './version.js';
@@ -134,13 +150,19 @@ import {
   setRecordingStorageLimit,
   readHandoff,
   readToolEditReview,
+  readEditReviewAsset,
+  readEvents,
   withSessionMutationFence
 } from './session/store.js';
+import { netTurnChanges, netTurnFileDiff, turnFileEdits, type EditAt } from './session/turn-changes.js';
 import { forgetSession, notifyChanged, onSessionChange } from './session/recorder.js';
 import { findInSession, locateMessage, locateSearchMatch, searchSessions } from './session/search.js';
 import { listBookmarks, setBookmark } from './session/bookmarks.js';
 import { readSessionEvents, readSessionList, sessionListCursorSchema } from './session/read-model.js';
 import { exportSessionMarkdown } from './session/markdown-export.js';
+import { commitProjectChanges, createPullRequest, pushProject, readCommitState } from './project-commit.js';
+import { exportSessionPage } from './session/page-export.js';
+import { feedbackIssueUrl, operatingSystemName, systemVersion } from './feedback.js';
 import { saveCodeFile } from './code-file.js';
 import { blockedChatIds, setChatsBlocked } from './session/blocked-chats.js';
 import { setChatsTrusted, trustedChatIds } from './session/trusted-chats.js';
@@ -172,6 +194,14 @@ import {
   onMacOSDesktopAccessChange,
   refreshMacOSDesktopAccess
 } from './computer/index.js';
+
+/** Why phone settings cannot be saved as they are, or null. Only an enabled form is checked. */
+function phonePushProblem(push: { enabled: boolean; topic: string; server: string }): string | null {
+  if (!push.enabled) return null;
+  if (!isValidTopic(push.topic)) return 'Choose a topic of letters, digits, - and _ (up to 64).';
+  if (!normalizeServer(push.server)) return 'Enter the address of an ntfy server, such as https://ntfy.sh.';
+  return null;
+}
 
 /** Fixed native Settings destinations; authored chat links use the shared web/mail policy. */
 const ALLOWED_LINKS = new Set([
@@ -225,12 +255,21 @@ const settingsPatch = z.object({
     defaultChatReasoning: z.enum(REASONING_EFFORTS).optional(),
     chatBrowser: z.enum(CHAT_BROWSERS).optional(),
     cosBrowserMinimize: z.enum(['taskbar', 'tray']).optional(),
+    desktopAsk: z.enum(['off', 'active', 'always']).optional(),
+    desktopUnattributed: z.boolean().optional(),
+    linuxDesktopEnabled: z.boolean().optional(),
     developerMode: z.boolean().optional(),
     playfulStatus: z.boolean().optional(),
     playfulContinue: z.boolean().optional(),
     announceTurns: z.boolean().optional(),
     customContinue: z.string().trim().max(CUSTOM_CONTINUE_MAX_CHARS).optional(),
+    // #1856: absent is the built-in text; '' leaves that part out.
+    chatPersonality: z.string().trim().max(MAX_CHAT_STYLE_CHARS).optional(),
+    chatWritingStyle: z.string().trim().max(MAX_CHAT_STYLE_CHARS).optional(),
+    // #1794: the renderer saves only an address on this computer; main checks it again before use.
+    sendCheckUrl: z.string().trim().max(300).optional(),
     followOutput: z.boolean().optional(),
+    showMessageTimes: z.boolean().optional(),
     mentionCore: z.boolean().optional(),
     mentionPlugins: z.boolean().optional(),
     language: z.enum(UI_LANGUAGES).optional(),
@@ -255,13 +294,23 @@ const settingsPatch = z.object({
     autoConnect: z.boolean(),
     startAtLogin: z.boolean().optional(),
     turnNotifications: z.boolean().optional(),
+    sounds: z.boolean().optional(),
     rotateTurnMinutes: z.number().int().min(0).max(120).optional(),
     rotateStopFallback: z.boolean().optional(),
     localAppUsage: z.boolean().optional(),
     keepAwake: z.boolean().optional(),
     keepScreenAwake: z.boolean().optional(),
     privacyScreenshots: z.boolean(),
-    theme: z.enum(['light', 'dark'])
+    phonePush: z.object({
+      enabled: z.boolean(), server: z.string().max(2048), topic: z.string().max(64), needsYou: z.boolean(), failures: z.boolean(),
+      finishedAfterMinutes: z.number().int().min(0).max(240).nullable(), onlyWhenAway: z.boolean(),
+      quietHours: z.object({ from: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/), to: z.string().regex(/^([01]\d|2[0-3]):[0-5]\d$/) }).strict().nullable(),
+      includeDetails: z.boolean()
+    }).strict().optional(),
+    secretsShield: z.boolean().optional(),
+    // Set from the Commit dialog (projectCommit:flow); a settings save carries it through.
+    commitFlow: z.enum(['commit', 'ask-push', 'pr']).optional(),
+    theme: z.enum(['light', 'dark', 'system'])
   }),
   sessions: z.object({
     record: z.boolean(),
@@ -295,6 +344,7 @@ const settingsPatch = z.object({
   }),
   mcp: z.object({ instructions: z.string().trim().max(MAX_MCP_INSTRUCTIONS_CHARS), persistentUrls: z.boolean().optional() }).strict().optional(),
   controlApi: z.object({ enabled: z.boolean(), allowActions: z.boolean().optional() }).strict().optional(),
+  projects: z.object({ codeCheckpoints: z.boolean() }).strict().optional(),
   goal: z.object({
     impulseMinutes: z.number().int().min(0).max(60).optional(),
     includeToolCalls: z.boolean().optional(),
@@ -302,6 +352,7 @@ const settingsPatch = z.object({
       loopBackend: z.enum(['api', 'chatgpt']).optional(),
       helperModel: z.string().trim().min(1).max(80).optional(),
       helperReasoning: z.enum(REASONING_EFFORTS).optional(),
+      reviewerModel: z.string().trim().max(80).optional(),
     enabled: z.boolean(),
     // Which of the two standing modes the switch runs. One field, so the renderer has no way
     // to describe a state where Goal and Loop are both on.
@@ -350,7 +401,7 @@ type SettingsSnapshot = z.infer<typeof settingsPatch>;
  * unchanged between `base` and `wanted` was not edited by this renderer save and therefore keeps
  * the current main-process value. A field that differs was deliberately edited here and wins.
  */
-function mergeSettings(current: Config, base: SettingsSnapshot, wanted: SettingsSnapshot): Omit<SettingsSnapshot, 'controlApi'> & { controlApi: Config['controlApi'] } {
+function mergeSettings(current: Config, base: SettingsSnapshot, wanted: SettingsSnapshot): Omit<SettingsSnapshot, 'controlApi' | 'projects'> & { controlApi: Config['controlApi']; projects: Config['projects'] } {
   const tunnelEdited = (['tunnelId', 'desktopTunnelId', 'pluginsTunnelId'] as const)
     .some(key => (base.tunnel[key] ?? '') !== (wanted.tunnel[key] ?? ''));
   if (tunnelEdited && ((base.tunnel.profileId ?? 'default') !== (current.tunnel.profileId ?? 'default') ||
@@ -358,6 +409,18 @@ function mergeSettings(current: Config, base: SettingsSnapshot, wanted: Settings
     throw new Error('Setup profile changed. Edit the tunnel ID in the selected profile again.');
   }
   const pick = <T>(live: T, before: T, next: T): T => (Object.is(before, next) ? live : next);
+  // Field by field, like the rest of the form: a change elsewhere never undoes one made here.
+  const mergePhonePush = (live: PhonePushSettings | undefined, before: PhonePushSettings | undefined, next: PhonePushSettings | undefined): PhonePushSettings | undefined => {
+    if (!next) return live;
+    const now = live ?? DEFAULT_PHONE_PUSH, was = before ?? DEFAULT_PHONE_PUSH;
+    const field = <K extends keyof PhonePushSettings>(key: K): PhonePushSettings[K] =>
+      JSON.stringify(was[key]) === JSON.stringify(next[key]) ? now[key] : next[key];
+    const merged: PhonePushSettings = {
+      enabled: field('enabled'), server: field('server'), topic: field('topic'), needsYou: field('needsYou'), failures: field('failures'),
+      finishedAfterMinutes: field('finishedAfterMinutes'), onlyWhenAway: field('onlyWhenAway'), quietHours: field('quietHours'), includeDetails: field('includeDetails')
+    };
+    return { ...merged, server: normalizeServer(merged.server) ?? merged.server.trim() };
+  };
   const pickRules = (live: string[], before: string[], next: string[]): string[] =>
     before.length === next.length && before.every((rule, index) => rule === next[index]) ? live : next;
   const capabilities = Object.fromEntries(
@@ -376,6 +439,10 @@ function mergeSettings(current: Config, base: SettingsSnapshot, wanted: Settings
       : pick(current.controlApi.allowActions, base.controlApi?.allowActions ?? false, wanted.controlApi.allowActions);
     controlApi = { enabled, allowActions: enabled && allowActions === true };
   }
+  // A form that omits the section leaves the live value alone.
+  const projects: Config['projects'] = wanted.projects
+    ? { codeCheckpoints: pick(current.projects.codeCheckpoints, base.projects?.codeCheckpoints ?? false, wanted.projects.codeCheckpoints) }
+    : current.projects;
   return {
     ...(wanted.connectorSuffix === undefined ? {} : {
       connectorSuffix: pick(current.connectorSuffix ?? '', base.connectorSuffix ?? '', wanted.connectorSuffix)
@@ -383,6 +450,7 @@ function mergeSettings(current: Config, base: SettingsSnapshot, wanted: Settings
     mcp: wanted.mcp ? { instructions: pick(current.mcp.instructions, base.mcp?.instructions ?? '', wanted.mcp.instructions),
       persistentUrls: pick(current.mcp.persistentUrls === true, base.mcp?.persistentUrls === true, wanted.mcp.persistentUrls ?? current.mcp.persistentUrls === true) } : current.mcp,
     controlApi,
+    projects,
     capabilities,
     readOnly: pick(current.readOnly, base.readOnly, wanted.readOnly),
     commandAllowlist: {
@@ -413,17 +481,34 @@ function mergeSettings(current: Config, base: SettingsSnapshot, wanted: Settings
       defaultChatReasoning: pick(current.ui.defaultChatReasoning, base.ui.defaultChatReasoning, wanted.ui.defaultChatReasoning),
       chatBrowser: pick(current.ui.chatBrowser, base.ui.chatBrowser, wanted.ui.chatBrowser),
       cosBrowserMinimize: pick(current.ui.cosBrowserMinimize, base.ui.cosBrowserMinimize, wanted.ui.cosBrowserMinimize),
+      // None saved is the default, off: a stale snapshot without the field and the form's Off are the same
+      // choice, so the live value stays (also when none is saved, so nothing reads as changed).
+      desktopAsk: (base.ui.desktopAsk ?? 'off') === (wanted.ui.desktopAsk ?? 'off') ? current.ui.desktopAsk : wanted.ui.desktopAsk,
+      // None saved is off, as in desktopAsk: a stale snapshot without the field changes nothing.
+      desktopUnattributed: (base.ui.desktopUnattributed === true) === (wanted.ui.desktopUnattributed === true)
+        ? current.ui.desktopUnattributed : wanted.ui.desktopUnattributed,
+      linuxDesktopEnabled: (base.ui.linuxDesktopEnabled === true) === (wanted.ui.linuxDesktopEnabled === true)
+        ? current.ui.linuxDesktopEnabled : wanted.ui.linuxDesktopEnabled,
       developerMode: pick(current.ui.developerMode, base.ui.developerMode, wanted.ui.developerMode),
       playfulStatus: pick(current.ui.playfulStatus, base.ui.playfulStatus, wanted.ui.playfulStatus),
       playfulContinue: pick(current.ui.playfulContinue, base.ui.playfulContinue, wanted.ui.playfulContinue),
       announceTurns: pick(current.ui.announceTurns, base.ui.announceTurns, wanted.ui.announceTurns),
       // An emptied field means the built-in phrases again.
       customContinue: pick(current.ui.customContinue, base.ui.customContinue, wanted.ui.customContinue || undefined),
+      // Unlike the Continue prompt, an emptied part is kept as '': it means "leave this part out".
+      chatPersonality: pick(current.ui.chatPersonality, base.ui.chatPersonality, wanted.ui.chatPersonality),
+      chatWritingStyle: pick(current.ui.chatWritingStyle, base.ui.chatWritingStyle, wanted.ui.chatWritingStyle),
+      // An emptied address turns the send check off.
+      sendCheckUrl: pick(current.ui.sendCheckUrl, base.ui.sendCheckUrl, wanted.ui.sendCheckUrl || undefined),
       followOutput: pick(current.ui.followOutput, base.ui.followOutput, wanted.ui.followOutput),
+      // An absent value is off: a form from before the switch sends off without an edit (CodeRabbit on #1948).
+      showMessageTimes: (base.ui.showMessageTimes === true) === (wanted.ui.showMessageTimes === true)
+        ? current.ui.showMessageTimes : wanted.ui.showMessageTimes,
       mentionCore: pick(current.ui.mentionCore, base.ui.mentionCore, wanted.ui.mentionCore),
       mentionPlugins: pick(current.ui.mentionPlugins, base.ui.mentionPlugins, wanted.ui.mentionPlugins),
       // Not part of the settings form: reported by the window and the extension, carried through.
       language: current.ui.language,
+      commitFlow: current.ui.commitFlow,
       browserPreferences: current.ui.browserPreferences,
       cosBrowserTrayHint: current.ui.cosBrowserTrayHint,
       finishTool: pick(current.ui.finishTool, base.ui.finishTool, wanted.ui.finishTool),
@@ -447,8 +532,10 @@ function mergeSettings(current: Config, base: SettingsSnapshot, wanted: Settings
       autoConnect: pick(current.ui.autoConnect, base.ui.autoConnect, wanted.ui.autoConnect),
       startAtLogin: pick(current.ui.startAtLogin, base.ui.startAtLogin, wanted.ui.startAtLogin),
       turnNotifications: pick(current.ui.turnNotifications, base.ui.turnNotifications, wanted.ui.turnNotifications),
+      sounds: pick(current.ui.sounds === true, base.ui.sounds === true, wanted.ui.sounds ?? current.ui.sounds === true),
       rotateTurnMinutes: pick(current.ui.rotateTurnMinutes, base.ui.rotateTurnMinutes, wanted.ui.rotateTurnMinutes),
-      rotateStopFallback: pick(current.ui.rotateStopFallback === true, base.ui.rotateStopFallback === true, wanted.ui.rotateStopFallback ?? current.ui.rotateStopFallback === true),
+      // On unless false (2.1.49): a missing value is the default, on.
+      rotateStopFallback: pick(current.ui.rotateStopFallback !== false, base.ui.rotateStopFallback !== false, wanted.ui.rotateStopFallback ?? current.ui.rotateStopFallback !== false),
       localAppUsage: pick(current.ui.localAppUsage, base.ui.localAppUsage, wanted.ui.localAppUsage),
       keepAwake: pick(current.ui.keepAwake, base.ui.keepAwake, wanted.ui.keepAwake),
       keepScreenAwake: pick(current.ui.keepScreenAwake, base.ui.keepScreenAwake, wanted.ui.keepScreenAwake),
@@ -457,6 +544,9 @@ function mergeSettings(current: Config, base: SettingsSnapshot, wanted: Settings
         base.ui.privacyScreenshots,
         wanted.ui.privacyScreenshots
       ),
+      phonePush: mergePhonePush(current.ui.phonePush, base.ui.phonePush, wanted.ui.phonePush),
+      // Missing means on, here as in the saved settings.
+      secretsShield: pick(current.ui.secretsShield !== false, base.ui.secretsShield !== false, wanted.ui.secretsShield ?? current.ui.secretsShield !== false),
       theme: pick(current.ui.theme, base.ui.theme, wanted.ui.theme)
     },
     sessions: {
@@ -537,6 +627,7 @@ function mergeSettings(current: Config, base: SettingsSnapshot, wanted: Settings
       loopBackend: pick(current.goal.loopBackend, base.goal.loopBackend, wanted.goal.loopBackend),
       helperModel: pick(current.goal.helperModel, base.goal.helperModel, wanted.goal.helperModel),
       helperReasoning: pick(current.goal.helperReasoning, base.goal.helperReasoning, wanted.goal.helperReasoning),
+      reviewerModel: pick(current.goal.reviewerModel, base.goal.reviewerModel, wanted.goal.reviewerModel),
       enabled: pick(current.goal.enabled, base.goal.enabled, wanted.goal.enabled),
       mode: pick(current.goal.mode, base.goal.mode, wanted.goal.mode),
       provider: {
@@ -598,6 +689,7 @@ async function buildState(): Promise<AppState> {
     hasApiKey: await hasSecret(setupApiKeySlot(config.tunnel.profileId)),
     hasGoalKey: await hasSecret('openRouterApiKey'),
     hasCustomProviderKey: await hasSecret('customProviderApiKey'),
+    hasPhonePushToken: await hasSecret('ntfyToken'),
     // After the reads above: only a read can find the file unreadable.
     credentialsUnreadable: storedSecretsUnreadable(),
     resolvedBinary: resolvedBinary(config),
@@ -611,10 +703,10 @@ async function buildState(): Promise<AppState> {
 }
 
 /** Wraps a handler so a thrown error becomes a message the UI can show. */
-function handle<T>(channel: string, fn: (payload: unknown) => Promise<T>): void {
-  ipcMain.handle(channel, async (_event, payload: unknown) => {
+function handle<T>(channel: string, fn: (payload: unknown, event: IpcMainInvokeEvent) => Promise<T>): void {
+  ipcMain.handle(channel, async (event, payload: unknown) => {
     try {
-      return { ok: true as const, data: await fn(payload) };
+      return { ok: true as const, data: await fn(payload, event) };
     } catch (err) {
       const message =
         err instanceof SandboxError || err instanceof z.ZodError
@@ -645,6 +737,14 @@ export async function openSessionChat(id: string): Promise<void> {
   // For an explicitly selected external browser, reveal its existing chat first; otherwise open
   // the conversation in that same preferred browser (never the system default by accident).
   if (!(await revealChatInBrowser(conversationId))) await openInPreferredBrowser(chatUrl(conversationId), { reveal: true });
+}
+
+/** A message the person wrote: not an automatic Continue, a Goal decision, a finish step or an opening. */
+export function personsMessage(entry: InputEntry): boolean {
+  // Who wrote it, not when it goes: a message the person queued for the finish is still theirs,
+  // while the finish's generated checkpoints carry no authored text (CodeRabbit on #1981).
+  return !entry.opening && !entry.recovery && !entry.continuedFrom && !entry.purpose && !entry.finishOwner &&
+    (entry.authoredSource ?? 'text') !== 'none';
 }
 
 export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall: () => void): void {
@@ -712,11 +812,35 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
     // `did-finish-load`, it can only happen after the renderer's first IPC request has completed
     // secure-storage availability/decryption probes and the rest of the initial state snapshot.
     logInfo('renderer state ready');
+    markStartup('renderer');
     return state;
   });
 
-  handle('settings:save', async (payload) => {
-    const request = settingsSave.parse(payload);
+  // Phone notifications: a test message now, and the optional access token (kept in secure storage).
+  handle('phonePush:test', async () => { await testPhonePush(); });
+  handle('phonePush:token', async payload => {
+    const { token } = z.object({ token: z.string().max(512) }).strict().parse(payload);
+    const trimmed = token.trim();
+    if (trimmed && !/^[\x21-\x7e]+$/.test(trimmed)) {
+      // Never the token itself.
+      logWarn('phone push: access token not saved: it has spaces or other characters a token cannot have');
+      throw new Error('An access token is letters, digits and symbols, without spaces.');
+    }
+    await setSecret('ntfyToken', trimmed);
+    logInfo(`phone push: access token ${trimmed ? 'saved' : 'removed'}`);
+    return buildState();
+  });
+  /** One settings save: the Settings form's, and a settings backup's import. */
+  /**
+   * Saves the settings and reports, apart from the state, an error that came after they were
+   * written (worker history, login item, control API). An error before the write is thrown.
+   */
+  const saveSettingsReport = async (request: z.infer<typeof settingsSave>): Promise<{ state: AppState; lateError: unknown }> => {
+    // The phone settings are checked only when this save changes them, and only while on: a damaged
+    // stored value (hand-edited, or from an older version) must not block every other save, nor the
+    // save that repairs it or switches it off.
+    const push = request.patch.ui.phonePush;
+    const phoneChanged = !!push && JSON.stringify(push) !== JSON.stringify(request.base.ui.phonePush);
     const before = getConfig();
     const next = await updateConfig(async config => {
       if (request.patch.ui.browserBridgePort !== undefined &&
@@ -725,6 +849,15 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
         throw new Error('Browser bridge port is controlled by CLF_BRIDGE_PORTS.');
       }
       const proposed = { ...config, ...mergeSettings(config, request.base, request.patch) };
+      // Checked as it will be saved: the form may be stale, and the merge keeps fields another
+      // window changed meanwhile (a cleared topic stays cleared while this save turns it on).
+      if (phoneChanged && proposed.ui.phonePush) {
+        const problem = phonePushProblem(proposed.ui.phonePush);
+        if (problem) {
+          logWarn(`settings save refused: ${problem}`);
+          throw new Error(problem);
+        }
+      }
       // If an earlier Off retirement failed, On must retry it before admission.
       if (!config.ui.finishTool && proposed.ui.finishTool) await cancelFinishInputs(false);
       else if (!config.goal.impulseMinutes && (proposed.goal.impulseMinutes ?? 0) > 0) await cancelFinishInputs(true);
@@ -740,13 +873,12 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
     void refreshAppProxy();
     setRecordingStorageLimit(next.sessions.storageLimitGiB ?? DEFAULT_RECORDING_STORAGE_GIB);
     if ((before.ui.keepAwake !== false) !== (next.ui.keepAwake !== false) || (before.ui.keepScreenAwake === true) !== (next.ui.keepScreenAwake === true)) refreshKeepAwake();
+    // Electron's own `system` source is what System (#1914) means; set first, so the shown theme is current.
     nativeTheme.themeSource = next.ui.theme;
-    if (process.platform === 'win32') getWindow()?.setTitleBarOverlay(titleBarOverlayForTheme(next.ui.theme, next.ui.appearance));
-    // BrowserWindow's native backing color is fixed at construction unless updated explicitly.
-    // Keep it in lock-step too: the default macOS application menu exposes Reload, and after a
-    // live theme switch an old opposite background otherwise flashes behind the renderer while it
-    // paints again. This is also the color Electron shows during any later renderer reload/failure.
-    getWindow()?.setBackgroundColor(windowBackgroundForTheme(next.ui.theme, next.ui.appearance));
+    // The default macOS application menu exposes Reload, and after a live theme switch an old
+    // opposite background otherwise flashes behind the renderer while it paints again. This is
+    // also the color Electron shows during any later renderer reload/failure.
+    paintWindowTheme(next.ui, getWindow());
     refreshPetOverlayAppearance();
     if (
       before.goal.enabled !== next.goal.enabled ||
@@ -777,6 +909,7 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
     // reaches automatic plugin refresh. Cosmetic saves must not invalidate discovery.
     if (before.multiAgent.enabled !== next.multiAgent.enabled || before.sessions.record !== next.sessions.record ||
         before.ui.finishTool !== next.ui.finishTool ||
+        (before.ui.linuxDesktopEnabled === true) !== (next.ui.linuxDesktopEnabled === true) ||
         JSON.stringify(effectiveCapabilities(before)) !== JSON.stringify(effectiveCapabilities(next))) forgetExposedSurface();
     // Order matters, and it used to be wrong. Pausing the run and withdrawing worker browser
     // commands has to happen while the bridge can still cancel those transports; stopping the
@@ -795,17 +928,22 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
         authorityPersistError = error instanceof Error ? error : new Error(String(error));
       }
     }
+    // The settings are written. A step after this that fails is reported, but never stops the
+    // steps after it: the app does not stay half-on, and an import is not left half done.
+    let runtimeError: unknown;
+    const step = async (run: () => unknown): Promise<void> => {
+      try { await run(); } catch (error) { runtimeError ??= error; }
+    };
     // Recording, workers and direct browser tools share the same extension transport.
     // Startup and settings saves use one eligibility rule.
-    if (browserExtensionRequired(next)) await startBridge();
-    else await stopBridge();
-    if (before.ui.chatBrowser !== next.ui.chatBrowser) await syncCosBrowser();
+    await step(() => browserExtensionRequired(next) ? startBridge() : stopBridge());
+    if (before.ui.chatBrowser !== next.ui.chatBrowser) await step(syncCosBrowser);
     if (before.capabilities.screen !== next.capabilities.screen || before.capabilities.control !== next.capabilities.control || before.readOnly !== next.readOnly) wakeBrowserWork('browser-control');
     // Permissions and the second tunnel id both decide whether the optional Desktop
     // connector should be published. Without this, enabling desktop access or pasting its
     // tunnel id left the connector unpublished until the user happened to reconnect, with
     // the card still saying "not published" and nothing explaining why.
-    await applySettings();
+    await step(applySettings);
     if (before.ui.autoRefreshPlugins !== next.ui.autoRefreshPlugins) wakeBrowserWork();
     logInfo('settings updated');
     // The config and runtime side effects above still complete so the app does not stay half-on,
@@ -829,22 +967,183 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
     // Stable connector URLs (#924): turning it on keeps the URLs running now, so nothing has to be
     // re-entered in ChatGPT; turning it off forgets them, and the next start rotates again.
     if ((before.mcp.persistentUrls === true) !== (next.mcp.persistentUrls === true)) {
-      if (next.mcp.persistentUrls === true) {
-        if (!(await rememberRunningSurfaceTokens())) logWarn('connector URLs: secure storage is unavailable, so they still change at the next start');
-        else logInfo('connector URLs: kept across restarts from now on');
-      } else {
-        await forgetSurfaceTokens();
-        logInfo('connector URLs: forgotten; the next start gives each connector a new one');
-      }
+      await step(async () => {
+        if (next.mcp.persistentUrls === true) {
+          if (!(await rememberRunningSurfaceTokens())) logWarn('connector URLs: secure storage is unavailable, so they still change at the next start');
+          else logInfo('connector URLs: kept across restarts from now on');
+        } else {
+          await forgetSurfaceTokens();
+          logInfo('connector URLs: forgotten; the next start gives each connector a new one');
+        }
+      });
     }
     // The listener reads this switch on every request, so a flip needs no restart; it is logged.
     if (before.controlApi.allowActions !== next.controlApi.allowActions) {
       logInfo('control API: actions ' + (next.controlApi.allowActions ? 'allowed' : 'refused'));
     }
-    if (authorityPersistError) throw authorityPersistError;
-    if (loginStartupError) throw loginStartupError;
-    if (controlApiError) throw controlApiError;
-    return buildState();
+    if (before.projects.codeCheckpoints !== next.projects.codeCheckpoints) {
+      logInfo('code checkpoints: ' + (next.projects.codeCheckpoints ? 'on' : 'off'));
+    }
+    // Each of these came after the settings were written; the caller decides how to report it.
+    const lateError = authorityPersistError ?? runtimeError ?? loginStartupError ?? controlApiError ?? null;
+    if (runtimeError) logWarn(`settings saved, but a later step failed: ${runtimeError instanceof Error ? runtimeError.message : String(runtimeError)}`);
+    return { state: await buildState(), lateError };
+  };
+  const saveSettings = async (request: z.infer<typeof settingsSave>): Promise<AppState> => {
+    const { state, lateError } = await saveSettingsReport(request);
+    if (lateError) throw lateError;
+    return state;
+  };
+  handle('settings:save', async payload => saveSettings(settingsSave.parse(payload)));
+
+  // Settings backup. The file is read and checked in the main process; the renderer sees only a
+  // summary and a token, and saved keys never cross to it. Errors are sentences it translates.
+  let pendingImport: { token: string; backup: ParsedBackup; changed: string[]; wider: string[] } | null = null;
+  // What importing would change, as a save really applies it: mergeSettings keeps the fields the
+  // settings form does not own, so only changes that happen are counted. The interface language
+  // is applied beside the save, since the form never edits it.
+  const importPlan = (backup: ParsedBackup) => {
+    const config = getConfig();
+    const base = pickByShape(settingsPatch, config);
+    const merged = overlaySettings(settingsPatch, base, backup.settings);
+    const typed = settingsSave.parse({ base, patch: merged });
+    const saved = pickByShape(settingsPatch, mergeSettings(config, typed.base, typed.patch));
+    const asked = z.enum(UI_LANGUAGES).safeParse((merged.ui as { language?: unknown } | undefined)?.language);
+    const language = asked.success ? asked.data : config.ui.language;
+    const result = { ...saved, ui: { ...(saved.ui as object), language } };
+    return { base, merged, language, changed: changedSettings(base, result), wider: widerAccess(base, result) };
+  };
+  handle('settings:export', async payload => {
+    const { includeKeys, passphrase } = z.object({ includeKeys: z.boolean(), passphrase: z.string().max(1024).optional() }).strict().parse(payload);
+    // Checked before the keys are read, so a short passphrase never touches secure storage.
+    if (includeKeys && !passphraseLongEnough(passphrase ?? '')) {
+      logInfo('settings backup: export refused, the passphrase is too short; nothing was read or written');
+      throw new Error('Use a passphrase of at least 8 characters.');
+    }
+    const keys = includeKeys ? await readSecretsFor(exportableSecret).catch(error => {
+      logWarn(`settings backup: saved keys could not be read: ${error instanceof Error ? error.message : String(error)}`);
+      throw new Error('The saved keys could not be read, so no backup was made. Try again, or export without them.');
+    }) : null;
+    // Its errors are sentences the renderer translates (a short passphrase).
+    const text = await buildBackup({ settings: settingsForBackup(settingsPatch, getConfig()), appVersion: app.getVersion(), now: new Date(),
+      ...(keys ? { secrets: { values: keys, passphrase: passphrase! } } : {}) });
+    const options: Electron.SaveDialogOptions = { ...dialogLabel('Export settings'),
+      defaultPath: path.join(app.getPath('documents'), `chat-on-steroids-settings-${new Date().toISOString().slice(0, 10)}.json`),
+      filters: [{ name: mainText('Settings backups'), extensions: ['json'] }] };
+    const owner = getWindow();
+    const chosen = owner && !owner.isDestroyed() ? await dialog.showSaveDialog(owner, options) : await dialog.showSaveDialog(options);
+    if (chosen.canceled || !chosen.filePath) return null;
+    // Written beside the target and renamed, so a failed write never leaves half a backup; readable
+    // by this user only, since it may hold keys.
+    const temporary = `${chosen.filePath}.${randomUUID()}.tmp`;
+    try {
+      await fs.writeFile(temporary, text, { encoding: 'utf8', mode: 0o600 });
+      await fs.rename(temporary, chosen.filePath);
+    } catch (error) {
+      await fs.rm(temporary, { force: true }).catch(() => undefined);
+      throw error;
+    }
+    const keyCount = keys ? Object.keys(keys).length : 0;
+    logInfo(`settings backup: exported ${keyCount ? `with ${keyCount} saved key${keyCount === 1 ? '' : 's'}` : 'without saved keys'}`);
+    return { file: path.basename(chosen.filePath), keyCount };
+  });
+  handle('settings:importPick', async (): Promise<SettingsBackupChoice | null> => {
+    const options: Electron.OpenDialogOptions = { ...dialogLabel('Import settings'), properties: ['openFile'],
+      filters: [{ name: mainText('Settings backups'), extensions: ['json'] }] };
+    const owner = getWindow();
+    const selected = owner && !owner.isDestroyed() ? await dialog.showOpenDialog(owner, options) : await dialog.showOpenDialog(options);
+    if (selected.canceled || !selected.filePaths[0]) return null;
+    const file = selected.filePaths[0];
+    // Size first: a large file is refused without reading it.
+    if ((await fs.stat(file)).size > 4_000_000) {
+      logInfo('settings backup: refused the chosen file (too-large), it was not read');
+      throw new BackupError('too-large', 'This file is too large to be a settings backup.');
+    }
+    let backup: ParsedBackup;
+    try { backup = readBackup(await fs.readFile(file, 'utf8')); } catch (error) {
+      if (error instanceof BackupError) logInfo(`settings backup: refused the chosen file (${error.code})`);
+      throw error;
+    }
+    // A value this version's settings do not accept (an edited file, or a value a later version
+    // dropped) refuses the whole file: importing the rest would leave a half-applied backup.
+    let plan: ReturnType<typeof importPlan>;
+    try { plan = importPlan(backup); } catch (error) {
+      if (!(error instanceof z.ZodError)) throw error;
+      logInfo(`settings backup: refused the chosen file (invalid-settings at ${error.issues[0]?.path.join('.') || 'settings'}); nothing changed`);
+      throw new BackupError('invalid-settings', 'This backup has a setting this version does not accept, so nothing was imported.');
+    }
+    const { changed, wider } = plan;
+    pendingImport = { token: randomUUID(), backup, changed, wider };
+    return {
+      token: pendingImport.token, file: path.basename(file), appVersion: backup.appVersion, exportedAt: backup.exportedAt,
+      changed, wider, keyCount: backup.secretCount
+    };
+  });
+  handle('settings:importApply', async payload => {
+    const { token, includeKeys, passphrase } = z.object({ token: z.string().uuid(), includeKeys: z.boolean(), passphrase: z.string().max(1024).optional() }).strict().parse(payload);
+    if (!pendingImport || pendingImport.token !== token) {
+      logInfo('settings backup: import refused, its choice is gone or was already used; nothing changed');
+      throw new Error('Choose the backup file again.');
+    }
+    const { backup } = pendingImport;
+    // Keys open first: a wrong passphrase changes nothing, and the dialog can ask again.
+    let keys: Record<string, string> = {};
+    if (includeKeys && backup.secrets) {
+      try { keys = await openSecrets(backup.secrets, passphrase ?? ''); } catch (error) {
+        logInfo('settings backup: import refused, the passphrase did not open the saved keys; nothing changed');
+        throw error;
+      }
+    }
+    // Against the settings as they are now. If they changed since the file was chosen (a save still
+    // on its way, another window), the person confirmed a different import: it is refused, so more
+    // access is never granted without the warning the preview showed.
+    const { base, merged, language, changed, wider } = importPlan(backup);
+    if (JSON.stringify(changed) !== JSON.stringify(pendingImport.changed) || JSON.stringify(wider) !== JSON.stringify(pendingImport.wider)) {
+      pendingImport = null;
+      logInfo('settings backup: import refused, the settings changed after the file was chosen; nothing changed');
+      throw new Error('Your settings changed after the file was chosen. Choose it again.');
+    }
+    // Checked before anything changes, so a computer without secure storage gets a clear refusal
+    // rather than its settings changed and its keys missing.
+    if (Object.keys(keys).length && !(await isEncryptionAvailable())) {
+      logInfo('settings backup: import refused, secure storage is not available for the saved keys; nothing changed');
+      throw new Error('Secure storage is not available on this computer, so the saved keys cannot be imported. Import without them.');
+    }
+    // An unreadable key store would refuse the key write after the settings changed: refused first.
+    if (Object.keys(keys).length && storedSecretsUnreadable()) {
+      logInfo('settings backup: import refused, the saved keys on this computer cannot be read; nothing changed');
+      throw new Error('The saved keys on this computer cannot be read, so the backup\'s keys cannot be added. Import without them.');
+    }
+    // A save can fail after it wrote the settings (login registration, the control API, worker
+    // history): it finishes its own work and then reports. The import does the same, so the
+    // language and keys are not left out of a backup whose settings already changed.
+    // Said after "Imported", each a sentence the renderer translates on its own.
+    const warnings: string[] = [];
+    if (changed.length) {
+      // This save's own report, never an inference from the config: another window's save may land meanwhile.
+      const { lateError } = await saveSettingsReport(settingsSave.parse({ base, patch: merged }));
+      if (lateError) {
+        const message = lateError instanceof Error ? lateError.message : String(lateError);
+        warnings.push(message);
+        logWarn(`settings backup: the settings were saved, but a later step of the save failed (${message}); the import goes on`);
+      }
+    }
+    if (language !== getConfig().ui.language) await updateConfig(config => ({ ...config, ui: { ...config.ui, language } }));
+    // The settings are written by now: a key write that still fails is reported, never as a failed
+    // import, and never by undoing settings (an undo that fails halfway would be worse).
+    let keysFailed = false;
+    if (Object.keys(keys).length) {
+      try { await setSecrets(keys as Partial<Record<SecretKey, string>>); } catch (error) {
+        keysFailed = true;
+        logWarn(`settings backup: the settings were imported, but the saved keys could not be stored (${error instanceof Error ? error.message : String(error)})`);
+        warnings.push('The settings were imported, but the saved keys could not be stored. Add them again in Settings.');
+      }
+    }
+    pendingImport = null;
+    const keyCount = keysFailed ? 0 : Object.keys(keys).length;
+    logInfo(`settings backup: imported ${changed.length} changed setting${changed.length === 1 ? '' : 's'}` +
+      `${keyCount ? ` and ${keyCount} saved key${keyCount === 1 ? '' : 's'}` : ''}${backup.appVersion ? ` from a ${backup.appVersion} backup` : ''}`);
+    return { state: await buildState(), changedCount: changed.length, keyCount, ...(warnings.length ? { warnings } : {}) };
   });
 
   /** Approves one folder by path. The picker dialog and the drop zone both end here. */
@@ -885,6 +1184,16 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
     if (turnOn) wakeBrowserWork();
     return buildState();
   });
+  // #1864 (Haz's keyboard condition): the desktop question also waits in the app's window, answered there.
+  handle('desktopAsk:pending', async () => currentDesktopAsk());
+  handle('desktopAsk:answer', async (payload) => {
+    const { id, choice } = z.object({ id: z.string().min(1).max(64), choice: z.enum(['go', 'not-now']) }).parse(payload);
+    return answerDesktopAsk(id, choice);
+  });
+  handle('ui:tourDone', async () => {
+    // #1833: only ever set; Settings replays the tour without asking main to offer it again.
+    if (getConfig().ui.tourDone !== true) await updateConfig(config => ({ ...config, ui: { ...config.ui, tourDone: true } }));
+  });
   handle('ui:whatsNewSeen', async () => {
     // Only this version can be recorded; the renderer cannot write another one (#1172).
     if (getConfig().ui.lastSeenVersion !== APP_VERSION) await updateConfig(config => ({ ...config, ui: { ...config.ui, lastSeenVersion: APP_VERSION } }));
@@ -919,6 +1228,17 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
     const { sessionId, groupId: target } = z.object({ sessionId: sessionIdArg.shape.id, groupId: groupId.nullable() }).strict().parse(payload);
     const session = await getSession(sessionId);
     return assignChatGroup(session ? { id: session.id, projectId: session.projectId ?? null, origin: session.origin ?? null } : null, target);
+  });
+  // Move to project (#1919): the chat, its sub-agents and its group place change; nothing it does.
+  handle('sessions:moveProject', async payload => {
+    const { sessionId, projectId, groupId: target } = z.object({ sessionId: sessionIdArg.shape.id,
+      projectId: z.string().min(1).max(160).nullable(), groupId: groupId.nullable().optional() }).strict().parse(payload);
+    const { from, fromGroup, moved, groups } = await moveChatWithGroup(sessionId, projectId, target);
+    // The moved chats' own summaries: a row from older history is not on the newest page the
+    // sidebar rereads, and a move does not change its place in the list (CodeRabbit on #1965).
+    const summaries = (await Promise.all([...new Set([sessionId, ...moved])].map(id => getSession(id))))
+      .filter((summary): summary is NonNullable<typeof summary> => !!summary);
+    return { from, fromGroup, groups, summaries };
   });
   handle('pets:list', async () => petLibraryState());
   handle('pets:overlayState', async () => petOverlayControlState());
@@ -1011,7 +1331,8 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
     push('session:changed');
     return project;
   });
-  handle('projects:add', async () => {
+  handle('projects:add', async (payload) => {
+    const { chatgpt } = z.object({ chatgpt: z.literal('later').optional() }).strict().parse(payload ?? {});
     const window = getWindow();
     if (!window) throw new Error('No window');
     const result = await dialog.showOpenDialog(window, { ...dialogLabel('Choose a project folder for ChatGPT'), properties: ['openDirectory'] });
@@ -1023,7 +1344,7 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
       const state = await approveRoot(folder);
       push('state:changed', state);
     }
-    const project = await addProject(folder);
+    const project = await addProject(folder, chatgpt ? { chatgpt } : {});
     push('session:changed');
     // Its native ChatGPT Project is created by the browser; tell it there is work.
     if (project.chatgpt?.state === 'requested') wakeBrowserWork();
@@ -1031,9 +1352,9 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
   });
   // A folder on a server (#1469): the address and folder as typed; the server is asked once.
   handle('projects:addRemote', async payload => {
-    const { address, folder } = (payload ?? {}) as { address?: unknown; folder?: unknown };
+    const { address, folder, chatgpt } = (payload ?? {}) as { address?: unknown; folder?: unknown; chatgpt?: unknown };
     if (typeof address !== 'string' || typeof folder !== 'string' || address.length > 300 || folder.length > 4096) throw new Error('Enter an SSH address and a folder');
-    const project = await addRemoteProject(address, folder);
+    const project = await addRemoteProject(address, folder, {}, chatgpt === 'later' ? { chatgpt: 'later' } : {});
     push('session:changed');
     if (project.chatgpt?.state === 'requested') wakeBrowserWork();
     return project;
@@ -1044,6 +1365,78 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
     if (project) wakeBrowserWork();
     push('session:changed');
     return project;
+  });
+  // #1826: a chat's schedule. Its rules and checks live in scheduled-runs.ts; errors are sentences the renderer translates.
+  const scheduleSession = z.string().min(8).max(64);
+  handle('schedules:get', async payload => {
+    const { sessionId } = z.object({ sessionId: scheduleSession }).strict().parse(payload);
+    return (await listSchedules()).find(row => row.sessionId === sessionId) ?? null;
+  });
+  handle('schedules:save', async payload => {
+    const request = z.object({ sessionId: scheduleSession, text: z.string().max(200_000), repeat: z.unknown(), until: z.number().int().nonnegative().nullable(),
+      catchUp: z.boolean().optional() }).strict().parse(payload);
+    const repeat = scheduleRepeatSchema.parse(request.repeat);
+    if (!(await getSession(request.sessionId))) throw new Error('This chat no longer exists.');
+    const saved = await saveSchedule({ sessionId: request.sessionId, text: request.text, repeat, until: request.until, catchUp: request.catchUp === true });
+    logInfo(`scheduled run: schedule saved (${repeat.kind}) for ${request.sessionId}`);
+    push('session:changed');
+    return saved;
+  });
+  handle('schedules:pause', async payload => {
+    const { sessionId, paused } = z.object({ sessionId: scheduleSession, paused: z.boolean() }).strict().parse(payload);
+    const updated = await setSchedulePaused(sessionId, paused);
+    if (updated) logInfo(`scheduled run: ${paused ? 'paused' : 'resumed'} for ${sessionId}`);
+    push('session:changed');
+    return updated;
+  });
+  handle('schedules:delete', async payload => {
+    const { sessionId } = z.object({ sessionId: scheduleSession }).strict().parse(payload);
+    const removed = await deleteSchedule(sessionId);
+    if (removed) logInfo(`scheduled run: schedule removed for ${sessionId}`);
+    push('session:changed');
+    return removed;
+  });
+  // Linking a project to a ChatGPT Project the account already has (#1756).
+  handle('projects:chatgpt-choices', async () => chatgptProjectChoices());
+  handle('projects:chatgpt-link', async payload => {
+    const { id, chatgptId } = z.object({ id: z.string().uuid(), chatgptId: z.string().regex(CHATGPT_PROJECT_ID) }).strict().parse(payload);
+    const project = await linkChatgptProject(id, chatgptId);
+    push('session:changed');
+    return project;
+  });
+  handle('projects:chatgpt-create', async payload => {
+    const { id, replace } = z.object({ id: z.string().uuid(), replace: z.boolean().optional() }).strict().parse(payload);
+    const project = await createChatgptProjectFor(id, { replace: replace === true });
+    if (project.chatgpt?.state === 'requested') wakeBrowserWork();
+    push('session:changed');
+    return project;
+  });
+  // Unlinking leaves the ChatGPT Project and its chats in ChatGPT; the project's new chats start outside it.
+  handle('projects:chatgpt-unlink', async payload => {
+    const { id } = z.object({ id: z.string().uuid() }).strict().parse(payload);
+    const project = await unlinkChatgptProject(id);
+    push('session:changed');
+    return project;
+  });
+  handle('projects:secrets-shield', async payload => {
+    const { id, off } = z.object({ id: z.string().uuid(), off: z.boolean() }).strict().parse(payload);
+    const project = await setProjectSecretsShieldOff(id, off);
+    logInfo(`secrets shield: turned ${off ? 'off' : 'back on'} for a project's chats`);
+    push('session:changed');
+    return project;
+  });
+  // Related folders (#1689): context for a project's chats, chosen from approved folders only.
+  handle('projects:related', async payload => {
+    const { id } = z.object({ id: z.string().uuid() }).strict().parse(payload);
+    const project = (await listProjects()).find(row => row.id === id);
+    if (!project) throw new Error('Project not found');
+    return relatedFolderViews(project);
+  });
+  handle('projects:related-set', async payload => {
+    const { id, folders } = z.object({ id: z.string().uuid(), folders: z.array(z.string().min(1).max(32768)).max(40) }).strict().parse(payload);
+    const project = await setRelatedFolders(id, folders);
+    push('session:changed');
+    return relatedFolderViews(project);
   });
   handle('projects:color', async payload => {
     const { id, color } = z.object({ id: z.string().uuid(), color: z.enum(PROJECT_COLORS).nullable() }).strict().parse(payload);
@@ -1125,10 +1518,104 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
       baseRef: z.string().min(1).max(256).optional() }).strict().parse(payload);
     return readProjectGitSnapshot(projectId, baseRef);
   });
+  // Commit & PR from Review. Each step is its own call, so the dialog can stop after any of them.
+  handle('projectCommit:state', async payload => {
+    const { projectId } = z.object({ projectId: projectFileId }).strict().parse(payload);
+    return readCommitState(projectId);
+  });
+  // A changed file's path as Review listed it: relative, and never leaving the project.
+  const commitPath = projectRelativePath.min(1).refine(file => !/^(?:[\\/]|[A-Za-z]:)/.test(file) && !file.split(/[\\/]/).includes('..'),
+    'A path must stay inside the project.');
+  handle('projectCommit:commit', async payload => {
+    const request = z.object({ projectId: projectFileId, message: z.string().max(10_000), paths: z.array(commitPath).max(2_000),
+      newBranch: z.string().min(1).max(200).optional(), expectedToken: z.string().length(64).regex(/^[0-9a-f]+$/) }).strict().parse(payload);
+    return commitProjectChanges(request.projectId, request);
+  });
+  handle('projectCommit:push', async payload => {
+    const { projectId } = z.object({ projectId: projectFileId }).strict().parse(payload);
+    return pushProject(projectId);
+  });
+  handle('projectCommit:pullRequest', async payload => {
+    const { projectId, title, body } = z.object({ projectId: projectFileId, title: z.string().max(1_000), body: z.string().max(10_000) }).strict().parse(payload);
+    const result = await createPullRequest(projectId, { title, body });
+    // Without gh, GitHub's own page opens filled in; the person creates the pull request there.
+    if (result.via === 'browser') await shell.openExternal(result.url);
+    return result;
+  });
+  handle('projectCommit:flow', async payload => {
+    const { flow } = z.object({ flow: z.enum(['commit', 'ask-push', 'pr']) }).strict().parse(payload);
+    if (getConfig().ui.commitFlow !== flow) {
+      await updateConfig(config => ({ ...config, ui: { ...config.ui, commitFlow: flow } }));
+      // The dialog reads the choice from the window's copy of the state; it must not open with the old one.
+      push('state:changed', await buildState());
+    }
+    return true;
+  });
   handle('projectGit:diff', async payload => {
     const { projectId, path, baseRef, expectedRevision } = z.object({ projectId: projectFileId, path: projectRelativePath.min(1),
       baseRef: z.string().min(1).max(256).optional(), expectedRevision: z.string().length(64).regex(/^[0-9a-f]+$/).optional() }).strict().parse(payload);
     return readProjectGitDiff(projectId, path, baseRef, expectedRevision);
+  });
+  // #1827: what one answer changed, per file, read from the turn's start on.
+  const turnChangesRequest = z.object({ sessionId: z.string().min(8).max(64).regex(/^[0-9a-z-]+$/i), turnId: z.string().min(1).max(256),
+    from: z.number().int().nonnegative() });
+  // Read once for a turn's card and each of its files' diffs, not once per request; any change to
+  // the chat reads it again, since a turn can still gain an edit.
+  const turnEditsRead = new Map<string, Promise<ReturnType<typeof turnFileEdits>>>();
+  onSessionChange(change => {
+    for (const key of [...turnEditsRead.keys()])
+      if (!change.sessionIds || change.sessionIds.some(id => key.startsWith(`${id}\0`))) turnEditsRead.delete(key);
+  });
+  const turnEdits = (request: z.infer<typeof turnChangesRequest>) => {
+    const key = `${request.sessionId}\0${request.turnId}\0${request.from}`;
+    let read = turnEditsRead.get(key);
+    if (!read) {
+      read = readEvents(request.sessionId, { from: request.from, kinds: ['tool_call'] }).then(events => turnFileEdits(events, request.turnId));
+      turnEditsRead.set(key, read);
+      read.catch(() => turnEditsRead.delete(key));
+      if (turnEditsRead.size > 64) turnEditsRead.delete(turnEditsRead.keys().next().value!);
+    }
+    return read;
+  };
+  /** A malformed request is refused with one fixed log line, never its paths or ids. */
+  const turnRequest = <T extends z.ZodTypeAny>(channel: string, schema: T, payload: unknown): z.infer<T> => {
+    const parsed = schema.safeParse(payload);
+    if (parsed.success) return parsed.data;
+    logWarn(`ipc: ${channel} refused: invalid_payload`);
+    throw new Error('The request was not valid.');
+  };
+  const reviewOf = (sessionId: string) => (at: EditAt) => at.assetId ? readEditReviewAsset(sessionId, at.assetId) : Promise.resolve(null);
+  handle('sessions:turnChanges', async payload => {
+    const request = turnRequest('sessions:turnChanges', turnChangesRequest.strict(), payload);
+    const files = await turnEdits(request);
+    return { changes: await netTurnChanges(files, reviewOf(request.sessionId)), total: files.length };
+  });
+  handle('sessions:turnFileDiff', async payload => {
+    const request = turnRequest('sessions:turnFileDiff', turnChangesRequest.extend({ path: z.string().min(1).max(4096) }).strict(), payload);
+    return netTurnFileDiff(await turnEdits(request), request.path, reviewOf(request.sessionId));
+  });
+  handle('checkpoints:restore', async payload => {
+    const { projectId, checkpointId, paths, expectedRevision } = z.object({ projectId: projectFileId,
+      checkpointId: z.string().regex(/^[0-9a-f]{32}$/), paths: z.array(projectRelativePath.min(1)).min(1).max(256).nullable(),
+      expectedRevision: z.string().length(64).regex(/^[0-9a-f]+$/) }).strict().parse(payload);
+    // Approval comes from this trusted dialog, never from a renderer boolean; the default keeps the files.
+    return restoreCheckpoint(projectId, checkpointId, paths, expectedRevision, async selected => {
+      const shown = selected.slice(0, 25).map(name => `  - ${name.replace(/[\x00-\x1f\x7f]/g, '?').slice(0, 180)}`);
+      const { response } = await dialog.showMessageBox({
+        type: 'warning',
+        title: mainText('Restore files from this checkpoint?'),
+        message: mainText('Restore files from this checkpoint?'),
+        detail: [
+          mainText('Files return to their checkpoint version; files added since are removed. Current files are saved first, so you can undo this in Review.'),
+          '', ...shown, ...(selected.length > shown.length ? [mainText('More files are not shown.')] : [])
+        ].join('\n'),
+        buttons: [mainText('Keep current files'), mainText('Restore files')],
+        defaultId: 0,
+        cancelId: 0,
+        noLink: true
+      });
+      return response === 1;
+    });
   });
   handle('sessions:toolEditReview', async payload => {
     const { sessionId, callId, changeIndex } = z.object({
@@ -1264,6 +1751,22 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
   handle('diagnostics:run', async () => runDiagnostics());
   // "Save diagnostics report": one plain-text file for a bug report, personal details removed
   // (see diagnostics-report.ts). Revealed after saving so the user reads what they would share.
+  // In-app feedback: GitHub's issue form, filled in, opens in the browser. The person reads it and
+  // submits it there; the app sends nothing itself. The diagnostics report is saved separately.
+  handle('feedback:openIssue', async (payload) => {
+    const text = (max: number) => z.string().max(max);
+    const report = z.object({ kind: z.literal('bug'), what: text(4000).refine(value => value.trim().length > 0), steps: text(4000).optional(),
+      frequency: z.enum(['Every time', 'Sometimes', 'It happened once']).optional() }).strict().parse(payload);
+    const bridge = await bridgeStatus();
+    const { url, trimmed } = feedbackIssueUrl(report, {
+      version: app.getVersion(), os: operatingSystemName(process.platform, systemVersion()), arch: process.arch,
+      extension: bridge.paired || bridge.extensionVersion ? { present: bridge.present, version: bridge.extensionVersion } : null
+    });
+    await shell.openExternal(url);
+    logInfo(`feedback: opened GitHub's ${report.kind === 'bug' ? 'bug report' : 'feature request'} form, filled in${trimmed ? ' (text shortened to fit the link)' : ''}`);
+    return { trimmed };
+  });
+
   handle('diagnostics:saveReport', async () => {
     const selfTest = await Promise.race([
       runDiagnostics().catch(() => null),
@@ -1294,6 +1797,36 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
   handle('desktop:requestAccessibility', async () => {
     await refreshMacOSDesktopAccess({ promptAccessibility: true });
     return buildState();
+  });
+  // A user action inside the focused main window is necessary for GNOME's Screenshot
+  // portal to display its consent dialog. Never synthesize a grant or send image bytes
+  // to the renderer. This is a diagnostic probe, not a general-purpose screen IPC.
+  let linuxScreenshotConsentPending = false;
+  handle('desktop:linuxScreenshotConsent', async (_payload, event) => {
+    // A different renderer must not borrow the main window's foreground state
+    // to trigger an operating-system access dialog.
+    const window = getWindow();
+    if (!window || window.isDestroyed() || event.sender !== window.webContents) {
+      logInfo('linux screenshot consent: refused because the request was not from the main window');
+      throw new Error('Screenshot permission can be requested only from the Chat On Steroids main window.');
+    }
+    if (linuxScreenshotConsentPending) {
+      logInfo('linux screenshot consent: refused because another request is already running');
+      throw new Error('A screenshot permission request is already running.');
+    }
+    linuxScreenshotConsentPending = true;
+    try {
+      return await testLinuxScreenshotConsent({
+        focused: () => {
+          const window = getWindow();
+          return !!window && !window.isDestroyed() && window.isFocused();
+        },
+        enabled: () => getConfig().ui.linuxDesktopEnabled === true,
+        screenAllowed: () => effectiveCapabilities(getConfig()).screen === true
+      });
+    } finally {
+      linuxScreenshotConsentPending = false;
+    }
   });
   // A grant from an earlier build no longer applies, yet System Settings shows it on: reset this
   // app's own entries and ask again, so macOS files the grant under the build running now.
@@ -1327,7 +1860,8 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
   });
 
   // Copy or save a completed turn's answer, or the session transcript, as Markdown. Main reads
-  // the full text of answers that were cut in the log, so neither comes out truncated.
+  // the full text of answers that were cut in the log, so neither comes out truncated. A whole
+  // chat as a web page goes through sessions:sharePage, which previews it first.
   handle('sessions:exportMarkdown', async (payload) => {
     const request = z.object({
       id: z.string().min(8).max(64).regex(/^[0-9a-z-]+$/i),
@@ -1337,6 +1871,17 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
       target: z.enum(['clipboard', 'file'])
     }).parse(payload);
     return exportSessionMarkdown(request, getWindow());
+  });
+
+  // Share a chat as one web page: the dialog previews exactly what Save writes, with or without
+  // the details the person chose to hide.
+  handle('sessions:sharePage', async (payload) => {
+    const id = z.string().min(8).max(64).regex(/^[0-9a-z-]+$/i);
+    const request = z.discriminatedUnion('target', [
+      z.object({ id, target: z.literal('preview'), hide: z.boolean(), lang: z.string().max(35).regex(/^[a-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$/) }),
+      z.object({ id, target: z.literal('file'), preview: z.string().uuid() })
+    ]).parse(payload);
+    return exportSessionPage(request, getWindow());
   });
 
   // The Install button. The renderer decides nothing about what is installed - it cannot
@@ -1487,8 +2032,28 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
     return (await stageFiles([{ text }]))[0]!;
   });
   handle('sessions:stopTurn', async payload => {
-    const { id, expectedTurnId } = sessionIdArg.extend({ expectedTurnId: z.string().min(1).max(256) }).parse(payload);
-    return stopSessionTurn(id, expectedTurnId);
+    const { id, expectedTurnId, expectedConversationId } = sessionIdArg.extend({ expectedTurnId: z.string().min(1).max(256),
+      expectedConversationId: z.string().min(1).max(256).optional() }).parse(payload);
+    // The chat and its Goal or Loop as Stop found them, before any of it changes. The window names the
+    // chat it showed Stop for: a Compact & Resume that moved the session since is not that chat (CodeRabbit on #2066).
+    const found = await sessionControlsFor(id).catch(() => null);
+    // A failed read is no licence to act on whatever chat the session shows now: the named chat still binds,
+    // and Goal or Loop that could not be read is not counted as stopped (CodeRabbit on #2066).
+    const before = found ? { ...found, conversationId: expectedConversationId ?? found.conversationId }
+      : expectedConversationId ? { conversationId: expectedConversationId, automation: 'off' as const } : null;
+    try {
+      return await stopSessionTurn(id, expectedTurnId);
+    } catch (error) {
+      if (!(error instanceof Error) || error.message !== 'active_turn_changed') throw error;
+      // The answer Stop showed for is no longer running: the app's own work still stops (Haz on #1883),
+      // and the person reads what happened, not an error code.
+      const outcome = await endOwnWorkAfterStop(id, expectedTurnId, before);
+      throw new Error(outcome.resumeGoesOn
+        ? 'That answer had already ended, so ChatGPT was not asked to stop. Compact & Resume was already moving this chat and goes on.'
+        : outcome.ended
+          ? "That answer had already ended, so ChatGPT was not asked to stop. This chat's automatic work is stopped."
+          : 'That answer had already ended; there was nothing to stop.');
+    }
   });
   handle('sessions:releaseFinish', async (payload) => {
     const { id, expectedTurnId } = sessionIdArg.extend({ expectedTurnId: z.string().min(1).max(256) }).parse(payload);
@@ -1506,6 +2071,11 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
   handle('sessions:controls', async (payload) => sessionControlsFor(sessionIdArg.parse(payload).id));
   // #1032: the user keeps this answer from being reloaded; false once the browser claimed it.
   handle('sessions:cancelRecovery', async (payload) => cancelAssistantRecovery(sessionIdArg.parse(payload).id));
+  // A chat whose next step was not picked up: the person's one click (2026-10-31).
+  handle('sessions:pickupNow', async (payload) => {
+    const args = z.object({ id: z.string().min(1).max(200), next: z.enum(['queue', 'goal', 'loop', 'continue']), stoppedAt: z.number().finite() }).parse(payload);
+    return pickupNow(args.id, { next: args.next, stoppedAt: args.stoppedAt });
+  });
   handle('sessions:automation', async (payload) => {
     const { id, automation, afterTurn } = sessionIdArg.extend({ automation: z.enum(['off', 'goal', 'loop']), afterTurn: z.boolean().optional() }).parse(payload);
     return setSessionAutomation(id, automation, afterTurn);
@@ -2041,6 +2611,7 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
     target.webContents.send(channel, ...args);
   };
   configureInputDelivery({
+    pickupContext: () => browserPickupContext(),
     recoveryAllowed: recoveryInputAllowed,
     callsHoldRecovery: recoveryHeldByCalls,
     activity: sessionInputActivity,
@@ -2069,7 +2640,12 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
       });
     },
     changed: () => push('session:changed'),
-    recordDelivered: (entry, anchorCommitted) => getConfig().sessions.record ? recordDeliveredInput(entry, anchorCommitted) : Promise.resolve(true),
+    recordDelivered: async (entry, anchorCommitted) => {
+      // The message that named a moved chat's folder went out: no other one repeats it (#1919).
+      if (entry.sessionId && personsMessage(entry) && (await getSession(entry.sessionId))?.projectNotePending)
+        await clearProjectNote(entry.sessionId).catch(error => logWarn(`projects: could not mark the folder note sent for ${entry.sessionId}: ${String(error)}`));
+      return getConfig().sessions.record ? recordDeliveredInput(entry, anchorCommitted) : true;
+    },
     prepareText: async (entry, limits, authored) => {
       const control = entry.conversationId ? goalSwitchFor(entry.conversationId) : getConfig().goal;
       const mode = entry.automation ?? (control.enabled ? control.mode : 'off');
@@ -2080,7 +2656,9 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
       // An edit of a chat's first question (#365) replaces the message that carried its setup.
       return ((entry.opening || !entry.sessionId) && !entry.conversationId && !entry.finishOwner && entry.mode !== 'finish') || entry.editFramed
         ? prepareSessionPrompt(text, entry, limits, authored)
-        : !entry.finishOwner && entry.purpose !== 'decision' ? prepareSkillFollowup(text, authored, limits, entry) : text;
+        : !entry.finishOwner && entry.purpose !== 'decision'
+          ? prepareSkillFollowup(text, authored, limits, entry, personsMessage(entry) && !!entry.sessionId && (await getSession(entry.sessionId))?.projectNotePending === true)
+          : text;
     },
     applyAutomation: async (conversationId, automation, phase, objective, loopAfterTurn) => {
       // This message supersedes the old final; never pick that old final up merely
@@ -2153,4 +2731,5 @@ export function registerIpc(getWindow: () => BrowserWindow | null, quitToInstall
   onSessionChange(change => push('session:changed', change));
   onBackgroundExecChange(() => push('sessions:backgroundExecChanged'));
   onSwarmChange(() => push('swarm:changed', swarmState()));
+  mirrorDesktopAsk(pending => push('desktopAsk:pending', pending));
 }

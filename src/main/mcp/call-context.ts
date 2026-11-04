@@ -44,6 +44,8 @@ export interface CallEvidence {
  * recorder writes down on purpose.
  */
 export interface CallCaller {
+  /** Native request anchoring a host conversation-metadata proof, when used. */
+  providerSessionAnchor?: string;
   transportKey: string | null;
   /**
    * Local Setup profile that owns the MCP endpoint generation which accepted this call.
@@ -76,6 +78,8 @@ export interface CallCaller {
 }
 
 export interface CallContext {
+  /** Presentation witness captured at admission; never consumed by caller/permission routing. */
+  recordingContext?: import('../session/recorder.js').RecordingContext | null;
   /** Result publication belongs to the transport, not to the generation-wide request ID. */
   publication?: OutputPublication;
   /** Wall-clock start of this MCP request, shared by identity-sensitive handlers. */

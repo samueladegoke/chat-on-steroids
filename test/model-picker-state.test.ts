@@ -90,7 +90,7 @@ function fixture(versionCaption = '', closeDelay: number | null = 0) {
     if (closeDelay) win.setTimeout(close, closeDelay); else close();
   });
   win.eval(fiberSource); win.eval(domSource);
-  return { api: (win as any).CLF_DOM, state, props, selections, actions, freeze: () => { frozen = true; } };
+  return { api: (win as any).CLF_DOM, state, props, selections, versions, actions, freeze: () => { frozen = true; } };
 }
 it('confirms the exact selected pair without moving through other model versions', async () => {
   const f = fixture('', 30);
@@ -176,6 +176,14 @@ it.each([['xhigh', 11], ['medium', 10]] as const)('selects the nearest offered e
   const f = fixture('', 0);
   expect(await f.api.selectModelSettings('future-model', effort), `${effort} refused instead of rounded`).toBe(true);
   expect(f.state.currentBucket).toBe(bucket);
+});
+// CodeRabbit on #1972: an effort-only request (a wake keeps the chat's model) never moves to another
+// model that happens to offer that effort; it rounds within the current model.
+it('keeps an effort-only request on the current model', async () => {
+  const f = fixture('', 0);
+  expect(await f.api.selectModelSettings(null, 'ultra')).toBe(true);
+  expect(f.state.selectedVersionEntry.id).toBe('latest');
+  expect(f.state.currentSelection.modelSlug).toBe('gpt-5-6-thinking');
 });
 it('still refuses a model the account does not offer, whatever the effort', async () => {
   const f = fixture('', 0);
@@ -610,4 +618,45 @@ it('retains the Chat max-to-xhigh mapping without a Work owner flag', async () =
   f.state.currentSelection.thinkingEffort = 'max';
   expect(await f.api.selectModelSettings('gpt-5-6-thinking', 'xhigh')).toBe(true);
   expect(f.state.currentSelection.thinkingEffort).toBe('max');
+});
+
+// #1905: ChatGPT's unified picker lists every model in an existing chat; one entry the reader did not
+// accept (a colon in a version id, a Work lane with an effort it has no word for, more than twelve
+// choices) made the whole picker unreadable, and every send into an existing chat failed.
+it('confirms the selected pair when the picker also lists models it cannot read (#1905)', async () => {
+  const f = fixture();
+  f.versions.push({ id: 'gpt-6-pro:', displayTextForIntelligence: 'Pro', enabled: true }, { id: 'work:agent', displayTextForIntelligence: 'Agent', enabled: true });
+  const extra = (bucket: number, modelSlug: string, thinkingEffort: string) => ({ bucket, modelSlug, thinkingEffort, availability: { status: 'available' },
+    category: { modelLane: 'thinking', shortLabel: `Model ${bucket}` } });
+  f.state.bucketSelections = [...f.state.bucketSelections, extra(4, 'gpt-6-work', 'auto'),
+    ...Array.from({ length: 10 }, (_, i) => extra(20 + i, `other-model-${i}`, 'standard'))] as never;
+  expect(await f.api.selectModelSettings('gpt-5-6-thinking', 'high')).toBe(true);
+});
+
+// CodeRabbit on #1907: a lane the reader skips still sits on ChatGPT's slider. Between two lanes it
+// can read, one arrow key lands on it, so the steps follow the slider's own order, both ways.
+it('steps over a lane it cannot read on the way to the chosen one (#1905)', async () => {
+  const f = fixture();
+  const lanes = f.selections[0] as any[];
+  const skipped = { bucket: 5, modelSlug: 'gpt-5-6-thinking', thinkingEffort: 'auto', availability: { status: 'available' }, category: { modelLane: 'thinking', shortLabel: '5.6 Sol' } };
+  lanes.splice(1, 0, skipped);
+  Object.assign(f.state, { currentBucket: 1, currentSelection: lanes[0] });
+  expect(await f.api.selectModelSettings('gpt-5-6-thinking', 'high')).toBe(true);
+  expect(f.state.currentBucket).toBe(2);
+  expect(await f.api.selectModelSettings('gpt-5-6-thinking', 'medium')).toBe(true);
+  expect(f.state.currentBucket).toBe(1);
+});
+
+// CodeRabbit on #1907: the September reader and the content side share the same limit.
+it('confirms a picker of exactly 48 versions or lanes and refuses one of 49 (#1905)', async () => {
+  for (const [count, readable] of [[48, true], [49, false]] as const) {
+    for (const part of ['versions', 'lanes'] as const) {
+      const f = fixture();
+      const lanes = f.selections[0] as any[];
+      while (part === 'versions' && f.versions.length < count) f.versions.push({ id: `extra-${f.versions.length}`, displayTextForIntelligence: `Extra ${f.versions.length}`, enabled: true });
+      while (part === 'lanes' && lanes.length < count) lanes.push({ bucket: 100 + lanes.length, modelSlug: `other-${lanes.length}`, thinkingEffort: 'standard',
+        availability: { status: 'available' }, category: { modelLane: 'thinking', shortLabel: `Other ${lanes.length}` } });
+      expect(await f.api.selectModelSettings('gpt-5-6-thinking', 'high'), `${count} ${part}`).toBe(readable);
+    }
+  }
 });

@@ -13,12 +13,23 @@ export interface LocalProject {
   createdAt: number;
   /** Removed sidebar group; existing conversations and queued work retain their folder. */
   ungrouped?: boolean;
+  /** The secrets shield is off for this project's chats (on everywhere else, unless off in Settings). */
+  secretsShieldOff?: boolean;
   /**
    * The native ChatGPT Project this CoS project's new chats open in. Only projects created after
    * this existed have one; it grants no filesystem permission.
    */
   chatgpt?: ChatgptProjectLink;
+  /**
+   * Related folders (#1689): other approved folders this work also uses, by their approved folder's
+   * path. Context for ChatGPT only: they never change the working directory and grant no access.
+   */
+  relatedFolders?: string[];
 }
+
+/** A related folder as the dialog shows it; unavailable ones are left out of what ChatGPT is told. */
+export interface RelatedFolderView { path: string; name: string | null; virtual: string | null; available: boolean }
+export const MAX_RELATED_FOLDERS = 10;
 
 /**
  * One CoS project's native ChatGPT Project, from request to verified identity.
@@ -38,3 +49,12 @@ export type ChatgptProjectLink =
 
 /** ChatGPT addresses a Project as `g-p-` and 32 hex digits; nothing else is one. */
 export const CHATGPT_PROJECT_ID = /^g-p-[0-9a-f]{32}$/;
+
+/** A ChatGPT Project the account already has, offered to link a CoS project to (#1756). */
+export interface ChatgptProjectChoice {
+  id: string;
+  /** As ChatGPT's sidebar showed it; a label only, never used to link. */
+  name: string;
+  /** The CoS project already linked to it; a ChatGPT Project belongs to one CoS project. */
+  linkedTo: { id: string; name: string } | null;
+}

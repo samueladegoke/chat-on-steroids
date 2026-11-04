@@ -13,15 +13,15 @@ composes that connector's own tools.
 | Connector | Purpose | Possible tools |
 | --- | --- | --- |
 | **Chat On Steroids Core** | Approved files, patches, terminal, generated images, task plans, workers | `read`, `view_image`, `find`, `apply_patch`, `save_image`, `exec_command`, `write_stdin`, `update_plan`, `agents`, `session_finish`, `exec` |
-| **Chat On Steroids Desktop** | Browser tabs through the companion (all platforms); screen, windows, mouse/keyboard and clipboard (Windows/macOS) | `browser_tabs`, `browser_snapshot`, `browser_screenshot`, `browser_navigate`, `browser_action`, `browser_evaluate`, `browser_console`, `browser_network`; Windows: `list_windows`, `get_window`, `list_apps`, `get_window_state`, `launch_app`, `click`, `press_key`, `type_text`, `scroll`, `set_value`, `drag`, `perform_secondary_action`, `activate_window`, `read_clipboard`, `write_clipboard`; macOS: `observe`, `computer`; `exec` |
+| **Chat On Steroids Desktop** | Browser tabs through the companion (all platforms); screen, windows, mouse/keyboard and clipboard (Windows/macOS); opt-in GNOME Wayland read-only display screenshots (Linux) | `browser_tabs`, `browser_snapshot`, `browser_screenshot`, `browser_navigate`, `browser_action`, `browser_evaluate`, `browser_console`, `browser_network`; Windows: `list_windows`, `get_window`, `list_apps`, `get_window_state`, `launch_app`, `click`, `press_key`, `type_text`, `scroll`, `set_value`, `drag`, `perform_secondary_action`, `activate_window`, `read_clipboard`, `write_clipboard`; macOS: `observe`, `computer`; Linux opt-in: `linux_observe` (screenshot only); `exec` |
 | **Chat On Steroids Plugins** | External MCP tools the user enabled in Settings | Each enabled tool under its own schema, plus `exec` |
 
 Core is the main connector everywhere; Desktop and Plugins are optional.
 
 On a fresh current config, Core permissions are enabled, along with
 session recording and multi-agent mode; read-only mode is off. Windows also enables Desktop permissions; macOS starts them off and the user switches them on. Linux masks
-Desktop permissions off at runtime while preserving stored choices for a config later reopened on
-Windows or macOS. Existing configs keep explicit choices during upgrades; missing legacy permissions are
+native Desktop input permissions off at runtime while preserving stored choices for a config later reopened on
+Windows or macOS. Linux GNOME screenshots require an independent default-off opt-in and explicit Screen permission. Existing configs keep explicit choices during upgrades; missing legacy permissions are
 not silently widened.
 
 With fresh defaults, Core advertises `read`, `view_image`, `apply_patch`, `save_image`,
@@ -170,6 +170,40 @@ attaching, including protected ChatGPT tabs. An attached tab also accepts `brows
 dialogs), `browser_evaluate`, `browser_console` and `browser_network`. Input works in the
 background without moving the OS cursor or bringing the browser to the front.
 
+### `browser_network` stream capture
+
+For Chromium network inspection, `browser_network` accepts `requestId` with `stream:true`
+to retain an in-flight `text/event-stream` response. Retention is bounded to 4 MiB per tab
+and 4096 nonempty chunks per request; exceeding either bound marks overflow.
+`browser_network` refuses ChatGPT pages (`chatgpt.com` and `chat.openai.com`) and
+tabs protected by CoS orchestration, including previously attached tabs that navigate
+into those pages. ChatGPT request traffic is excluded from retained listings even
+when encountered from another tab. This covers stream capture and legacy body reads.
+Captured response bytes remain only in extension memory while their attached tab
+and request entry are retained; there is no time-based expiry. Clear, request
+replacement, buffer eviction, debugger detach or tab release disposes the bytes.
+Top-level document navigation also releases retained stream bytes. A subframe
+navigation or same-document URL change does not interrupt the main page's stream.
+Already-open ChatGPT tabs are checked before recording network events, including
+third-party requests with no document URL.
+Capture from an individual child frame/session is discarded when that child
+navigates to another document or detaches. ChatGPT child frames are excluded even
+when the resource URL and document URL are not ChatGPT URLs. Read permission is
+rechecked after asynchronous response-body work before any byte page is returned.
+Child debugger sessions are bound to the top-level document epoch at attach time;
+an old session cannot contribute requests after the top page navigates.
+Child requests are admitted only after that debugger session initializes successfully;
+failed or pending initialization cannot leave retained request metadata or bytes.
+Read captured bytes with `body:true`, optional `bodyOffset` (byte offset) and `bodyBytes`
+(default 65536, maximum 262144). Decode each base64 page to bytes and concatenate before
+UTF-8 decoding; a page can split a character. Inspect `terminal` and `complete` separately:
+aborts, capture errors, invalid bytes and overflow never prove a complete response.
+`nextOffsetBytes:null` means the end of currently retained bytes, not the end of a live
+response. Poll again from `totalBytes` while `terminal:false`.
+Enable capture before the request finishes. Unsupported CDP capture is reported explicitly;
+ordinary finite response reads retain their existing behavior. Clear/release/eviction discard
+retained data. This operation uses the existing tab ownership and screen-read permission.
+
 ### Native desktop tools (Windows and macOS)
 
 Linux does not advertise or execute these schemas. Windows publishes one tool per operation:
@@ -177,6 +211,20 @@ Linux does not advertise or execute these schemas. Windows publishes one tool pe
 `press_key`, `type_text`, `scroll`, `set_value`, `drag`, `perform_secondary_action` and
 `activate_window` act; `read_clipboard` and `write_clipboard` follow the clipboard permissions.
 macOS publishes `observe` and `computer`, described below.
+
+### `linux_observe` (read-only display screenshot, Linux)
+
+This first Linux stage publishes `linux_observe` only when a person enables
+`ui.linuxDesktopEnabled` and grants Screen permission. Its input schema allows
+only `{ what: 'screenshot', display: 0 }` (display 0 is the only allowed value).
+The bounded output is an MCP PNG image plus text metadata labeled `scope: 'display'`.
+GNOME's operating-system portal can ask for consent and can be cancelled; do not retry
+automatically. The separate Settings test requests one portal screenshot but discards it
+without returning pixels to the renderer. Unknown caller identity requires the existing,
+separately chosen `desktopUnattributed` setting; the default is to refuse.
+
+Linux has **no `linux_act`, window inventory, accessibility snapshot, text entry, click,
+or coordinate input** in this PR. Those belong to the later control PR.
 
 ### `observe`
 

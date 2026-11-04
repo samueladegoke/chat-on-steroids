@@ -112,6 +112,10 @@ const {
   swarmStateForCaller,
   statusForCaller,
   waitingForSubAgents,
+  REVIEW_MAX_MS,
+  REVIEW_TEXT_CHARS,
+  isReviewerConversation,
+  reviewerFor,
   workerPrimeOwner,
   workerConversationGone,
   workerRevivalClaimed
@@ -3799,6 +3803,13 @@ describe('through the MCP endpoint', () => {
       expect(offerMessagesForConversation('mcp-original-worker')?.messages).toEqual([]);
       expect(offerMessagesForConversation('mcp-recovered-worker')?.messages[0]?.text).toBe('Only recovered worker');
       await asChat('mcp-recovered-worker', 'finish', { result: 'Done with first task' });
+      // As a prime does: it hears the finish (its status call delivers the report), and the family is parked
+      // before it is woken. Under CI load the wake used to race the parking and found the run still active,
+      // so it came back with the same incarnation (Windows, 2026-11-02, both attempts).
+      await vi.waitFor(async () => {
+        const families = (await replyWithRequestId('wfr_mcp_recovered_fleet', 'status', {})).result.structuredContent.available_runs as Array<{ run_id: string; running: boolean }>;
+        expect(families.find(family => family.run_id === recoveredRun)?.running).toBe(false);
+      }, { timeout: 15_000 });
       const wake = await replyWithRequestId('wfr_mcp_recovered_fleet', 'message', { run_id: recoveredRun, to: 'worker-1', text: 'Follow-up task' });
       expect(wake.result?.isError, textOfReply(wake)).not.toBe(true);
       const newRun = wake.result.structuredContent.run_id;
@@ -3858,6 +3869,23 @@ describe('through the MCP endpoint', () => {
       expect(field).not.toMatch(/key|secret|token/i);
     }
     expect(JSON.stringify(agentsSchema)).not.toMatch(/join/i);
+  });
+
+  // #1841: Codex sends every tool call as a new request. Its spawn promised results "at the end of
+  // later tool results", and a later status call answered "use agents action=spawn", so it
+  // waited for results that never came and started runs no later call could reach.
+  it('tells a caller without a chat, at spawn and at status, that later requests cannot reach the run', async () => {
+    await setEnabled(true, 3, true);
+    try {
+      const spawned = await agentsWithRequestId('wfr_codex_spawn', 'spawn', { workers: [{ task: 'read the file' }] });
+      expect(spawned).toMatch(/only later tool calls of this same request can reach the run/);
+      expect(spawned).not.toMatch(/arrive at the end of later tool results/);
+      const status = await agentsWithRequestId('wfr_codex_status', 'status');
+      expect(status).toMatch(/AGENTS_NO_CHAT/);
+      expect(status).not.toMatch(/Use agents action=spawn/);
+    } finally {
+      await setEnabled(true);
+    }
   });
 
   it('returns empty status to an unrelated chat without exposing the other run', async () => {
@@ -4884,6 +4912,55 @@ describe('through the MCP endpoint', () => {
     expect(pendingCount('worker-1')).toBe(0);
   });
 
+  it('asks the send check before a message reaches a worker, and queues nothing when it is held (#1794)', async () => {
+    const previous = getConfig();
+    await saveConfig({ ...previous, ui: { ...previous.ui, sendCheckUrl: 'http://127.0.0.1:8123/check' } });
+    const asked: Array<Record<string, unknown>> = [];
+    let allow = false;
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init: RequestInit) => {
+      asked.push(JSON.parse(String(init.body)));
+      return Response.json(allow ? { allow: true } : { allow: false, reason: 'review first' });
+    }));
+    try {
+      spawn({ caller: prime, workers: [{ task: 'Checked worker' }] });
+      const held = await asChat(PRIME_CHAT, 'message', { to: 'worker-1', text: 'Also update the docs' });
+      expect(held).toContain("The person's send check held this message to worker-1: review first. Nothing was queued.");
+      expect(pendingCount('worker-1')).toBe(0);
+      expect(asked).toEqual([expect.objectContaining({ kind: 'worker-message', text: 'Also update the docs', attempt: 1,
+        chat: expect.objectContaining({ worker: 'worker-1' }) })]);
+      allow = true;
+      expect(await asChat(PRIME_CHAT, 'message', { to: 'worker-1', text: 'Also update the docs' })).toContain('Queued for worker-1');
+      expect(pendingCount('worker-1')).toBe(1);
+      // A worker's report to its prime is not a send the app makes to a worker.
+      const before = asked.length;
+      await asChat(PRIME_CHAT, 'status');
+      expect(asked).toHaveLength(before);
+    } finally {
+      vi.unstubAllGlobals();
+      await saveConfig(previous);
+    }
+  });
+
+  it('names no session to the send check when the prime chat is current on two sessions (CodeRabbit)', async () => {
+    const previous = getConfig();
+    await saveConfig({ ...previous, ui: { ...previous.ui, sendCheckUrl: 'http://127.0.0.1:8123/check' } });
+    const asked: Array<Record<string, any>> = [];
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init: RequestInit) => {
+      asked.push(JSON.parse(String(init.body)));
+      return Response.json({ allow: false, reason: 'review first' });
+    }));
+    try {
+      await createSession({ conversationId: PRIME_CHAT });
+      await createSession({ conversationId: PRIME_CHAT });
+      spawn({ caller: prime, workers: [{ task: 'Checked worker' }] });
+      await asChat(PRIME_CHAT, 'message', { to: 'worker-1', text: 'Also update the docs' });
+      expect(asked).toEqual([expect.objectContaining({ kind: 'worker-message', chat: expect.objectContaining({ session: null, project: null }) })]);
+    } finally {
+      vi.unstubAllGlobals();
+      await saveConfig(previous);
+    }
+  });
+
   it('lets existing primes exchange messages by explicit run address without exposing foreign workers', async () => {
     const primeB: Caller = { conversationId: 'mcp-peer-prime-b' };
     const a = spawn({ caller: prime, workers: [{ task: 'A worker' }] });
@@ -5620,5 +5697,71 @@ describe('retired worker chats', () => {
     startWorker('worker-1');
     clearAgent(PRIME_ID);
     expect(retired).toEqual([['c-worker-1']]);
+  });
+});
+
+/**
+ * #1832: the Goal step reviewer is a worker the app puts into the Goal chat's own family. It takes a
+ * brief with diffs, longer than a model-written task may be; it holds that chat's next Goal step
+ * while it works, whether or not the person asked automatic steps to wait for workers, but never
+ * longer than REVIEW_MAX_MS; the next step's brief wakes the same reviewer.
+ */
+describe('the Goal step reviewer', () => {
+  const brief = (length: number) => 'Review this Goal step. '.padEnd(length, 'x');
+  afterEach(async () => { vi.useRealTimers(); await setEnabled(true); });
+
+  it('takes a brief longer than a task the model may write, and only as the reviewer', () => {
+    expect(() => spawn({ caller: prime, workers: [{ label: 'Worker', task: brief(6000) }] })).toThrow(/too long/);
+    expect(() => spawn({ caller: prime, workers: [{ task: brief(REVIEW_TEXT_CHARS + 1), reviewer: true }] })).toThrow(/too long/);
+    const made = spawn({ caller: prime, workers: [{ task: brief(20_000), reviewer: true }] });
+    expect(made.created).toHaveLength(1);
+    expect(made.created[0]).toMatchObject({ label: 'Reviewer', reviewer: true });
+    expect(reviewerFor(PRIME_CHAT)?.id).toBe(made.created[0]!.id);
+    expect(reviewerFor('c-other-chat')).toBeNull();
+  });
+
+  it('holds the Goal chat while it works, with or without the workers wait, for at most REVIEW_MAX_MS', async () => {
+    vi.useFakeTimers({ now: 1_000_000, toFake: ['Date'] });
+    const base = defaultConfig();
+    await saveConfig({ ...base, multiAgent: { ...base.multiAgent, enabled: true, maxWorkers: 3, waitForSubAgents: false } });
+    spawn({ caller: prime, workers: [{ task: brief(500), reviewer: true }] });
+    expect(waitingForSubAgents(PRIME_CHAT)).toBe(true);
+    vi.setSystemTime(1_000_000 + REVIEW_MAX_MS - 1);
+    expect(waitingForSubAgents(PRIME_CHAT)).toBe(true);
+    vi.setSystemTime(1_000_000 + REVIEW_MAX_MS);
+    expect(waitingForSubAgents(PRIME_CHAT)).toBe(false);
+    // With the workers wait on, an overdue reviewer still holds nothing: its limit is its own.
+    await saveConfig({ ...base, multiAgent: { ...base.multiAgent, enabled: true, maxWorkers: 3, waitForSubAgents: true } });
+    expect(waitingForSubAgents(PRIME_CHAT)).toBe(false);
+  });
+
+  it('releases the hold when it reports, and the next brief wakes the same reviewer with a fresh limit', () => {
+    vi.useFakeTimers({ now: 2_000_000, toFake: ['Date'] });
+    const made = spawn({ caller: prime, workers: [{ task: brief(500), reviewer: true }] });
+    const id = made.created[0]!.id;
+    const reviewer = startWorker(id, 'c-reviewer');
+    expect(isReviewerConversation('c-reviewer')).toBe(true);
+    finishAgent(reviewer.caller, 'No problems found.');
+    expect(waitingForSubAgents(PRIME_CHAT)).toBe(false);
+    expect(reviewerFor(PRIME_CHAT)).toMatchObject({ id, state: 'sleeping', result: 'No problems found.' });
+    vi.setSystemTime(2_000_000 + REVIEW_MAX_MS * 3);
+    // A model's own message to it keeps the ordinary limit; the app's next brief may be long.
+    expect(() => stageMessages(prime, [{ to: id, text: brief(6000) }])).toThrow(/too long/);
+    const staged = stageMessages(prime, [{ to: id, text: brief(15_000) }], { review: true });
+    staged.commit();
+    expect(reviewerFor(PRIME_CHAT)?.reviewAskedAt).toBe(2_000_000 + REVIEW_MAX_MS * 3);
+    expect(waitingForSubAgents(PRIME_CHAT)).toBe(true);
+  });
+
+  it('is an ordinary worker in every other respect, and its mark survives a restart', () => {
+    const made = spawn({ caller: prime, workers: [{ task: brief(500), reviewer: true }, { label: 'Helper', task: 'help' }] });
+    expect(made.created.map(worker => worker.reviewer === true)).toEqual([true, false]);
+    startWorker(made.created[0]!.id, 'c-reviewer-restart');
+    expect(isReviewerConversation('c-worker-x')).toBe(false);
+    const saved = JSON.parse(JSON.stringify(snapshotSwarm()));
+    resetAgentsForTests();
+    restoreSwarm(saved);
+    expect(isReviewerConversation('c-reviewer-restart')).toBe(true);
+    expect(reviewerFor(PRIME_CHAT)).toMatchObject({ label: 'Reviewer', reviewer: true });
   });
 });

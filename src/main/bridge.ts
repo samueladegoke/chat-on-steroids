@@ -1,6 +1,6 @@
 import { nextWorkerArchive, onWorkerChatReady, readyForWake, settleWorkerArchive } from './worker-archive.js';
 import { considerTurnRotation, noteRotationDeclined, noteStopFallback, stopFallbackDue, type RotationDeps } from './turn-rotation.js';
-import { armRotationFence, clearRotationFence, rotationFenced, rotationFenceTurn } from './rotation-fence.js';
+import { armRotationFence, clearRotationFence, FENCE_MS, restoreRotationFences, rotationFenced, rotationFenceTurn } from './rotation-fence.js';
 import { conversationProgress } from './session/progress.js';
 import { cosSignInTransfer, SignInTransferError } from './cos-browser/sign-in-transfer.js';
 import { externalBrowserProof, noteExternalInstalled, noteExternalSignedIn, resetBrowserProofForTests } from './browser-proof.js';
@@ -16,18 +16,21 @@ import { CONVERSATION_DELETED } from '../shared/chat-error.js';
 import { prepareSessionPrompt } from './session/prompt.js';
 import { NEW_CHAT, noteAutomaticReply } from './session/automatic-replies.js';
 import { pendingChatModelRequest, observeChatModels, requestChatModels } from './chat-models.js';
-import { resumeModelSelection } from './resume-model.js';
+import { resumeModelSelection, wakeModelSelection } from './resume-model.js';
 import { isDeliberateEffort, isProModel } from '../shared/chat-models.js';
 import { supportsFinishAutomation } from '../shared/finish.js';
 import { injectedUserMessage, recordedRequestTurn, responseTurnId, type TimelineTurns } from '../shared/chronology.js';
 import type { SessionSummary } from '../shared/session.js';
+import { STUCK_SUMMARY_MS } from '../shared/session.js';
 import { messageReferences } from '../shared/session.js';
 import { turnTrace } from '../shared/turn-trace.js';
+import { checkAutomaticSend, SEND_CHECK_RETRY_MS } from './send-check.js';
 import { publishBrowserDecision, authorizeBrowserInput, sessionInputPolicy, collectRecordedBrowserDecision, fileRotationInput, fileRotationContinueAfterStop, rotationDelivery, withdrawUnsentRotation, type InputActivity } from './session/input.js';
 import { callHoldOpen, holdCalls } from './rotation-hold.js';
 import { authorizedPluginRefreshPublications, hasRequestedPluginRefresh, pendingPluginRefreshes, claimPluginRefresh, requireManualPluginRefresh, completePluginRefresh, failPluginRefresh } from './plugin-refresh.js';
 import { attachBrowserWake, wakeBrowserWork } from './browser-wake.js';
 import { noteRouteExistingChatSend, tunnelRouteSettling } from './tunnel/route-settle.js';
+import { noteChatgptProjects } from './chatgpt-project-catalog.js';
 import { armProjectCreate, bindChatToLinkedProject, claimProjectCreate, completeProjectCreate, failProjectCreate, getProject, markProjectGone, pendingProjectCreates } from './projects.js';
 import { wakeBrowserUrl } from './browser-startup.js';
 let browserWake: ReturnType<typeof attachBrowserWake> | null = null;
@@ -36,7 +39,7 @@ export { setBrowserWorkArea } from './browser-window-layout.js';
 import { pendingBrowserPreferenceRequest, acknowledgeBrowserPreferences } from './browser-preferences.js';
 import { sessionFinishHeld, releaseSessionFinish, getSessionFinishDraft, sessionFinishWaiting } from './session/finish.js';
 import { observeUsage } from './session/usage.js';
-import { pendingBrowserInputs, claimBrowserInput, acknowledgeBrowserInput, bindBrowserInputProject, failBrowserInput, completeBrowserDecision, listInputs, fileSilenceInput, fileRecoveryInput, advanceRecoveryInput, hasQueuedAfterTurnInput, inputBeforeGoal, pendingQueuedPickups, recordQueuedPickupAttemptNow, syncQueuedPickupRecoveryNow, deferSilenceInput, revokeSilenceInputs, endRecoveryInput, failBranchInput, retryUnclaimedInput, failInputsForDeletedConversation } from './session/input.js';
+import { inBrowserDelivery, automaticSendKind, heldBySendCheck, holdInputForSendCheck, pendingBrowserInputs, claimBrowserInput, acknowledgeBrowserInput, bindBrowserInputProject, failBrowserInput, lostBrowserOpening, completeBrowserDecision, listInputs, fileSilenceInput, fileRecoveryInput, advanceRecoveryInput, hasQueuedAfterTurnInput, inputBeforeGoal, pendingQueuedPickups, queuedInputOfferBlocker, continueAsOrdinaryMessage, recordQueuedPickupAttemptNow, syncQueuedPickupRecoveryNow, deferSilenceInput, revokeSilenceInputs, withdrawOwnContinuesAfterStop, endRecoveryInput, failBranchInput, retryUnclaimedInput, failInputsForDeletedConversation, ownUnsentTexts, retireMismatchedRecoveryInput, noteInputHeld } from './session/input.js';
 /**
  * The local bridge between the Chrome extension and this app.
  *
@@ -62,11 +65,12 @@ import { pendingBrowserInputs, claimBrowserInput, acknowledgeBrowserInput, bindB
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import http from 'node:http';
 import type { BridgeStatus, CompanionDiagnostics, CompanionEnvironment, CompanionPageDiagnostics, CompanionTabDiagnostics, CompanionTraceEntry } from '../shared/types.js';
-import { BROWSER_PICKUP_BACKOFF_MS, BROWSER_PICKUP_MAX_ATTEMPTS, recoveryBusyMs } from '../shared/recovery.js';
+import { BROWSER_PICKUP_ATTEMPT_LIMIT, BROWSER_PICKUP_BACKOFF_MS, BROWSER_PICKUP_MAX_ATTEMPTS, BROWSER_PICKUP_SLOW_MS, browserPickupDelay, recoveryBusyMs } from '../shared/recovery.js';
 import { CHAT_ACTIVE_MS, CHAT_SILENCE_MS, continuationMarkerOf, isReasoningEffort, normalizedToolOutcome, toolCallSummary, unescapeMarkdown,
   type ReasoningEffort, type SessionEvent, type SessionOrigin, type StoredText, type ToolCallRecord } from '../shared/session.js';
 import { blockedChatIds, isChatBlocked, chatBlockedAt } from './session/blocked-chats.js';
 export { CHAT_ACTIVE_MS, CHAT_SILENCE_MS } from '../shared/session.js';
+import { extensionAppearance } from './extension-appearance.js';
 import { effectiveCapabilities, getConfig, updateConfig } from './config.js';
 import { BROWSER_BRIDGE_AUTO_PORTS } from '../shared/browser-bridge.js';
 import { bridgePortSelection } from './bridge-ports.js';
@@ -85,6 +89,7 @@ import {
   beginGoalDraft,
   discardPreparedGoalDraft,
   draftOpeningMessage,
+  REQUEST_TIMEOUT_MS,
   goalKeyPresent,
   registerGoalDecisionChat,
   isGoalDecisionChat,
@@ -111,6 +116,7 @@ import {
   startGoalDraft
 } from './goal.js';
 import { logInfo, logWarn } from './logger.js';
+import { markStartup } from './startup-timing.js';
 import {
   closeConversation,
   liveConversations,
@@ -127,9 +133,10 @@ import {
   type ChatObservation,
   type PageCallEvidence
 } from './session/recorder.js';
+import { noteRequestTraces, type RequestTrace } from './session/request-trace.js';
 import { noticeApprovalWaiting, noticeChatStopped } from './stuck-notice.js';
 import { approvalAnswerFor, approvalCardWaiting, noteApprovalCard, parseApprovalCard, parseApprovalResult, resetApprovalWaits, settleApprovalAnswer, type ApprovalWaitDeps } from './approval-wait.js';
-import { APPROVAL_PROGRESS_PREFIX, APPROVAL_WAITING_TEXT } from '../shared/approval-wait.js';
+import { APPROVAL_PROGRESS_PREFIX, APPROVAL_REPAIR_DEFERRED_TEXT, APPROVAL_WAITING_TEXT } from '../shared/approval-wait.js';
 import {
   autoCompactionReady,
   automaticCompactionAllowed,
@@ -190,6 +197,7 @@ import { ownCoreHint,
   releaseQuiescentRun,
   retiredWorkerForConversation,
   waitingForSubAgents,
+  reviewerHoldUntil,
   sleepSilentWorkers,
   notePageGenerating,
   occupiesSlot,
@@ -206,6 +214,7 @@ import { ownCoreHint,
   workerRevivalDeliveredSince,
   type WorkerRevival
 } from './agents.js';
+import { reviewWaitUntil } from './goal-reviewer.js';
 import { lookupWorkerWorkspace, validateWorkerWorkspaceLease } from './worktrees/index.js';
 import {
   abortContinuation,
@@ -230,6 +239,7 @@ import {
   normalizeProjectId,
   openContinuationNow,
   reopenWithHandoffNow,
+  savedSummaryUsable,
   releaseContinuationDestinationSendNow,
   recoverContinuationFromRecordedBootstrap,
   repairPrimeFromResumeShadow,
@@ -241,7 +251,7 @@ import type { ContinuationView } from './session/continuation.js';
 import { noteResumeOpening } from './session/resume-gate.js';
 import { readDurable, writeDurableNow, writeDurableSoon } from './durable.js';
 import { APP_VERSION, BRIDGE_PROTOCOL } from './version.js';
-import { conversationHasMcpCallSince, readHandoffResponse } from './session/store.js';
+import { conversationHasMcpCallSince, readHandoff, readHandoffResponse } from './session/store.js';
 import { sessionWorkingAt } from '../shared/session-activity.js';
 import { requestCorrelation } from './session/correlation.js';
 import { completeImageExport, IMAGE_EXPORT_BODY_BYTES, pendingImageExports } from './image-export.js';
@@ -445,7 +455,11 @@ type CommandSpec =
    * brief got newer — not two fresh chats, which is what keying on the handoff produced.
    */
   | { type: 'resume'; sessionId: string; token: string }
-  | { type: 'stop'; sessionId: string; conversationId: string; turnId: string; userMessageId?: string };
+  | { type: 'stop'; sessionId: string; conversationId: string; turnId: string; userMessageId?: string;
+    /** Asked for a turn the page holds after the app stopped counting it as work (`heldTurnId`). */
+    held?: true;
+    /** A fresh-turn Stop (the stop fallback): its chat's rotation fence lives as long as it does. */
+    rotation?: true };
 
 interface Command {
   id: string;
@@ -471,6 +485,8 @@ interface Command {
    */
   timer: NodeJS.Timeout | null;
   lastError: string | null;
+  /** #1794: the send check held this worker's start or wake; asked again from `nextAt`. Not persisted. */
+  sendCheck?: { attempt: number; nextAt: number; allowed?: { text: string; spec: CommandSpec; url: string } };
   /**
    * The page that redeemed this command, while its lease holds.
    *
@@ -488,8 +504,48 @@ interface Command {
   progress?: { opened?: 'browser' | 'os'; step?: CommandStep; stepAt?: number };
 }
 
+/** Why a page held a queued message back, as the log says it (see `/page-note`, 2026-10-30). */
+const HELD_INPUT_REASONS: Record<string, string> = {
+  'page-moved': 'the page reloaded or moved on while it waited',
+  'chat-moved-on': 'the chat moved on while the page waited (a new message, another turn or new progress)',
+  'question-gone': 'the question it continues was no longer shown on the page while it waited',
+  'still-answering': 'ChatGPT still shows an answer running',
+  'turn-held': 'the page still holds a turn that ChatGPT no longer shows running',
+  'tool-running': 'a tool call of this chat is still running on the page',
+  'recovery-question-changed': 'its last question is not the one this automatic Continue answers',
+  'recovery-question-unreadable': 'its last question cannot be read on the page, so this automatic Continue cannot be matched to it',
+  'recovery-not-ready': 'the page could not yet prove the turn this automatic Continue answers is unfinished',
+  'no-composer': 'the page shows no message box',
+  'composer-hidden': 'its message box is covered or cannot be typed into'
+};
+/** When each page-note was last logged, by chat and heading (see `/page-note`). */
+const pageNotesLogged = new Map<string, number>();
+/** Uninterrupted "question changed" refusals of one automatic Continue: since when, and the last one. */
+const recoveryQuestionChanged = new Map<string, { since: number; last: number }>();
+/** Refusals further apart than this are not one run; this long of one run retires the Continue. */
+let QUESTION_CHANGED_GAP_MS = 5 * 60_000;
+let QUESTION_CHANGED_RETIRE_MS = 30 * 60_000;
+/** Whether pages are refusing this automatic Continue right now because the chat shows another question. */
+function questionChangedRefusalActive(inputId: string, now = Date.now()): boolean {
+  const run = recoveryQuestionChanged.get(inputId);
+  return !!run && now - run.last <= QUESTION_CHANGED_GAP_MS;
+}
+export function setQuestionChangedTimingForTests(gapMs = 5 * 60_000, retireMs = 30 * 60_000): void {
+  QUESTION_CHANGED_GAP_MS = gapMs; QUESTION_CHANGED_RETIRE_MS = retireMs;
+  recoveryQuestionChanged.clear();
+}
+/** When each repair-claim refusal was last logged, by chat and reason (#1922). */
+const claimRefusalsLogged = new Map<string, number>();
+/** Marks a page-note key logged now, as the newest entry, so a full map evicts the oldest log, not this one. */
+function notePageNoteLogged(key: string, now: number): void {
+  pageNotesLogged.delete(key);
+  pageNotesLogged.set(key, now);
+  if (pageNotesLogged.size > 200) pageNotesLogged.delete(pageNotesLogged.keys().next().value!);
+}
+const UUID_SHAPE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 /** Bootstrap stages a page reports after redeeming, in order. See `commandProgress`. */
-const COMMAND_STEPS = ['revival-waiting', 'revival-busy', 'revival-draft', 'revival-editor', 'composer', 'model', 'composer-after-model', 'inserting', 'sending'] as const;
+// `model-unconfirmed`: a wake whose worker model the picker could not confirm goes out anyway (#1952).
+const COMMAND_STEPS = ['revival-waiting', 'revival-busy', 'revival-draft', 'revival-editor', 'composer', 'model', 'model-unconfirmed', 'composer-after-model', 'inserting', 'sending'] as const;
 /** Steps a wake reports while it waits, before redeeming. `revival-waiting` is what older pages send. */
 const REVIVAL_WAIT_STEPS = new Set<string>(['revival-waiting', 'revival-busy', 'revival-draft', 'revival-editor']);
 type CommandStep = typeof COMMAND_STEPS[number];
@@ -509,6 +565,7 @@ const COMMAND_STEP_TEXT: Record<CommandStep, string> = {
   'revival-editor': 'its page never showed a usable message box',
   composer: 'waiting for ChatGPT\'s message box',
   model: 'choosing the model and reasoning',
+  'model-unconfirmed': 'going on without the requested model, which the picker could not confirm',
   'composer-after-model': 'waiting for the message box after choosing the model',
   inserting: 'putting the task into the message box',
   sending: 'sending the task'
@@ -685,6 +742,26 @@ function staleCompanion(req: http.IncomingMessage): boolean {
 function notChosenBrowser(req: http.IncomingMessage): boolean {
   return getConfig().ui.chatBrowser === 'cos' && req.headers['x-extension-host'] !== 'cos' && cosExtensionPresent();
 }
+/**
+ * Whether a page in this browser may open new work handed to it: a worker's or a replacement's tab.
+ * #1852: the prime chat still open in Chrome collected a worker tab through its own page while the
+ * built-in browser was chosen, and the redeem route then refused that tab's page as not chosen.
+ */
+function opensNewWork(req: http.IncomingMessage, route: string, conversationId: string): boolean {
+  const reason = notChosenBrowser(req) ? 'another browser is chosen' : staleCompanion(req) ? 'its extension is out of date' : null;
+  if (!reason) return true;
+  // Said only when a tab was actually waiting for this chat, and once a minute per browser and route:
+  // a page polls every few seconds, and "nothing to hand out" is not a refusal.
+  const waiting = commands.some(entry => entry.owner === null && entry.placement?.conversationId === conversationId);
+  const key = `${route}\0${browserOf(req) ?? ''}\0${reason}`;
+  if (waiting && Date.now() - (withheldLoggedAt.get(key) ?? 0) >= WITHHELD_LOG_MS) {
+    withheldLoggedAt.set(key, Date.now());
+    logInfo(`bridge: ${route} withheld a tab to open from a page whose browser may not take new work (${reason})`);
+  }
+  return false;
+}
+const WITHHELD_LOG_MS = 60_000;
+const withheldLoggedAt = new Map<string, number>();
 function chosenBuiltInBrowser(req: http.IncomingMessage): boolean {
   return getConfig().ui.chatBrowser === 'cos' && req.headers['x-extension-host'] === 'cos';
 }
@@ -697,6 +774,21 @@ function browserOf(req: http.IncomingMessage): string | null {
   return typeof id === 'string' && /^[a-z0-9]{16,64}$/.test(id) ? id : null;
 }
 const browserSeenAt = new Map<string, number>();
+/** Until when a browser's extension reloads into a new build; it takes no new message meanwhile. */
+const extensionReloads = new Map<string, number>();
+const EXTENSION_RELOAD_PAUSE_MS = 20_000;
+/** Claims past the reload check that have not answered yet; each one holds the extension update. */
+let claimsInProgress = 0;
+function extensionReloading(req: http.IncomingMessage): boolean {
+  const until = extensionReloads.get(browserOf(req) ?? '');
+  if (until === undefined) return false;
+  if (Date.now() < until) {
+    noticeRefusal(`extension-reload:${browserOf(req) ?? ''}`, 'bridge: a claim waits: the browser extension is reloading into a new build');
+    return true;
+  }
+  extensionReloads.delete(browserOf(req) ?? '');
+  return false;
+}
 /** How long a browser keeps a new chat it was handed after it stops polling. */
 const OPENING_CUSTODY_MS = 60_000;
 /** New-chat inputs and the one browser each was first handed to. */
@@ -733,10 +825,29 @@ function chatHolders(conversationId: string): string[] {
  * 2.1.21 (2026-09-30) chat A came to live in both browsers, the copy in the browser the user was
  * not working in wrote the Compact & Resume brief, and chat B was placed beside that copy.
  */
+/** Chats whose repair waits for a browser that may open them (browser only), said once per episode. */
+const browserOnlyHoldTold = new Set<string>();
+/** A refused claim from a browser that is not the chosen one, said once a minute per chat. */
+const unchosenClaimToldAt = new Map<string, number>();
+
+/** A stalled-tab repair for a chat this browser holds: the one repair a browser that is not chosen may take. */
+function holdsStalledTab(repair: Repair, conversationId: string, browser: string | null): boolean {
+  return repair.reason === 'stalled' && !!browser && chatHolders(conversationId).includes(browser);
+}
+
 function chatHeldElsewhere(conversationId: string, browser: string | null): boolean {
   if (!browser) return false;
   const holders = chatHolders(conversationId);
   return holders.length > 0 && !holders.includes(browser);
+}
+
+/** The extension asks again every pass while an update is held: each reason is logged once a minute. */
+const updateHoldLoggedAt = new Map<string, number>();
+function logUpdateHold(hold: string, line: string): void {
+  const now = Date.now(), last = updateHoldLoggedAt.get(hold);
+  if (last !== undefined && now - last < 60_000 && now >= last) return;
+  updateHoldLoggedAt.set(hold, now);
+  logInfo(line);
 }
 
 /**
@@ -829,7 +940,11 @@ function inputHeldElsewhere(input: { id: string; conversationId: string | null }
 }
 
 let versionWarned = false;
+/** The send-check hold (by attempt) each held message's claim was last logged for. */
+const heldClaimsLogged = new Map<string, number>();
 let latestCompanionDiagnostics: CompanionDiagnostics | null = null;
+/** When this app received that report: the browser's own clock may differ. */
+let latestCompanionDiagnosticsAt = 0;
 let companionDiagnosticsRevision = 0;
 const companionDiagnosticsWaiters = new Set<() => void>();
 
@@ -963,8 +1078,17 @@ function sanitiseCompanionDiagnostics(value: unknown): CompanionDiagnostics | nu
       durations: preferences.durations === true
     },
     tab: diagnosticTab(root.tab),
-    environment: diagnosticEnvironment(root.environment)
+    environment: diagnosticEnvironment(root.environment),
+    language: diagnosticLanguage(root.language)
   };
+}
+
+const LANGUAGE_TAG = /^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$/;
+function diagnosticLanguage(value: unknown): CompanionDiagnostics['language'] {
+  const root = diagnosticObject(value);
+  if (!root) return null;
+  const tag = (field: unknown) => typeof field === 'string' && LANGUAGE_TAG.test(field) ? field : null;
+  return { applied: tag(root.applied), stored: tag(root.stored), error: diagnosticString(root.error, 200) };
 }
 
 function diagnosticEnvironment(value: unknown): CompanionEnvironment | null {
@@ -984,15 +1108,86 @@ function diagnosticEnvironment(value: unknown): CompanionEnvironment | null {
   };
 }
 
-function recordCompanionDiagnostics(value: unknown): void {
+/** Per browser: the extension language state last logged, so a repeating report logs once. */
+const extensionLanguageLogged = new Map<string, string>();
+/** Per browser: the last error-page reload the app has logged (the extension's clock) and its count. */
+const errorPageReloadsLogged = new Map<string, { at: number; count: number; skippedAt?: number }>();
+/** Per browser, the last extension close-outbox decision already written to the app log. */
+const closeOutboxDecisionsLogged = new Map<string, number>();
+const CLOSE_OUTBOX_REASONS: Record<string, string> = {
+  deferred_chrome_tab_open: 'deferred /closed: Chrome still has the conversation tab',
+  deferred_chrome_inventory_unavailable: 'deferred /closed: Chrome tab inventory was unavailable',
+  discarded_conversation_binding_open: 'discarded stale /closed: the conversation was rebound'
+};
+const ERROR_PAGE_SKIPS: Record<string, (nextIn: number) => string> = {
+  offline: () => 'not reloaded while the browser is offline',
+  backoff: nextIn => `the next reload is in ${nextIn} s (it backs off after each reload)`,
+  unreadable: () => 'not reloaded, because the extension could not read when it last reloaded it'
+};
+function recordCompanionDiagnostics(value: unknown, browser = ''): void {
   const next = sanitiseCompanionDiagnostics(value);
   if (!next) return;
+  const decision = diagnosticObject(diagnosticObject(value)?.closeOutboxDecision);
+  const decisionAt = diagnosticNumber(decision?.at);
+  const key = `${String(decision?.action ?? '')}_${String(decision?.reason ?? '')}`;
+  if (Object.hasOwn(CLOSE_OUTBOX_REASONS, key) && decisionAt > (closeOutboxDecisionsLogged.get(browser) ?? 0)) {
+    logInfo(`browser: ${CLOSE_OUTBOX_REASONS[key]}`);
+    closeOutboxDecisionsLogged.set(browser, decisionAt);
+    if (closeOutboxDecisionsLogged.size > 16) closeOutboxDecisionsLogged.delete(closeOutboxDecisionsLogged.keys().next().value!);
+  }
+  // A chat tab that loaded offline and sat on Chrome's error page was reloaded by the extension.
+  const reloads = diagnosticObject(diagnosticObject(value)?.errorPageReloads);
+  const reloadedAt = diagnosticNumber(reloads?.lastAt), reloadCount = Math.round(diagnosticNumber(reloads?.count, 100_000));
+  const logged = errorPageReloadsLogged.get(browser) ?? { at: 0, count: 0 };
+  if (reloadedAt > logged.at && reloadCount > 0) {
+    // A browser restart clears the extension's session storage, and its count starts again.
+    const fresh = reloadCount >= logged.count ? reloadCount - logged.count : reloadCount;
+    logInfo(`browser: reloaded ${Math.max(1, fresh)} ChatGPT tab(s) left on Chrome's error page (loaded while offline; the browser is online again)`);
+    errorPageReloadsLogged.set(browser, { ...logged, at: reloadedAt, count: reloadCount });
+    if (errorPageReloadsLogged.size > 16) errorPageReloadsLogged.delete(errorPageReloadsLogged.keys().next().value!);
+  }
+  // A reload the extension skipped, and why: once per skip it reports (CodeRabbit on #1911).
+  const skipped = diagnosticObject(reloads?.skipped);
+  const skippedAt = diagnosticNumber(skipped?.at), reason = String(skipped?.reason ?? '');
+  const skipLine = Object.hasOwn(ERROR_PAGE_SKIPS, reason) ? ERROR_PAGE_SKIPS[reason] : undefined;
+  const current = errorPageReloadsLogged.get(browser) ?? { at: 0, count: 0 };
+  if (skipLine && skippedAt > (current.skippedAt ?? 0)) {
+    const nextIn = Math.max(0, Math.ceil((diagnosticNumber(skipped?.nextAt) - skippedAt) / 1000));
+    logInfo(`browser: a ChatGPT tab is on Chrome's error page; ${skipLine(nextIn)}`);
+    errorPageReloadsLogged.set(browser, { ...current, skippedAt });
+    if (errorPageReloadsLogged.size > 16) errorPageReloadsLogged.delete(errorPageReloadsLogged.keys().next().value!);
+  }
+  // The extension shows its texts in the language it stored; say once when that is not the app's (2026-10-30).
+  const language = next.language, wanted = getConfig().ui.language ?? null;
+  const languageState = language ? `${wanted ?? ''}|${language.stored ?? 'none'}|${language.error ?? ''}` : '';
+  // A report that matches clears the key, so the same mismatch coming back later is logged again.
+  if (language && wanted && language.stored === wanted && !language.error) extensionLanguageLogged.delete(browser);
+  if (language && wanted && (language.stored !== wanted || language.error) && extensionLanguageLogged.get(browser) !== languageState) {
+    logWarn(`browser: the extension's stored language is ${language.stored ?? 'none (it uses the browser\'s)'}, the app's is ${wanted}` +
+      `${language.error ? `; last attempt: ${language.error}` : ''}`);
+    extensionLanguageLogged.set(browser, languageState);
+    if (extensionLanguageLogged.size > 16) extensionLanguageLogged.delete(extensionLanguageLogged.keys().next().value!);
+  }
   // Remember what the extension holds, but only values it actually stored: a fresh install
   // reports its defaults, and those must not overwrite the choices it is about to get back.
   if (diagnosticObject(value)?.preferencesStored === true) rememberBrowserPreferences(next.preferences);
   latestCompanionDiagnostics = next;
+  latestCompanionDiagnosticsAt = Date.now();
   companionDiagnosticsRevision += 1;
   for (const waiter of companionDiagnosticsWaiters) waiter();
+}
+
+/**
+ * The browser side as last known, for the log line of a message no browser picked up (#1878): the
+ * wake channel and the ChatGPT tab counts from the extension's latest report, with its age. Never waits.
+ */
+export function browserPickupContext(now = Date.now()): string {
+  const wake = `wake channel ${browserWakeConnected() ? 'connected' : 'not connected'}`;
+  const tabs = latestCompanionDiagnostics?.environment?.tabs;
+  if (!tabs) return `${wake}; no tab report from the browser yet`;
+  const age = Math.max(0, Math.round((now - latestCompanionDiagnosticsAt) / 1000));
+  return `${wake}; ChatGPT tabs ${tabs.open} open, ${tabs.discarded} discarded, ${tabs.frozen} frozen, ${tabs.loading} loading, ` +
+    `${tabs.inBackgroundWindow} in the background window, reported ${age} s ago`;
 }
 
 /** Ask the companion for a fresh popup-equivalent snapshot, but keep a bounded wait. */
@@ -1021,6 +1216,7 @@ export function companionDiagnostics(): Promise<CompanionDiagnostics | null> {
 
 function clearCompanionDiagnostics(): void {
   latestCompanionDiagnostics = null;
+  latestCompanionDiagnosticsAt = 0;
   companionDiagnosticsRevision++;
   for (const waiter of companionDiagnosticsWaiters) waiter();
 }
@@ -1488,7 +1684,9 @@ const OBSERVATION_KINDS = new Set([
   // requestId -> conversationId correlation registry.
   'tool_evidence',
   // Connector identity proof (connector-identity.ts); never transcript content.
-  'app_sightings'
+  'app_sightings',
+  // Where a chat's stream named request ids (session/request-trace.ts); diagnostics only.
+  'request_trace'
 ]);
 const OUTCOMES = new Set(['completed', 'failed', 'stopped', 'interrupted', 'stalled', 'unknown']);
 const MAX_OBSERVATIONS = 200;
@@ -1608,6 +1806,18 @@ function parseObservations(input: unknown): ChatObservation[] {
           appName: typeof app?.['appName'] === 'string' ? app['appName'].slice(0, 200) : null });
       }
       observation.apps = apps;
+      out.push(observation);
+      continue;
+    }
+    if (kind === 'request_trace') {
+      const traces: RequestTrace[] = [];
+      for (const rawTrace of Array.isArray(item['traces']) ? item['traces'].slice(0, 16) : []) {
+        const trace = rawTrace && typeof rawTrace === 'object' ? rawTrace as Record<string, unknown> : null;
+        const requestId = typeof trace?.['requestId'] === 'string' ? trace['requestId'] : '';
+        const path = typeof trace?.['path'] === 'string' ? trace['path'] : '';
+        if (/^(?:wfr_[a-zA-Z0-9_-]{1,96}|[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12})$/i.test(requestId) && /^[A-Za-z0-9_./:>*[\]-]{1,200}$/.test(path)) traces.push({ requestId, path });
+      }
+      observation.traces = traces;
       out.push(observation);
       continue;
     }
@@ -1768,7 +1978,9 @@ function parseObservations(input: unknown): ChatObservation[] {
     if (kind === 'chat_error' && item['blocking'] === true && typeof item['retryAt'] === 'number' &&
         Number.isFinite(item['retryAt']) && item['retryAt'] > observation.time &&
         item['retryAt'] - observation.time <= 24 * 60 * 60_000) observation.retryAt = Math.floor(item['retryAt']);
-    if (Array.isArray(item['calls'])) observation.calls = parseCallEvidence(item['calls']);
+    if (Array.isArray(item['calls'])) {
+      observation.calls = parseCallEvidence(item['calls'], kind === 'tool_evidence' && Boolean(observation.turnId));
+    }
     out.push(observation);
   }
   return out;
@@ -2023,6 +2235,12 @@ export type SessionControlsView = {
   proLoopDelivery?: boolean;
   objective: string;
   activeTurnId: string | null;
+  /**
+   * A turn this chat's page still holds open although the app no longer counts it as work (its
+   * activity ended; 2.1.47 round). The page takes no message while it holds one, so Stop is
+   * offered for it: the app shows no Working, but the person is not left without a way out.
+   */
+  heldTurnId?: string | null;
   finishHeld: boolean;
   queueAtFinish?: boolean;
   canInject?: boolean;
@@ -2034,6 +2252,11 @@ export type SessionControlsView = {
   finishGoalDraft?: Pick<import('./goal.js').GoalDraftView, 'stage' | 'model' | 'text' | 'error'> | null;
   blocked: 'worker' | 'blocked' | '';
   job: ResumeJobView | null;
+  /**
+   * The session's latest saved summary, offered when a Compact & Resume has waited STUCK_SUMMARY_MS without
+   * ChatGPT writing one (2026-11-01): "Continue in a new chat from the last summary" replaces that ticket.
+   */
+  lastSummary?: { handoffId: string; createdAt: number; earlierChat: boolean } | null;
   /**
    * No page picked up this chat's repairs, so recovery gave up (#1787); in memory, lifted when the page
    * polls again. Not the session list's durable `recoveryStopped`.
@@ -2065,28 +2288,77 @@ export async function sessionControlsFor(sessionId: string): Promise<SessionCont
   const activeTurnId = session.browserRecoveryDismissedAt === undefined && session.activeTurnId &&
     (stopping || runningToolCalls(id) > 0 || (activityExpiry !== undefined ? activityExpiry !== null && activityExpiry > Date.now() :
       live?.activeTurnId === session.activeTurnId)) ? session.activeTurnId : null;
+  // A worker chat may still be stopped (CodeRabbit); only the person's own Block refuses it.
+  const heldTurnId = !activeTurnId && !isChatBlocked(id) && session.activeTurnId && session.browserRecoveryDismissedAt === undefined &&
+    live?.activeTurnId === session.activeTurnId ? session.activeTurnId : null;
   const finishHeld = !blocked && await sessionFinishHeld(sessionId, activeTurnId, id);
   const draft = goalViewFor(id) ?? goalOutcomeFor(id);
   const inputPolicy = await sessionInputPolicy(sessionId, sessionInputActivity(session));
   const plan = await readSessionPlan(sessionId);
   const finishWaiting = await sessionFinishWaiting(sessionId, activeTurnId, id);
   const recovery = await sessionRecoveryCountdowns(sessionId, id);
-  return { sessionId, plan, conversationId: id, activeTurnId, finishHeld,
+  return { sessionId, plan, conversationId: id, activeTurnId, heldTurnId, finishHeld,
     recovery,
     queueAtFinish: !blocked && inputPolicy.queueAtFinish, canInject: !blocked && inputPolicy.canInject,
     canSendDirectly: !blocked && !!inputPolicy.directTurn,
     finishGoalDraft: getSessionFinishDraft(sessionId, activeTurnId),
     finishWaiting,
     goalDraft: draft ? { stage: draft.stage, model: draft.model, text: draft.text.slice(-8000), error: draft.error } : null,
-    goalWait: !blocked && !draft && goalActiveFor(id)
-      ? await goalWaitFor(id, sessionId, Date.now(), session.browserRecoveryDismissedAt !== undefined) : null,
+    goalWait: blocked || !goalActiveFor(id) ? null : draft ? draftReviewWait(id, draft.stage)
+      : await goalWaitFor(id, sessionId, Date.now(), session.browserRecoveryDismissedAt !== undefined),
     stopPending: commands.some(c => c.spec.type === 'stop' && c.spec.sessionId === sessionId && c.spec.turnId === activeTurnId),
     objective: goalObjectiveFor(id),
     loopAfterTurn: control.afterTurn,
     proLoopDelivery: control.enabled && getConfig().ui.finishTool === true && session.selectedModel?.conversationId === id &&
       supportsFinishAutomation(control.mode, session.selectedModel.model, session.selectedModel.reasoningEffort),
     automation: goalArmedFor(id) && !blocked ? control.enabled ? control.mode : 'goal' : 'off',
-    blocked, job: resumeJobFor(sessionId), pageless: pagelessChats.has(id) };
+    blocked, job: resumeJobFor(sessionId), lastSummary: await stuckSummaryOffer(sessionId, session), pageless: pagelessChats.has(id) };
+}
+
+/**
+ * The unattended way on for a compaction ChatGPT never answers: a chat with Goal or Loop on continues from
+ * the session's last saved summary (resumeFromSavedSummary cancels the stuck ticket). False when the chat is
+ * not unattended, has no usable summary, or the reopen is refused; the ordinary backoff then goes on.
+ */
+async function continueStuckFromSavedSummary(entry: { token: string; sessionId: string; from: string }, watch: { continuedFromSaved?: boolean }): Promise<boolean> {
+  watch.continuedFromSaved = true;
+  // Unattended means Goal or Loop on and the chat not blocked (a block keeps the switch's state; CodeRabbit on #2019).
+  const unattended = (): boolean => !goalBlockReason(entry.from) && goalArmedFor(entry.from) && goalSwitchFor(entry.from).enabled;
+  // Each refusal says why, once per ticket (this runs once per ticket; CodeRabbit on #2019).
+  const skip = (why: string): false => {
+    logInfo(`bridge: compaction ticket ${entry.token.slice(0, 8)} does not continue from the saved summary: ${why}`);
+    return false;
+  };
+  const attended = (): string => goalBlockReason(entry.from) ? 'the chat is blocked' : 'Goal and Loop are off for this chat';
+  if (!unattended()) return skip(attended());
+  const session = await getSession(entry.sessionId).catch(() => null);
+  if (!session) return skip('its session could not be read');
+  if (session.conversationId !== entry.from) return skip('the session has moved to another chat');
+  if (!session.lastHandoffId) return skip('the session has no saved summary');
+  // Checked again after the reads: the person may have blocked the chat or turned the switch off meanwhile.
+  if (!unattended()) return skip(attended());
+  if (!await savedSummaryUsable(entry.sessionId, session.lastHandoffId)) return skip(`saved summary ${session.lastHandoffId} is empty or unusable`);
+  if (!unattended()) return skip(attended());
+  try {
+    await resumeFromSavedSummary(entry.sessionId, session.lastHandoffId);
+    logWarn(`bridge: compaction ticket ${entry.token.slice(0, 8)} for ${entry.from} never reached ChatGPT; ` +
+      `the ${goalSwitchFor(entry.from).mode} chat continues in a new chat from saved summary ${session.lastHandoffId}`);
+    return true;
+  } catch (error) {
+    logInfo(`bridge: compaction ticket ${entry.token.slice(0, 8)} could not continue from the saved summary (${(error as Error).message}); backing off as before`);
+    return false;
+  }
+}
+
+export { STUCK_SUMMARY_MS };
+async function stuckSummaryOffer(sessionId: string, session: SessionSummary): Promise<SessionControlsView['lastSummary']> {
+  const job = resumeJobFor(sessionId);
+  if (!job || job.stage !== 'handoff-pending' || job.handoffId || Date.now() - job.startedAt < STUCK_SUMMARY_MS) return null;
+  if (!session.lastHandoffId || !await savedSummaryUsable(sessionId, session.lastHandoffId)) return null;
+  const saved = await readHandoff(sessionId, session.lastHandoffId).catch(() => null);
+  if (!saved) return null;
+  const source = saved.provenance?.sourceConversationId;
+  return { handoffId: saved.id, createdAt: saved.createdAt, earlierChat: !!source && source !== session.conversationId };
 }
 /** One absolute budget includes opening an absent tab and native hydration. */
 export const STOP_COMMAND_TIMEOUT_MS = 120_000;
@@ -2110,23 +2382,97 @@ const ROTATION_STOP_DELAY_MS = 500;
  * app stops the turn to continue it in a fresh one (`ui.rotateStopFallback`), so Goal or Loop and a
  * pending Compact & Resume stay as they are.
  */
+/** The turn Stop may name: the running one, or one the page still holds after its activity ended. */
+async function stoppableTurn(sessionId: string): Promise<string | null> {
+  const controls = await sessionControlsFor(sessionId);
+  return controls.activeTurnId ?? controls.heldTurnId ?? null;
+}
+/**
+ * The person pressed Stop, but the turn it named is no longer the page's running turn (Haz on #1883):
+ * ChatGPT is not asked to stop anything, since that turn may have ended or another may run, but the
+ * app's own work for this chat ends as a Stop ends it: Goal or Loop off, a pending Compact & Resume
+ * cancelled, a silence Continue withdrawn. Says whether any of that was going on.
+ */
+export async function endOwnWorkAfterStop(sessionId: string, expectedTurnId: string,
+  before: Pick<SessionControlsView, 'conversationId' | 'automation'> | null = null): Promise<{ ended: boolean; resumeGoesOn: boolean }> {
+  const id = await controlledConversation(sessionId);
+  // Bound to the chat the Stop was pressed for: a Compact & Resume that moved the session to a new chat
+  // meanwhile is not that chat's to stop (CodeRabbit on #2066).
+  if (before && before.conversationId !== id) {
+    logInfo(`bridge: Stop for turn ${expectedTurnId} in ${before.conversationId} found the session moved to ${id}; nothing there was changed`);
+    return { ended: false, resumeGoesOn: true };
+  }
+  const ended: string[] = [];
+  // A Compact & Resume already committing cannot be stopped; the person is told so (CodeRabbit on #2066).
+  let resumeGoesOn = false;
+  // Off is saved as this chat's own choice, as a Stop saves it: a Goal armed only by its objective too (CodeRabbit on #2066).
+  // Goal or Loop on when Stop was pressed counts, also when the Stop's own path already turned it off
+  // before it found the turn gone (CodeRabbit on #2066).
+  const armed = goalArmedFor(id) || (!!before && before.automation !== 'off');
+  await setSessionAutomation(sessionId, 'off');
+  if (armed) ended.push('Goal or Loop');
+  if (continuationForSession(sessionId)) {
+    if (await cancelResumeNow(sessionId)) ended.push('a pending Compact & Resume');
+    else { resumeGoesOn = true; logInfo(`bridge: Stop in ${id} came too late for its Compact & Resume, which was already moving the chat; it goes on`); }
+  }
+  // The named turn's silence recovery ends with it, so no new Continue is filed for that turn; another
+  // turn's activity is left alone (CodeRabbit on #2066).
+  const repair = repairsInFlight.get(id);
+  const silenced = repair?.reason === 'silence' && repair.silenceGrant?.turnId === expectedTurnId;
+  if (silenced) repairsInFlight.delete(id);
+  if (activeUntil.get(id)?.turnId === expectedTurnId) { endActivity(id); ended.push('the silence watch of that answer'); }
+  // A fresh turn the app was starting after that answer is cancelled, as a Stop of it cancels it.
+  if (rotationFenceTurn(id) === expectedTurnId) {
+    if (!await clearRotationFence(id)) logWarn(`turn rotation: ${id} — the cancelled fresh turn could not be saved; a restart within ${Math.round(FENCE_MS / 1000)} s could still continue after the person's Stop`);
+    ended.push('a fresh turn');
+  }
+  const withdrawn = await withdrawOwnContinuesAfterStop(sessionId, expectedTurnId);
+  if (withdrawn || silenced) ended.push('an automatic Continue');
+  logInfo(`bridge: Stop for turn ${expectedTurnId} in ${id} found that turn no longer running; ChatGPT was not asked to stop. ` +
+    (ended.length ? `The app's own work ended: ${ended.join(', ')}` : 'The app had nothing of its own going on'));
+  changed();
+  return { ended: ended.length > 0, resumeGoesOn };
+}
 export async function stopSessionTurn(sessionId: string, expectedTurnId: string, options: { rotation?: boolean } = {}): Promise<SessionControlsView> {
   const id = await controlledConversation(sessionId);
   const assertCurrent = async () => {
     const latest = await getSession(sessionId);
     if (latest?.conversationId !== id || latest.activeTurnId !== expectedTurnId || !expectedTurnId ||
-        await conversationWasSuperseded(id) || (await sessionControlsFor(sessionId)).activeTurnId !== expectedTurnId) throw new Error('active_turn_changed');
+        await conversationWasSuperseded(id) || await stoppableTurn(sessionId) !== expectedTurnId) throw new Error('active_turn_changed');
   };
   await assertCurrent();
   if (!options.rotation) {
+    // The person's Stop takes over a pending fresh-turn Stop of the same turn: no automatic continue
+    // may follow the stop they asked for (CodeRabbit on #1954). The saved Stop loses its fresh-turn
+    // mark first, so a restart restores neither it nor its fence.
+    const pendingRotation = commands.find(entry => entry.spec.type === 'stop' && entry.spec.sessionId === sessionId &&
+      entry.spec.turnId === expectedTurnId && entry.spec.rotation === true);
+    if (pendingRotation && !await withdrawStopRotation(pendingRotation))
+      logWarn(`turn rotation: ${id} — the person's Stop over the fresh-turn Stop of turn ${expectedTurnId} could not be saved; a restart within ${Math.round(FENCE_MS / 1000)} s could still continue after it`);
+    if (rotationFenceTurn(id) === expectedTurnId) {
+      // On disk before their Stop goes out, so a restart cannot bring the fence back and continue
+      // after it (CodeRabbit on #1954). Their Stop goes out even when the disk refuses: it is theirs.
+      const cleared = await clearRotationFence(id);
+      logInfo(`turn rotation: ${id} — the person stopped turn ${expectedTurnId}; the fresh turn the app was starting is cancelled`);
+      if (!cleared) logWarn(`turn rotation: ${id} — the cancelled fresh turn could not be saved; a restart within ${Math.round(FENCE_MS / 1000)} s could still continue after the person's Stop`);
+    }
     await setSessionAutomation(sessionId, 'off');
     await assertCurrent();
     if (continuationForSession(sessionId)) { await cancelResumeNow(sessionId); await assertCurrent(); }
   }
   const userMessageId = await stopUserAnchor(sessionId, expectedTurnId);
   await assertCurrent();
+  // Only a Stop for a held turn may let the page end that turn itself when it shows nothing of it;
+  // a running turn always goes through ChatGPT's own Stop. Read right before queuing: activity can
+  // end while automation and the anchor are settled above (CodeRabbit).
+  const atQueue = await sessionControlsFor(sessionId);
+  // A pending Stop makes the turn read as active, so a repeated Stop keeps the first one's marker.
+  const pendingHeld = commands.some(entry => entry.spec.type === 'stop' && entry.spec.sessionId === sessionId &&
+    entry.spec.turnId === expectedTurnId && entry.spec.held === true);
+  const held = pendingHeld || (!atQueue.activeTurnId && atQueue.heldTurnId === expectedTurnId);
   const alreadyQueued = commands.some(entry => entry.spec.type === 'stop' && entry.spec.sessionId === sessionId && entry.spec.turnId === expectedTurnId);
-  const command = queue({ type: 'stop', sessionId, conversationId: id, turnId: expectedTurnId, ...(userMessageId ? { userMessageId } : {}) });
+  const command = queue({ type: 'stop', sessionId, conversationId: id, turnId: expectedTurnId, ...(userMessageId ? { userMessageId } : {}),
+    ...(held ? { held: true as const } : {}), ...(options.rotation ? { rotation: true as const } : {}) });
   try {
     // Reuse the command lease barrier: status must not hand out an unsaved request.
     const pendingLease = commandWrites.get(command.id);
@@ -2142,6 +2488,7 @@ export async function stopSessionTurn(sessionId: string, expectedTurnId: string,
   endActivity(id);
   repairsInFlight.delete(id);
   if (!alreadyQueued) logInfo(`bridge: ${options.rotation ? 'fresh-turn' : 'desktop'} Stop requested for session ${sessionId}, conversation ${id}, turn ${expectedTurnId}, command ${command.id}; native cancellation is unconfirmed`);
+  else if (pendingHeld) logInfo(`bridge: Stop repeated for held turn ${expectedTurnId} in ${id}; command ${command.id} stays a held-turn Stop`);
   wakeBrowserWork();
   changed();
   if (!alreadyQueued) {
@@ -2271,6 +2618,14 @@ export async function compactSession(sessionId: string): Promise<SessionControls
 /** Compact & Resume again from the summary an abandoned run already captured (#1215). */
 export async function resumeFromSavedSummary(sessionId: string, handoffId: string): Promise<SessionControlsView> {
   await controlledConversation(sessionId);
+  // A summary that cannot be used ends nothing: the waiting Compact & Resume stays (CodeRabbit on #2019).
+  if (!await savedSummaryUsable(sessionId, handoffId)) throw new Error('This summary can no longer be used. Start Compact & Resume again.');
+  // The person chose the saved summary over a Compact & Resume still waiting for ChatGPT's: that ticket ends.
+  const waiting = continuationForSession(sessionId);
+  if (waiting && waiting.state === 'awaiting-summary' && !waiting.handoffId) {
+    logInfo(`bridge: ${sessionId} continues from saved summary ${handoffId}; the Compact & Resume still waiting for ChatGPT's summary is cancelled`);
+    await cancelResumeNow(sessionId);
+  }
   const opened = await reopenWithHandoffNow(sessionId, handoffId);
   if (!opened) throw new Error('This summary can no longer be used. Start Compact & Resume again.');
   queueResumeCommand(sessionId, opened.token);
@@ -2475,6 +2830,8 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       return { token, reused };
     });
     if (!provisioned) return json(res, 409, { error: 'browser_disconnected' }, origin);
+    // Accepted and holding its token: the extension is connected (an announced version alone could still be refused).
+    markStartup('extension');
     const appeared = noteBrowserSeen(req);
     if (!provisioned.reused) {
       logInfo('bridge: browser extension connected and provisioned');
@@ -2578,6 +2935,19 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     return json(res, 400, { error: 'invalid_browser_request' }, origin);
   }
 
+  // The Projects a ChatGPT page lists in its sidebar (#1756): offered when linking a project.
+  if (route === '/chatgpt-projects' && req.method === 'POST') {
+    let body: Record<string, unknown>;
+    try {
+      body = (await readBody(req)) as Record<string, unknown>;
+    } catch (err) {
+      if ((err as Error).message === 'body_too_large') return tooLarge(res, origin);
+      return json(res, 400, { error: 'bad_request' }, origin);
+    }
+    if (!Array.isArray(body?.['projects']) || body['projects'].length > 400) return json(res, 400, { error: 'bad_request' }, origin);
+    const changed = await noteChatgptProjects(body['projects'] as Array<{ id: unknown; name: unknown }>, Date.now(), body['workspace']);
+    return json(res, 200, { ok: true, changed }, origin);
+  }
   if (route === '/models' && req.method === 'POST') {
     const accepted = observeChatModels(await readBody(req));
     if (accepted) changed();
@@ -2640,7 +3010,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
   }
 
   if (route === '/diagnostics' && req.method === 'POST') {
-    recordCompanionDiagnostics(await readBody(req));
+    recordCompanionDiagnostics(await readBody(req), browserOf(req) ?? '');
     return json(res, 200, { ok: true }, origin);
   }
 
@@ -2654,7 +3024,28 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
   // The extension is idle and about to reload into the build this app ships: bring the folder
   // Chrome loads from up to date first, and say whether it now holds that build.
   if (route === '/extension/update' && req.method === 'POST') {
+    // Read first, so the holds below are checked at the moment the folder is replaced (CodeRabbit on #1961).
+    const updateBody = await readBody(req).catch(() => null) as { pastBusyChatsMs?: unknown } | null;
+    const pastBusy = typeof updateBody?.pastBusyChatsMs === 'number' && Number.isFinite(updateBody.pastBusyChatsMs) ? updateBody.pastBusyChatsMs : 0;
+    // A message claimed since the extension's last /status is being sent: its folder is not replaced
+    // under it. The extension reads `hold` and asks again on a later pass (CodeRabbit on #1901).
+    // A claim still deciding (the send check can take seconds) counts too: it may take its message next.
+    if (claimsInProgress > 0 || (await listInputs()).some(inBrowserDelivery)) {
+      logUpdateHold('sending', 'bridge: the extension update waits: a message is being sent');
+      return json(res, 200, { ready: false, hold: 'sending' }, origin);
+    }
+    // A tool call that started after the extension's last /status holds it too: the reload would cut
+    // off the page that is waiting for its result.
+    if (runningToolCalls() > 0) {
+      logUpdateHold('app-busy', 'bridge: the extension update waits: a tool call is running in this app');
+      return json(res, 200, { ready: false, hold: 'app-busy' }, origin);
+    }
     const prepared = prepareExtensionUpdate(extensionBuildOf(req));
+    // The extension reloads now: that browser takes no new message until it is back.
+    if (prepared?.ready) extensionReloads.set(browserOf(req) ?? '', Date.now() + EXTENSION_RELOAD_PAUSE_MS);
+    // An update that waited only for answering pages for long goes ahead at a quiet moment (2026-10-31);
+    // said only when it really goes ahead.
+    if (prepared?.ready && pastBusy > 0) logInfo(`bridge: the extension updates although a ChatGPT tab is still answering: it waited ${Math.round(pastBusy / 60_000)} minutes for every page to be idle, and no tool call runs and nothing is being sent now`);
     if (prepared?.ready) logInfo(`bridge: extension folder updated to build ${prepared.build}; the extension reloads itself now`);
     else if (prepared) logWarn(`bridge: could not update the extension folder to build ${prepared.build}`);
     return json(res, 200, prepared ?? { ready: false }, origin);
@@ -2710,7 +3101,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     if (repaired) {
       await confirmRepair(repaired.slice(0, 64), action);
     } else if (repairFailed) {
-      await failRepairAttempt(repairFailed.slice(0, 64), action, url.searchParams.get('why'), url.searchParams.get('detail')?.slice(0, 80) ?? null);
+      await failRepairAttempt(repairFailed.slice(0, 64), action, url.searchParams.get('why'), url.searchParams.get('detail')?.slice(0, 80) ?? null, url.searchParams.get('approval') === '1');
     }
     const repairHeld = url.searchParams.get('repairHeld');
     if (repairHeld) noteRepairHeld(repairHeld.slice(0, 64), url.searchParams.get('why'));
@@ -2752,6 +3143,9 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         browserPreferenceRequest: pendingBrowserPreferenceRequest(),
         projectCreateRequests: otherBrowser ? [] : await pendingProjectCreates(),
         inputOpeningIds: inputRows.filter(row => !['sent', 'failed', 'cancelled'].includes(row.state)).map(row => row.id),
+        // The ones being sent right now (handed to a browser), not those that only wait in the queue:
+        // only these hold the extension's self-update (a blocked chat can keep a queued one for hours).
+        inputSendingIds: inputRows.filter(inBrowserDelivery).map(row => row.id),
         // A message for the running turn goes in while a call runs: ChatGPT keeps that call's result (#1231).
         // An existing chat waits out a new tunnel-client's takeover, or its next call waits ~2 min (#1220).
         inputs: [...pendingInputs.filter(input => !refusedAsStale && (!input.conversationId || input.directTurn || runningToolCalls(input.conversationId) === 0) &&
@@ -2786,7 +3180,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         ...(req.method === 'POST' && imageExportRequested ? { imageExports: pendingImageExports() } : {}),
         // A failure report closes this request. Reissuing the repair in the same response would
         // replace the visible failure with "Trying" before a renderer could ever observe it.
-        repairs: repairFailed || repairHeld ? [] : await takePendingRepairs(Date.now(), browser),
+        repairs: repairFailed || repairHeld ? [] : await takePendingRepairs(Date.now(), browser, takesWork, chosenBuiltIn),
         ...tabPolicy,
         recoveryMonitoring: browserRecoveryMonitoring(),
         // A newer extension build ships with this app. The extension reloads into it on its own
@@ -2795,6 +3189,8 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         // The extension follows the app: its texts in the app's language, and preferences it lost
         // with a reinstall (a new id starts with empty storage) taken back from here.
         language: getConfig().ui.language ?? null,
+        // And its popup in the app's colors and theme (extension-appearance.ts).
+        appearance: extensionAppearance(),
         browserPreferences: getConfig().ui.browserPreferences ?? null
       },
       origin
@@ -2864,6 +3260,21 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     } catch { return json(res, 400, { error: 'invalid_usage' }, origin); }
   }
 
+  if (route === '/input/opening-unavailable' && req.method === 'POST') {
+    const body = await readBody(req) as Record<string, unknown>;
+    if (!body || typeof body.id !== 'string' || !/^[a-f0-9-]{36}$/i.test(body.id) ||
+        !Number.isSafeInteger(body.tab) || (body.tab as number) < 0 || !['ready', 'preparing'].includes(String(body.stage)))
+      return json(res, 400, { error: 'invalid_opening_report' }, origin);
+    const browser = browserOf(req);
+    const ownsOpening = () => openingCustody.get(body.id as string) === browser && !staleCompanion(req) && !notChosenBrowser(req);
+    if (!browser || !ownsOpening())
+      return json(res, 409, { error: 'opening_not_owned' }, origin);
+    // A lost tab before anything reached it gets a fresh one (the extension forgets the old election);
+    // after two, the message fails with Retry as before.
+    // The tab as this browser numbers it: another browser's tab 7 is another tab (CodeRabbit on #1980).
+    const outcome = await lostBrowserOpening(body.id, ownsOpening, `${browser}:${body.tab as number}`);
+    return json(res, 200, { ok: outcome !== 'kept', ...(outcome === 'reopen' ? { reopen: true } : {}) }, origin);
+  }
   if (['/input/claim', '/input/bind', '/input/ack', '/input/fail', '/input/answer', '/input/progress', '/input/attachment'].includes(route) && req.method === 'POST') {
     const body = await readBody(req) as Record<string, unknown>;
     if (!body || typeof body.id !== 'string' || !/^[a-f0-9-]{36}$/i.test(body.id) || typeof body.owner !== 'string' || body.owner.length > 160) {
@@ -2882,10 +3293,12 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     }
     if (route === '/input/fail') {
       const ok = await failBrowserInput(body.id, body.owner, typeof body.error === 'string' ? body.error : 'Unable to prepare ChatGPT',
-        typeof body.detail === 'string' && /^[a-z-]{1,40}$/.test(body.detail) ? body.detail : undefined);
+        // The page's own short reason code, as the extension forwards it (see RELEASE_DETAIL there).
+        typeof body.detail === 'string' && /^[a-z][a-z0-9 _-]{0,79}$/.test(body.detail) ? body.detail : undefined);
       // A rejected picker choice invalidates cached availability. Reobserve existing
       // browser documents through the catalog owner; failure grants no new-tab authority.
-      if (ok && body.error === 'Requested model or reasoning could not be confirmed') requestChatModels(false);
+      // The page words that reason in its own language; its code says it in any (2.1.47 round).
+      if (ok && (body.detail === 'model-unconfirmed' || body.error === 'Requested model or reasoning could not be confirmed')) requestChatModels(false);
       return json(res, 200, { ok }, origin);
     }
     if (route === '/input/progress') {
@@ -2952,30 +3365,81 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     // As /status: an existing chat waits until a new tunnel-client has taken over its route (#1220).
     if (target && tunnelRouteSettling()) return json(res, 200, { input: null }, origin);
     if (staleCompanion(req) || notChosenBrowser(req)) return json(res, 200, { input: null }, origin);
-    if (!target && !chosenBuiltInBrowser(req) && openingHeldElsewhere(body.id, browserOf(req))) return json(res, 200, { input: null }, origin);
-    // A new chat of a project with a native ChatGPT Project is claimed only from that Project's
-    // own page, which the page names; the root or another Project is never its destination.
-    if (!target) {
-      const entry = (await listInputs()).find(row => row.id === body.id);
-      // A branch (#482) is made where its source chat lives in ChatGPT, never on a Project's page.
-      const link = entry?.projectId && entry.purpose !== 'decision' && !entry.lifetime && !entry.branch ? (await getProject(entry.projectId))?.chatgpt : undefined;
-      if (link && (link.state !== 'linked' || body.project !== link.id)) return json(res, 200, { input: null }, origin);
+    if (extensionReloading(req)) return json(res, 200, { input: null }, origin);
+    // From here this claim may take a message: the extension update waits until it has answered,
+    // however it ends (an early answer, a thrown error, a page that went away) (CodeRabbit on #1901).
+    claimsInProgress++;
+    try {
+      if (!target && !chosenBuiltInBrowser(req) && openingHeldElsewhere(body.id, browserOf(req))) return json(res, 200, { input: null }, origin);
+      // A new chat of a project with a native ChatGPT Project is claimed only from that Project's
+      // own page, which the page names; the root or another Project is never its destination.
+      if (!target) {
+        const entry = (await listInputs()).find(row => row.id === body.id);
+        // A branch (#482) is made where its source chat lives in ChatGPT, never on a Project's page.
+        const link = entry?.projectId && entry.purpose !== 'decision' && !entry.lifetime && !entry.branch ? (await getProject(entry.projectId))?.chatgpt : undefined;
+        if (link && (link.state !== 'linked' || body.project !== link.id)) return json(res, 200, { input: null }, origin);
+      }
+      // #1794: an automatic send is first checked with the person's send check, outside the queue's lock.
+      const automatic = (await listInputs()).find(row => row.id === body.id && row.state === 'queued');
+      const kind = automatic ? automaticSendKind(automatic) : null;
+      if (automatic && kind && getConfig().ui.sendCheckUrl) {
+        // A held row is not asked about again before its next ask, however often a page claims it.
+        if (heldBySendCheck(automatic)) {
+          // Pages ask every few seconds: said once per hold.
+          const hold = automatic.sendCheck!;
+          if (heldClaimsLogged.get(automatic.id) !== hold.attempt) {
+            heldClaimsLogged.set(automatic.id, hold.attempt);
+            if (heldClaimsLogged.size > 256) heldClaimsLogged.delete(heldClaimsLogged.keys().next().value!);
+            logInfo(`send check: ${kind} ${automatic.id} attempt ${hold.attempt} still held until ${new Date(hold.nextAt).toISOString()} (${hold.reason}); a page asked to send it`);
+          }
+          return json(res, 200, { input: null }, origin);
+        }
+        const attempt = (automatic.sendCheck?.attempt ?? 0) + 1;
+        const project = automatic.projectId ?? (automatic.sessionId ? (await getSession(automatic.sessionId))?.projectId : undefined) ?? null;
+        const verdict = await checkAutomaticSend({ kind, id: automatic.id, attempt, text: automatic.text,
+          chat: { session: automatic.sessionId ?? null, project, worker: target ? agentForOwnedConversation(target) : null } });
+        if (!verdict.allowed) {
+          if (await holdInputForSendCheck(automatic.id, attempt, verdict.reason, verdict.answered)) changed();
+          return json(res, 200, { input: null }, origin);
+        }
+        // What was allowed is what goes: a row edited or withdrawn meanwhile is asked about again.
+        const now = (await listInputs()).find(row => row.id === body.id);
+        if (now?.state !== 'queued' || now.text !== automatic.text) return json(res, 200, { input: null }, origin);
+      }
+      // The send check can take seconds: an update allowed meanwhile closed the door behind it.
+      if (extensionReloading(req)) return json(res, 200, { input: null }, origin);
+      const input = await claimBrowserInput(body.id, body.owner, target, body.requiresAuthorization === true);
+      // The first message for an existing chat after a new tunnel-client is what the hold learns from.
+      if (input && target) noteRouteExistingChatSend(target);
+      // The app's own unsent messages for this chat, so the page can replace one left in the composer (#1922).
+      const ownUnsent = input && target ? await ownUnsentTexts(target, input.id) : [];
+      return json(res, 200, { input, ...(ownUnsent.length ? { ownUnsent } : {}) }, origin);
+    } finally {
+      claimsInProgress--;
     }
-    const input = await claimBrowserInput(body.id, body.owner, target, body.requiresAuthorization === true);
-    // The first message for an existing chat after a new tunnel-client is what the hold learns from.
-    if (input && target) noteRouteExistingChatSend(target);
-    return json(res, 200, { input }, origin);
   }
 
   if (route === '/repairs/claim' && req.method === 'POST') {
-    if (staleCompanion(req) || notChosenBrowser(req)) return json(res, 200, { allowed: false }, origin);
+    if (staleCompanion(req)) return json(res, 200, { allowed: false }, origin);
+    const unchosen = notChosenBrowser(req);
     let body: unknown;
-    try { body = await readBody(req); } catch { return json(res, 400, { error: 'bad_request' }, origin); }
+    try { body = await readBody(req); } catch { return unchosen ? json(res, 200, { allowed: false }, origin) : json(res, 400, { error: 'bad_request' }, origin); }
     const token = body && typeof body === 'object' && !Array.isArray(body) ? (body as Record<string, unknown>).token : null;
-    if (typeof token !== 'string' || token.length > 128) return json(res, 400, { error: 'bad_request' }, origin);
+    if (typeof token !== 'string' || token.length > 128) return unchosen ? json(res, 200, { allowed: false }, origin) : json(res, 400, { error: 'bad_request' }, origin);
     const found = [...repairsInFlight].find(([, repair]) => repairNeedsClaim(repair) && repair.token === token && repair.state === 'handed');
     if (!found) return json(res, 200, { allowed: false }, origin);
     const [conversationId, repair] = found;
+    // A browser that is not the chosen one takes no new work (#1516), except thawing its own frozen
+    // tab: only the browser holding that tab can, and it opens nothing new (CodeRabbit on #1963).
+    if (unchosen && !holdsStalledTab(repair, conversationId, browserOf(req))) {
+      const now = Date.now(), last = unchosenClaimToldAt.get(conversationId);
+      if (last === undefined || now - last >= 60_000 || now < last) {
+        unchosenClaimToldAt.set(conversationId, now);
+        if (unchosenClaimToldAt.size > 500) unchosenClaimToldAt.delete(unchosenClaimToldAt.keys().next().value!);
+        logInfo(`bridge: refused the ${repair.reason} repair claim for ${conversationId}: that browser is not the chosen one, which takes the repair`);
+      }
+      return json(res, 200, { allowed: false }, origin);
+    }
     const session = await getSession(repair.sessionId);
     // A Compact & resume the user pressed may act on the chat they closed: handout and claim agree.
     const current = session?.conversationId === conversationId && departureAllowsRepairFor(session, repair.reason, repair.episode) &&
@@ -2987,6 +3451,22 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     // An observation still publishing can revoke this handout. Refuse this
     // claim transiently; the same unclaimed token remains eligible to be checked.
     const allowed = current && observationWritesInFlight === 0 && repairsInFlight.get(conversationId) === repair && repair.state === 'handed' && !repair.claimed;
+    if (!allowed) {
+      // The page is there and asked: this offer is not one nobody picked up (#1922). Say why it
+      // was refused, once a minute per chat and reason, so "never asked" and "refused" differ.
+      repair.claimAskedAt = Date.now();
+      const why = !current ? 'the chat no longer needs it or recovery is paused'
+        : observationWritesInFlight > 0 ? 'a chat was still saving its events; the page may claim it again'
+        : 'it was replaced or already claimed';
+      const key = `${conversationId}|${why}`;
+      const now = Date.now();
+      if (now - (claimRefusalsLogged.get(key) ?? 0) >= 60_000) {
+        claimRefusalsLogged.delete(key);
+        claimRefusalsLogged.set(key, now);
+        if (claimRefusalsLogged.size > 200) claimRefusalsLogged.delete(claimRefusalsLogged.keys().next().value!);
+        logInfo(`bridge: refused the ${repair.reason} repair claim for ${conversationId}: ${why}`);
+      }
+    }
     if (allowed) {
       repair.claimed = true;
       if (repair.reason === 'assistant-error' && repair.assistantSource)
@@ -3092,7 +3572,9 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       logInfo(`connector identity learned: ${(['core', 'desktop', 'plugins'] as const).map(s => `${s}=${apps[s][0]?.appId ?? '-'}`).join(' ')}`);
       changed();
     }
-    const observations = parsed.filter(item => item.kind !== 'app_sightings');
+    const traces = parsed.flatMap(item => item.kind === 'request_trace' ? item.traces ?? [] : []);
+    if (traces.length) noteRequestTraces(id, traces);
+    const observations = parsed.filter(item => item.kind !== 'app_sightings' && item.kind !== 'request_trace');
     if (!observations.length && parsed.length) return json(res, 200, { ok: true, stored: 0 }, origin);
     observationWritesInFlight += 1;
     let committed: { sessionId: string | null; stored: number; wake: boolean } | undefined;
@@ -3235,6 +3717,15 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     return json(res, 200, { sessionId: committed!.sessionId, stored: committed!.stored }, origin);
   }
 
+  if (route === '/reveal/failed' && req.method === 'POST') {
+    let body: Record<string, unknown>;
+    try { body = (await readBody(req)) as Record<string, unknown>; } catch { return json(res, 400, { error: 'bad_request' }, origin); }
+    const id = conversationId(body['conversationId']);
+    if (!id) return json(res, 400, { error: 'bad_conversation_id' }, origin);
+    unclaimedChatShowFailed(id);
+    return json(res, 200, { ok: true }, origin);
+  }
+
   if (route === '/closed' && req.method === 'POST') {
     let body: Record<string, unknown>;
     try {
@@ -3342,6 +3833,8 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     const pageGenerating = url.searchParams.get('generating');
     if (pageGenerating === '1' || pageGenerating === '0') notePageGenerating(id, pageGenerating === '1');
     const retiredWorker = retiredWorkerForConversation(id);
+    // A page in a browser that may not take new work is handed no tab to open (#1852).
+    const opensWork = opensNewWork(req, '/activity', id);
     const superseded = await conversationWasSuperseded(id);
     /**
      * What is driving this chat, which is not a fact about the recorder.
@@ -3382,8 +3875,8 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       }
       const queuePending = !!astraSession && !!await goalInputPriority(id, astraSession.id, pending?.turnId ?? draft?.turnId);
       if (queuePending) draft = null;
-      const wait = !superseded && !silenceSuppressed && !queuePending && !draft && astraSession && goalActiveFor(id)
-        ? await goalWaitFor(id, astraSession.id) : null;
+      const wait = superseded || silenceSuppressed || queuePending || !astraSession || !goalActiveFor(id) ? null
+        : draft ? draftReviewWait(id, draft.stage) : await goalWaitFor(id, astraSession.id);
       // Authority/history reads yield. Revoked or replaced work must not survive
       // as an earlier captured ready view in the final native-send authorization.
       const currentDraft = goalViewFor(id, goalClient);
@@ -3771,14 +4264,14 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         // inspect Chrome's real tab set, routes it to that tab before it considers opening one.
         // Returning the same inert id here makes a live page the fast path; /status remains the
         // service-worker/restart path. Redeem is still the exclusive ownership boundary.
-        revival: pendingBrowserRevival(),
-        revivals: pendingBrowserRevivals(),
+        revival: opensWork ? pendingBrowserRevival() : null,
+        revivals: opensWork ? pendingBrowserRevivals() : [],
         // Recovery only. A placement is normally collected by the `/compact` reply that
         // produced it; this is where it is still found if that reply never reached the page —
         // a navigation, a dropped socket — so a lost response becomes a correctly placed tab
         // rather than an OS open in whichever window happened to have focus. Same one-shot:
         // whoever collects it first is the one that opens it.
-        placement: pendingBrowserPlacement(id),
+        placement: opensWork ? pendingBrowserPlacement(id) : null,
         // Browser recovery is delivered by /status, whose service-worker caller can scan every
         // actual ChatGPT tab immediately before deciding exact reload vs exact open. Keeping it
         // out of this document-local feed also lets a dead content script be recovered.
@@ -3922,6 +4415,13 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       }
       const reason = typeof body['sourceError'] === 'string' ? body['sourceError'].trim().slice(0, 500) : '';
       compactionDeferrals.set(entry.token, reason);
+      const code = body['sourceErrorCode'];
+      if (code === 'results-unconfirmed' || code === 'results-wait-changed') {
+        const misses = compactionReceiptMisses.get(entry.token) ?? { unconfirmed: 0, changed: 0 };
+        compactionReceiptMisses.set(entry.token, code === 'results-unconfirmed'
+          ? { ...misses, unconfirmed: misses.unconfirmed + 1 } : { ...misses, changed: misses.changed + 1 });
+        if (compactionReceiptMisses.size > 200) compactionReceiptMisses.delete(compactionReceiptMisses.keys().next().value!);
+      }
       logInfo(`bridge: compaction ticket ${entry.token.slice(0, 8)} for ${id} — the page could not ask for the handoff yet: ${reason || 'no reason given'}`);
       changed();
       return json(res, 200, { deferred: true, job: resumeJobFor(entry.sessionId) }, origin);
@@ -3972,7 +4472,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       // With the authored anchor durable, the recorder's bounded response to it is the capture
       // authority (#787): ChatGPT may remount a long answer under another assistant id, so the
       // page's mounted Fiber shape can miss a brief the recorder already holds complete.
-      const captured = await captureRecordedBrief(id, checkpointToken, anchor);
+      const captured = await captureRecordedBrief(id, checkpointToken, anchor, opensNewWork(req, '/compact', id));
       return captured
         ? json(res, captured.status, { ...captured.body, bound: true }, origin)
         : json(res, 200, { bound: true, job: resumeJobFor(entry.sessionId) }, origin);
@@ -4098,6 +4598,9 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       const { opened, started } = ticket;
       // A new attempt on the open ticket: the page is asking again, so its last reason is gone (#1643).
       if (compactionDeferrals.delete(opened.token)) changed();
+      const misses = compactionReceiptMisses.get(opened.token);
+      const waiveReceipt = body['automatic'] === true && opened.automatic && compactionReceiptWaived(misses);
+      if (waiveReceipt) logInfo(`bridge: compaction ticket ${opened.token.slice(0, 8)} for ${id} — asking for the handoff without ChatGPT's receipt for the latest tool results: ${misses!.unconfirmed} earlier attempt(s) waited it out and ${misses!.changed} were cut short`);
       return json(
         res,
         202,
@@ -4108,6 +4611,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
           token: opened.token,
           sourceSend: opened.sourceSend,
           prompt: null,
+          ...(waiveReceipt ? { waiveReceipt: true } : {}),
           job: resumeJobFor(sessionId)
         },
         origin
@@ -4123,7 +4627,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       const token = typeof body['token'] === 'string' ? body['token'] : '';
       const entry = continuationByToken(token);
       if (!entry || entry.sessionId !== sessionId) return json(res, 409, { error: 'no_such_continuation' }, origin);
-      const captured = await captureCompactionBrief(id, entry, body['summary'], known);
+      const captured = await captureCompactionBrief(id, entry, body['summary'], known, opensNewWork(req, '/compact', id));
       return json(res, captured.status, captured.body, origin);
     }
 
@@ -4460,7 +4964,8 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     const opening =
       body['mode'] === 'goal' || body['mode'] === 'loop' ? (body['mode'] as 'goal' | 'loop') : null;
     if (!(await goalKeyPresent(opening ?? goalModeFor()))) return goalJson(res, 409, { error: 'no_api_key' }, origin);
-    const drafted = await draftOpeningMessage(text, opening);
+    // The extension gives up on this request after 190 s; a slower helper (#2033) must not outlast it.
+    const drafted = await draftOpeningMessage(text, opening, undefined, undefined, REQUEST_TIMEOUT_MS);
     if ('error' in drafted) return goalJson(res, 502, drafted, origin);
     // The page types it into a new chat; the message it comes back as is the app's (#1655).
     noteAutomaticReply(NEW_CHAT, drafted.reply);
@@ -4859,7 +5364,7 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
         const sourceConversation = primeConversation(command.spec.runId);
         const source = sourceConversation ? await findSessionByConversation(sourceConversation, { requireUnique: true }) : null;
         const sessionId = source?.conversationId === sourceConversation ? source?.id : undefined;
-        described.text = await prepareSessionPrompt(described.text, { sessionId, workingDirectory });
+        described.text = await prepareSessionPrompt(described.text, { sessionId, workingDirectory, subAgent: true });
       } else if (workingDirectory) {
         // Revivals carry the prime's latest user-authored message, without repeating Core or
         // source AGENTS. Reassert the same checkout after a restart or worker reuse.
@@ -4867,6 +5372,35 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
       }
     }
     if (!commands.includes(command) || command.owner !== client) return json(res, 409, { error: 'command_taken' }, origin);
+    // #1794: a worker's start or wake is an automatic send, first checked with the person's send
+    // check. Held, the page keeps redeeming (retryable) and the program is asked at most every
+    // 30 s; the command's own deadline still ends it, then with the hold as its reason.
+    // An allow answers this text, this payload and this program: a replaced payload or another
+    // configured program is asked again.
+    const allowed = command.sendCheck?.allowed;
+    if ((command.spec.type === 'worker' || command.spec.type === 'revive') && getConfig().ui.sendCheckUrl && described.text &&
+        (allowed?.text !== described.text || allowed.spec !== command.spec || allowed.url !== getConfig().ui.sendCheckUrl)) {
+      const spec = command.spec, claimedAt = command.claimedAt, url = getConfig().ui.sendCheckUrl!;
+      if (command.sendCheck && Date.now() < command.sendCheck.nextAt) return json(res, 503, { error: 'send_check_held', retryable: true }, origin);
+      const attempt = (command.sendCheck?.attempt ?? 0) + 1;
+      const prime = primeConversation(spec.runId);
+      const source = prime ? await findSessionByConversation(prime, { requireUnique: true }) : null;
+      const verdict = await checkAutomaticSend({ kind: spec.type === 'worker' ? 'worker-start' : 'worker-message', id: command.id, attempt,
+        text: described.text, chat: { session: source?.id ?? null, project: source?.projectId ?? null, worker: spec.agent } });
+      // The owner alone cannot tell a replaced command redeemed again by this same page: the spec and claim must be the asked ones.
+      if (!commands.includes(command) || command.owner !== client || command.spec !== spec || command.claimedAt !== claimedAt)
+        return json(res, 409, { error: 'command_taken' }, origin);
+      if (!verdict.allowed) {
+        command.sendCheck = { attempt, nextAt: Date.now() + SEND_CHECK_RETRY_MS };
+        command.lastError = verdict.answered
+          ? `the person's send check held it${verdict.reason ? `: ${verdict.reason}` : ''}`
+          : "the person's send check did not answer";
+        changed();
+        return json(res, 503, { error: 'send_check_held', retryable: true }, origin);
+      }
+      command.sendCheck = { attempt, nextAt: 0, allowed: { text: described.text, spec, url } };
+      if (command.lastError?.startsWith("the person's send check")) { command.lastError = null; changed(); }
+    }
     const liveResume = command.spec.type === 'resume' ? continuationByToken(command.spec.token) : null;
     if (command.spec.type === 'resume' && (!liveResume || !sendUnattempted(liveResume.destinationSend)))
       return json(res, 409, { error: 'command_already_sent', final: true }, origin);
@@ -4877,6 +5411,59 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
   // A page that redeemed a command saying how far it got. Step names only; see `commandProgress`.
   // Advisory: it changes no lease or outcome, and a stale or foreign report is ignored. The one
   // deadline it moves is an automatic handoff's, which ends sooner at a step that stalls before typing.
+  // A ChatGPT announcement a page closed before it could use its message box (2026-10-30). Only the
+  // dialog's heading, ChatGPT's own words, is logged; once a minute per chat and heading.
+  if (route === '/page-note' && req.method === 'POST') {
+    let body: Record<string, unknown>;
+    try {
+      body = (await readBody(req)) as Record<string, unknown>;
+    } catch (err) {
+      if ((err as Error).message === 'body_too_large') return tooLarge(res, origin);
+      return json(res, 400, { error: 'bad_request' }, origin);
+    }
+    if (body?.['note'] === 'input-held') {
+      const reason = typeof body['reason'] === 'string' && Object.hasOwn(HELD_INPUT_REASONS, body['reason']) ? body['reason'] : null;
+      const inputId = typeof body['inputId'] === 'string' && UUID_SHAPE.test(body['inputId']) ? body['inputId'] : null;
+      if (!reason || !inputId) return json(res, 400, { error: 'bad_request' }, origin);
+      const chat = conversationId(body['conversationId']);
+      // A new chat has no id before its first send: its message keys it, so two new chats stay apart.
+      const key = `held|${chat ?? `input:${inputId}`}|${reason}`;
+      const now = Date.now();
+      if (now - (pageNotesLogged.get(key) ?? 0) >= 60_000) {
+        notePageNoteLogged(key, now);
+        logInfo(`bridge: ${chat ? `the page of ${chat}` : 'a ChatGPT page'} held queued message ${inputId} back: ${HELD_INPUT_REASONS[reason]}`);
+      }
+      // A page that keeps showing another last question will not stop: after half an hour of it without a
+      // break, the automatic Continue would only answer the wrong question, so it ends (2026-11-02).
+      // Any other reason in between means the page saw something else: the run starts over (CodeRabbit on #2030).
+      // A page holding it until its own turn ends has it: the queue says so, and it is not failed as
+      // never picked up a minute later (2026-11-03: the person's Continue, while ChatGPT still answered).
+      if (await noteInputHeld(inputId, reason, chat).catch(() => null) === 'new') changed();
+      if (reason !== 'recovery-question-changed') recoveryQuestionChanged.delete(inputId);
+      if (reason === 'recovery-question-changed' && chat) {
+        const run = recoveryQuestionChanged.get(inputId);
+        const since = run && now - run.last <= QUESTION_CHANGED_GAP_MS ? run.since : now;
+        recoveryQuestionChanged.set(inputId, { since, last: now });
+        if (recoveryQuestionChanged.size > 200) recoveryQuestionChanged.delete(recoveryQuestionChanged.keys().next().value!);
+        if (now - since >= QUESTION_CHANGED_RETIRE_MS && await retireMismatchedRecoveryInput(inputId, chat)) {
+          recoveryQuestionChanged.delete(inputId);
+          changed();
+        }
+      }
+      return json(res, 200, { ok: true }, origin);
+    }
+    if (body?.['note'] !== 'announcement-closed') return json(res, 400, { error: 'bad_request' }, origin);
+    const heading = typeof body['heading'] === 'string' ? body['heading'].replace(/[\u0000-\u001f\u007f"]+/g, ' ').replace(/\s+/g, ' ').trim().slice(0, 80) : '';
+    const chat = conversationId(body['conversationId']);
+    const key = `${chat ?? ''}|${heading}`;
+    const now = Date.now();
+    if (now - (pageNotesLogged.get(key) ?? 0) >= 60_000) {
+      notePageNoteLogged(key, now);
+      logInfo(`bridge: ${chat ? `the page of ${chat}` : 'a ChatGPT page'} closed ChatGPT's announcement` +
+        `${heading ? ` "${heading}"` : ''} that covered it, by Escape`);
+    }
+    return json(res, 200, { ok: true }, origin);
+  }
   if (route === '/commands/step' && req.method === 'POST') {
     let body: Record<string, unknown>;
     try {
@@ -4891,6 +5478,15 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
     const allowed = step && REVIVAL_WAIT_STEPS.has(step) ? command?.owner === null : command?.owner != null && command.owner === body['client'];
     if (!step || !command || !allowed) return json(res, 200, { ok: false }, origin);
     command.progress = { ...command.progress, step, stepAt: Date.now() };
+    if (step === 'model-unconfirmed' && command.spec.type === 'revive') {
+      const wanted = commandModelSelection(command);
+      logWarn(`bridge: ${command.spec.agent}'s wake in ${command.spec.conversationId} goes out on ChatGPT's current model: ` +
+        `${[wanted?.model, wanted?.reasoningEffort].filter(Boolean).join(' ') || 'its model'} could not be confirmed in the picker, and a wake is not held back for it`);
+    } else if (step === 'model-unconfirmed' && command.spec.type === 'resume') {
+      const wanted = commandModelSelection(command);
+      logWarn(`bridge: the Compact & Resume of session ${command.spec.sessionId} starts its new chat on ChatGPT's current model: ` +
+        `${[wanted?.model, wanted?.reasoningEffort].filter(Boolean).join(' ') || 'its model'} could not be confirmed in the picker, and a resume is not abandoned for it`);
+    }
     if (command.spec.type === 'resume' && command.timer && continuationByToken(command.spec.token)?.automatic) armDeadline(command);
     // A worker about to send gets its receipt window, and its page learns the new deadline (#1086).
     if (command.spec.type === 'worker' && step === 'sending') {
@@ -5187,6 +5783,23 @@ async function handle(req: http.IncomingMessage, res: http.ServerResponse): Prom
           outcome: 'committed',
           committed: true,
           error: null,
+          completedAt: Date.now()
+        };
+      } else if (projectEntryDetail && /^(source-ready-timeout|transition-timeout)\b/.test(projectEntryDetail) &&
+          continuationByToken(command.spec.token)?.automatic === true &&
+          continuationByToken(command.spec.token)?.destinationSend.state === 'not-attempted' &&
+          await releaseContinuationDestinationSendNow(command.spec.token, command.id)) {
+        // #1882: ChatGPT did not open the source Project in time (its history limited, a VPN switching
+        // regions). Nothing was sent and the brief is fine: an automatic Compact & Resume keeps it, and
+        // the next opening pickup opens the replacement chat again, instead of writing a new brief later.
+        logInfo(`bridge: ${specKey(command.spec)} — ChatGPT did not open the source Project in time (${projectEntryDetail}); the brief is kept and the new chat is opened again at the next pickup`);
+        receipt = {
+          id,
+          client: client || command.owner,
+          conversationId: conversation,
+          outcome: 'terminal-failure',
+          committed: false,
+          error: 'ChatGPT did not open the source Project in time; the brief is kept and the new chat is opened again later',
           completedAt: Date.now()
         };
       } else {
@@ -6082,6 +6695,23 @@ async function writeCommandTransition(command: Command, transition: () => Promis
   }
 }
 
+/** A fresh-turn Stop the person's own Stop takes over: saved without its mark (CodeRabbit on #1954). */
+async function withdrawStopRotation(command: Command): Promise<boolean> {
+  return writeCommandTransition(command, async () => {
+    if (!commands.includes(command) || command.spec.type !== 'stop' || !command.spec.rotation) return true;
+    const { rotation: _rotation, ...spec } = command.spec;
+    command.spec = spec;
+    try {
+      await writeDurableNow(COMMANDS_STATE, commandSnapshot());
+      return true;
+    } catch (err) {
+      persistCommands();
+      logWarn(`bridge: could not save the person's Stop over ${specKey(command.spec)} — ${err instanceof Error ? err.message : String(err)}`);
+      return false;
+    }
+  });
+}
+
 async function persistCommandLease(
   command: Command,
   owner: string | null,
@@ -6228,6 +6858,14 @@ async function finalizeCommand(command: Command, receipt: CommandReceipt): Promi
     command.timer = null;
     commands = commands.filter((entry) => entry !== command);
     commandReceipts = [...commandReceipts.filter((entry) => entry.id !== receipt.id), receipt].slice(-MAX_COMMAND_RECEIPTS);
+    // A fresh-turn Stop the page could not send protects nothing any more: no stop and no continue
+    // follow, so its chat's calls run again at once (CodeRabbit on #1954). A Stop that went out keeps
+    // the fence until its stopped end is processed, which files the continue.
+    if (receipt.outcome === 'terminal-failure' && command.spec.type === 'stop' && command.spec.rotation &&
+        rotationFenceTurn(command.spec.conversationId) === command.spec.turnId) {
+      void clearRotationFence(command.spec.conversationId);
+      logInfo(`turn rotation: ${command.spec.conversationId} — the page could not stop turn ${command.spec.turnId}; its calls run again and no fresh turn follows`);
+    }
     changed();
     return true;
   });
@@ -6258,6 +6896,8 @@ function queue(spec: CommandSpec): Command {
       // — and its deadline starts again from this delivery, because this is new work.
       existing.spec = spec;
       existing.lastError = null;
+      // New work: the send check's hold and answer were about the payload it replaced.
+      delete existing.sendCheck;
     }
     changed();
     persistCommands();
@@ -6796,7 +7436,9 @@ async function captureCompactionBrief(
   conversationId: string,
   entry: ContinuationView,
   text: string,
-  known: SessionSummary | null
+  known: SessionSummary | null,
+  /** False for a page in a browser that may not open new work: chat B stays for the chosen one. */
+  collectPlacement = true
 ): Promise<{ status: number; body: Record<string, unknown> }> {
   const { sessionId, token } = entry;
   // The handoff owner freezes and budgets the brief with its saved plan and
@@ -6888,7 +7530,7 @@ async function captureCompactionBrief(
       commandId: command?.id ?? null,
       // Chat B, for A's own browser to open in A's own window. Null whenever delivery
       // already opened it through the OS, which is every path that has no page to tell.
-      placement: pendingBrowserPlacement(conversationId),
+      placement: collectPlacement ? pendingBrowserPlacement(conversationId) : null,
       job: resumeJobFor(sessionId)
     }
   };
@@ -6904,7 +7546,9 @@ async function captureCompactionBrief(
 async function captureRecordedBrief(
   conversationId: string,
   token: string,
-  anchor: string
+  anchor: string,
+  /** As for captureCompactionBrief: false for a page in a browser that may not open new work. */
+  collectPlacement = true
 ): Promise<{ status: number; body: Record<string, unknown> } | null> {
   const entry = continuationByToken(token);
   if (!entry || entry.from !== conversationId || entry.state !== 'awaiting-summary' ||
@@ -6921,7 +7565,7 @@ async function captureRecordedBrief(
   const current = continuationByToken(token);
   if (!current || current.state !== 'awaiting-summary' || current.sourceSend.state !== 'sent' ||
       current.sourceSend.messageId !== anchor) return null;
-  return captureCompactionBrief(conversationId, current, response.text, session);
+  return captureCompactionBrief(conversationId, current, response.text, session, collectPlacement);
 }
 
 /**
@@ -6960,7 +7604,7 @@ function pendingBrowserPlacement(conversationId: string | null, browser: string 
   const spec = command.spec;
   const worker = spec.type === 'worker';
   // Only what this ChatGPT account offers: a Free plan has no picker to confirm a model with (#1766).
-  const selection = spec.type === 'resume' ? resumeModelSelection(continuationByToken(spec.token)?.requestedModel, spec.token) : null;
+  const selection = commandModelSelection(command);
   return {
     id: command.id, model: worker ? spec.model : selection?.model ?? null,
     reasoningEffort: worker ? spec.reasoningEffort : selection?.reasoningEffort ?? null,
@@ -7277,6 +7921,27 @@ async function goalInputPriority(conversationId: string, sessionId: string, turn
   return priority;
 }
 
+/**
+ * The wait of a next step's draft that is waiting for the Goal step reviewer (#1832): from reading the
+ * step and finding a worker slot to the answer. Any other draft describes itself.
+ */
+function draftReviewWait(conversationId: string, stage: string): import('../shared/goal.js').GoalWait | null {
+  if (stage !== 'sending') return null;
+  const until = reviewWaitUntil(conversationId);
+  return until === null ? null : { reason: 'reviewer', until };
+}
+
+/**
+ * Whether `turnId` is a turn of this chat that has ended while a newer one has started since (#1922).
+ * Ordered by when the recorder saw each turn (`origin`), never by its clock: two turns can share a
+ * millisecond, and a clock adjustment can put a newer turn earlier.
+ */
+function supersededTurn(summary: SessionSummary | null | undefined, turnId: string | undefined): boolean {
+  const reported = turnId ? summary?.timelineTurns?.[turnId] : undefined;
+  return !!reported && reported.endTime !== undefined && summary?.activeTurnId !== turnId &&
+    Object.values(summary?.timelineTurns ?? {}).some(turn => turn.origin > reported.origin);
+}
+
 /** Both UIs describe the same existing reply and work deadlines, without another clock owner. */
 async function goalWaitFor(conversationId: string, sessionId: string, now = Date.now(), closed = false): Promise<import('../shared/goal.js').GoalWait | null> {
   const pending = goalPendingReplyFor(conversationId);
@@ -7286,6 +7951,9 @@ async function goalWaitFor(conversationId: string, sessionId: string, now = Date
     return visible ? { reason: 'silence', until: visible.deadline } : null;
   }
   if (runningToolCalls(conversationId) > 0) return { reason: 'tools' };
+  // The Goal step reviewer's hold has a known end (#1832), so its wait shows a countdown.
+  const reviewUntil = reviewerHoldUntil(conversationId) ?? reviewWaitUntil(conversationId);
+  if (reviewUntil !== null) return { reason: 'reviewer', until: reviewUntil };
   // A run's own workers report back into this chat, so the next instruction waits for them
   // rather than deciding from a context that is about to change. No deadline: the wait ends
   // when the last worker stops, and a countdown would only be a second, guessed clock.
@@ -7694,13 +8362,17 @@ async function sessionRecoveryCountdowns(sessionId: string, conversationId: stri
   if (recovery?.silenceBoundary && recoveryInputAllowed(sessionId, conversationId)) {
     const stoppedAt = recovery.pickupRecovery?.stoppedAt ??
       (stoppedQueued?.inputId === recovery.id ? stoppedQueued.pickupStoppedAt : undefined);
-    if (stoppedAt) return [{ kind: 'pickup-stopped', deadline: stoppedAt,
-      attempts: recovery.pickupRecovery?.attempts ?? BROWSER_PICKUP_MAX_ATTEMPTS, next: 'continue' }];
+    if (stoppedAt) {
+      const attempts = recovery.pickupRecovery?.attempts ?? BROWSER_PICKUP_MAX_ATTEMPTS;
+      return [{ kind: 'pickup-stopped', deadline: stoppedAt, attempts, next: 'continue',
+        ...(pickupExhausted(attempts, recovery.silenceBoundary.acceptedAt ?? recovery.createdAt ?? Date.now()) ? { exhausted: true as const } : {}) }];
+    }
   }
   if (stoppedQueued) {
     const queuedRow = rows.find(row => row.id === stoppedQueued.inputId);
     return [{ kind: 'pickup-stopped', deadline: stoppedQueued.pickupStoppedAt!,
-      attempts: stoppedQueued.pickupAttempts, next: queuedRow?.recovery ? 'continue' : 'queue' }];
+      attempts: stoppedQueued.pickupAttempts, next: queuedRow?.recovery ? 'continue' : 'queue',
+      ...(pickupExhausted(stoppedQueued.pickupAttempts, stoppedQueued.acceptedAt) ? { exhausted: true as const } : {}) }];
   }
   const pendingGoal = goalActiveFor(conversationId) ? goalPendingReplyFor(conversationId) : null;
   if (pendingGoal?.pickupStoppedAt && runningToolCalls(conversationId) === 0) {
@@ -7709,8 +8381,10 @@ async function sessionRecoveryCountdowns(sessionId: string, conversationId: stri
     const questionPosition = latestQuestion?.kind === 'user_message' ? latestQuestion.origin ?? latestQuestion.seq : latestQuestion?.seq ?? 0;
     if (source && !(latestQuestion && ((pendingGoal.eventSeq > 0 && questionPosition > pendingGoal.eventSeq) ||
         (latestQuestion.kind === 'turn_start' && latestQuestion.turnId !== source)))) {
+      const attempts = pendingGoal.pickupAttempts ?? BROWSER_PICKUP_MAX_ATTEMPTS;
       return [{ kind: 'pickup-stopped', deadline: pendingGoal.pickupStoppedAt,
-        attempts: pendingGoal.pickupAttempts ?? BROWSER_PICKUP_MAX_ATTEMPTS, next: goalModeFor(conversationId) }];
+        attempts, next: goalModeFor(conversationId),
+        ...(pickupExhausted(attempts, pendingGoal.acceptedAt) ? { exhausted: true as const } : {}) }];
     }
   }
   // Preserve pre-existing recovery/pickup precedence. A 429 only replaces
@@ -7811,6 +8485,12 @@ interface Repair {
    * needs a page to report something back.
    */
   offers?: number;
+  /**
+   * When a page last asked to claim this repair (#1922). A claim refused for the moment still proves
+   * a page is there, so offers made while one asked recently are not counted toward the no-page
+   * budget, whichever browser polls in between (CodeRabbit on #1953).
+   */
+  claimAskedAt?: number;
   /** Stable local owner; the browser action is valid only while this session is still here. */
   sessionId: string;
   endedTurns: number;
@@ -7855,6 +8535,23 @@ const TURN_SCOPED_REPAIRS: ReadonlySet<Repair['reason']> = new Set(['unattribute
 const repairsInFlight = new Map<string, Repair>();
 /** Exact provider Retry-After deadline for conversation-history reads. It delays browser recovery; it never creates one. */
 const providerHistoryBackoffUntil = new Map<string, number>();
+/*
+ * A history limit that answers the retry after its own wait with another 429 is still running,
+ * and an exact one-minute hold sends the next reload straight back into it. Measured 2026-10-30:
+ * a 327k-token chat was limited for half an hour while every reload after the 60-second hold drew
+ * another 429. Each limited retry holds longer, the same steps the page's own Retry presses take
+ * (content.js LOAD_FAILURE_LIMITED_BACKOFF_MS); ChatGPT's own longer Retry-After still wins. A
+ * limit that returns after a quiet quarter of an hour starts over.
+ */
+const PROVIDER_HISTORY_STREAK_HOLDS_MS = [0, 120_000, 240_000, 480_000, 900_000];
+const PROVIDER_HISTORY_STREAK_RESET_MS = 15 * 60_000;
+const providerHistoryStreaks = new Map<string, { strikes: number; until: number }>();
+/** The hold deadline a deferred pickup was last logged for, so each hold is logged once. */
+/** How long an automatic Continue may sit untaken before it becomes an ordinary message. */
+const RECOVERY_ORDINARY_AFTER_MS = 10 * 60_000;
+/** Withheld pickups already logged, by chat, input and reason. */
+const pickupWithheldLogged = new Set<string>();
+const pickupHeldLogged = new Map<string, number>();
 type ProviderDeferredColdStart = {
   repair: Repair;
   pickup: { replyId: string; dueAt: number; attempts: number; expiresAt: number; stoppedAt?: number } | null;
@@ -7876,11 +8573,23 @@ function providerHistoryBackoff(conversationId: string, now = Date.now()): numbe
 function noteProviderHistoryBackoff(conversationId: string, observations: readonly ChatObservation[]): void {
   const now = Date.now();
   for (const [id, deadline] of providerHistoryBackoffUntil) if (deadline <= now) providerHistoryBackoffUntil.delete(id);
+  for (const [id, streak] of providerHistoryStreaks) if (now - streak.until > PROVIDER_HISTORY_STREAK_RESET_MS) providerHistoryStreaks.delete(id);
   let until = providerHistoryBackoff(conversationId, now) ?? 0;
   for (const item of observations) {
     if (item.kind !== 'chat_error' || item.blocking !== true || !Number.isFinite(item.retryAt) ||
         item.retryAt! <= now || item.retryAt! - item.time > 24 * 60 * 60_000) continue;
-    until = Math.max(until, item.retryAt!);
+    // Only a limit seen after the previous hold ran out is a failed retry; one inside the hold, or
+    // a replay of an older notice, belongs to the episode already counted.
+    const streak = providerHistoryStreaks.get(conversationId);
+    const strikes = !streak || item.time - streak.until > PROVIDER_HISTORY_STREAK_RESET_MS ? 0
+      : item.time >= streak.until ? streak.strikes + 1 : streak.strikes;
+    const floor = item.time + PROVIDER_HISTORY_STREAK_HOLDS_MS[Math.min(strikes, PROVIDER_HISTORY_STREAK_HOLDS_MS.length - 1)]!;
+    until = Math.max(until, item.retryAt!, floor);
+    if (strikes > (streak?.strikes ?? 0)) {
+      logInfo(`bridge: ${conversationId} history was limited again after its wait (retry ${strikes}) — ` +
+        `holding automatic recovery ${Math.ceil((until - item.time) / 60_000)} minutes`);
+    }
+    providerHistoryStreaks.set(conversationId, { strikes, until: Math.max(streak && strikes ? streak.until : 0, until) });
   }
   if (!until) return;
   providerHistoryBackoffUntil.set(conversationId, until);
@@ -8028,6 +8737,61 @@ function assistantRecoveryCancelledFor(conversationId: string, sessionId: string
  * The user's "don't reload this answer". Only a reload the browser has not claimed can be
  * withdrawn; a claimed one is already happening. Returns whether a countdown was cancelled.
  */
+const HISTORY_LIMIT_REFUSAL = 'ChatGPT limits its chat\'s history';
+
+/** Why the person's one click did nothing; the renderer words each one (CodeRabbit on #1979). */
+export type PickupNowRefusal = 'no-chat' | 'history-limit' | 'nothing-waiting' | 'changed' | 'not-sent' | 'not-started';
+
+/**
+ * The person's one click on a chat whose next step was not picked up (2026-10-31): an automatic
+ * Continue goes as an ordinary message now (a plain Continue was taken at once where the automatic
+ * one sat); a queued message or a Goal/Loop step is tried again now. Never inside a history limit.
+ * `shown`: the stopped step the button belonged to; a newer one is never acted on in its name.
+ * The answer says only what really started: `queued` is a queued ordinary message, not a delivery.
+ */
+export async function pickupNow(sessionId: string, shown: { next: string; stoppedAt: number }, now = Date.now()):
+    Promise<{ ok: true; did: 'queued' | 'retrying' } | { ok: false; code: PickupNowRefusal }> {
+  const refuse = (code: PickupNowRefusal, why: string) => {
+    logInfo(`bridge: the person asked to pick up session ${sessionId} now; nothing was tried — ${why}`);
+    return { ok: false as const, code };
+  };
+  const conversationId = (await getSession(sessionId))?.conversationId;
+  if (!conversationId) return refuse('no-chat', 'it has no ChatGPT conversation yet');
+  const limitedUntil = providerHistoryBackoff(conversationId, now);
+  if (limitedUntil !== null)
+    return refuse('history-limit', `ChatGPT limits ${conversationId}'s history for ${Math.ceil((limitedUntil - now) / 1000)} s more`);
+  const owed = (await owedPickups(now)).get(conversationId);
+  if (!owed || owed.sessionId !== sessionId) return refuse('nothing-waiting', `nothing is owed in ${conversationId} any more`);
+  const current = (await sessionRecoveryCountdowns(sessionId, conversationId)).find(row => row.kind === 'pickup-stopped');
+  if (!current || current.next !== shown.next || current.deadline !== shown.stoppedAt)
+    return refuse('changed', `the stopped step shown (${shown.next}, stopped ${new Date(shown.stoppedAt).toISOString()}) is no longer the one waiting in ${conversationId}`);
+  // A history limit can arrive while the reads above ran: nothing is tried inside it (CodeRabbit on #1979).
+  const limitedLate = providerHistoryBackoff(conversationId, Date.now());
+  if (limitedLate !== null) return refuse('history-limit', `ChatGPT began limiting ${conversationId}'s history meanwhile`);
+  if (owed.queued && owed.inputId && shown.next === 'continue') {
+    const outcome = await continueAsOrdinaryMessage(owed.inputId, 'the person asked to continue now', 0,
+      conversation => providerHistoryBackoff(conversation, Date.now()) !== null ? HISTORY_LIMIT_REFUSAL : null);
+    if ('refused' in outcome && outcome.refused === HISTORY_LIMIT_REFUSAL)
+      return refuse('history-limit', `ChatGPT began limiting ${conversationId}'s history while the Continue was checked`);
+    if ('row' in outcome) {
+      pickupWatch.delete(conversationId);
+      logInfo(`bridge: the person queued the automatic Continue in ${conversationId} now, as an ordinary message`);
+      wakeBrowserWork();
+      return { ok: true, did: 'queued' };
+    }
+    // A queued message of the person's own is no automatic Continue: it is retried instead.
+    if (!/no longer a queued automatic Continue/.test(outcome.refused)) return refuse('not-sent', `the Continue in ${conversationId} was not queued: ${outcome.refused}`);
+  }
+  // The exact owed step the button stood for: a replacement that arrives meanwhile is not tried in
+  // its name (CodeRabbit on #1979).
+  const focus: PickupFocus = { conversationId, replyId: owed.replyId };
+  await inspectOwedPickups(now, focus);
+  if (!focus.started) return refuse('not-started', `no retry of ${conversationId} could start now (its tries are used up, or another repair or a gate holds it)`);
+  logInfo(`bridge: the person asked to pick up ${conversationId} now; ${focus.started === 'queued' ? 'its Continue was queued as an ordinary message' : 'its next try runs at once'}`);
+  wakeBrowserWork();
+  return { ok: true, did: focus.started };
+}
+
 export async function cancelAssistantRecovery(sessionId: string): Promise<boolean> {
   const conversationId = (await getSession(sessionId))?.conversationId;
   if (!conversationId) return false;
@@ -8131,6 +8895,64 @@ async function assistantRepairCurrent(conversationId: string, repair: Repair): P
  * is to offer again; this only ends the case where nothing is listening at all.
  */
 const UNCLAIMED_REPAIR_OFFERS = 10;
+/** Stuck repairs whose chat was already shown once (session and episode), so it is shown only once. */
+const unclaimedChatShown = new Set<string>();
+/** Which of those a chat's last show belongs to, and when it went out, so a failed show is given back. */
+const unclaimedChatShownFor = new Map<string, { key: string; at: number }>();
+/** Shows of one stuck repair the browser could not carry out: one more try, then the page-less verdict. */
+const unclaimedChatShowFailures = new Map<string, number>();
+/** A browser that cannot show a chat says so within seconds; a report later than this is not about that show. */
+const SHOW_FAILURE_REPORT_MS = 60_000;
+const SHOW_RETRIES_PER_REPAIR = 1;
+
+/**
+ * The browser took the chat to show it and could not (#2027): it may be shown once more when its offers run
+ * out. Only a report soon after the show counts, so an older show's late failure cannot release a newer
+ * episode's (a newer episode's show comes at least ten offers later), and repeated failures end in the
+ * page-less verdict instead of showing and offering forever (CodeRabbit on #2027).
+ */
+export function unclaimedChatShowFailed(conversationId: string, now = Date.now()): void {
+  const shown = unclaimedChatShownFor.get(conversationId);
+  if (!shown || now - shown.at > SHOW_FAILURE_REPORT_MS) return;
+  unclaimedChatShownFor.delete(conversationId);
+  const failures = (unclaimedChatShowFailures.get(shown.key) ?? 0) + 1;
+  unclaimedChatShowFailures.set(shown.key, failures);
+  if (unclaimedChatShowFailures.size > 500) unclaimedChatShowFailures.delete(unclaimedChatShowFailures.keys().next().value!);
+  if (failures > SHOW_RETRIES_PER_REPAIR) {
+    logWarn(`bridge: the browser could not show ${conversationId} again; its recovery stops when its offers run out`);
+    return;
+  }
+  unclaimedChatShown.delete(shown.key);
+  logWarn(`bridge: the browser could not show ${conversationId}; it is shown again if its recovery stays unclaimed`);
+}
+
+/**
+ * Before a Goal or Loop chat is given up as page-less, a browser running the extension shows its tab once
+ * and the offers start over (user, 2026-11-02). Twice on 2026-11-01 a Loop chat's repairs went unclaimed
+ * until the app stopped, and showing the chat by hand brought it back at once. Only a browser that can
+ * show chats counts: without one nothing would be shown, so the chat gets the page-less notice as before
+ * (CodeRabbit on #2027). Worker chats and chats nobody automates are never brought forward.
+ */
+function showUnclaimedChatOnce(conversationId: string, repair: Repair): boolean {
+  const key = `${repair.sessionId}:${repair.episode}`;
+  if (unclaimedChatShown.has(key) || !goalActiveFor(conversationId) || isChatBlocked(conversationId) ||
+      stopRequestedFor(conversationId) || getConfig().ui.browserOnly === true ||
+      !browserWakeConnected() || !revealCapable()) return false;
+  unclaimedChatShown.add(key);
+  unclaimedChatShownFor.set(conversationId, { key, at: Date.now() });
+  if (unclaimedChatShown.size > 500) unclaimedChatShown.delete(unclaimedChatShown.values().next().value!);
+  if (unclaimedChatShownFor.size > 500) unclaimedChatShownFor.delete(unclaimedChatShownFor.keys().next().value!);
+  repair.offers = 1;
+  logWarn(`bridge: ${conversationId} never claimed ${UNCLAIMED_REPAIR_OFFERS} ${repair.reason} repair offer(s) — showing its tab once before giving up`);
+  void recordNote(repair.sessionId, 'The browser did not pick up this chat\'s recovery, so the app is showing its tab to go on.')
+    .catch(() => undefined);
+  void revealChatInBrowser(conversationId).then(shown => {
+    if (!shown) logWarn(`bridge: no browser took ${conversationId} to show it; its recovery is offered ${UNCLAIMED_REPAIR_OFFERS} more times`);
+  });
+  return true;
+}
+/** How long a page's refused claim keeps a repair's offers from counting as unclaimed (#1922). */
+const CLAIM_ASKED_FRESH_MS = 2 * 60_000;
 const unclaimedRepairTold = new Set<string>();
 /**
  * Chats this app has concluded have no page, until one reports in again.
@@ -8454,7 +9276,7 @@ async function noteRecoveryObservations(
   // calls may run again, and the continue goes as an ordinary message.
   const fencedTurn = rotationFenceTurn(conversationId);
   if (lastEnd === 'stopped' && sessionId && fencedTurn && ended?.turnId === fencedTurn) {
-    clearRotationFence(conversationId);
+    void clearRotationFence(conversationId);
     void fileRotationContinueAfterStop(sessionId, fencedTurn).then(row => {
       logInfo(row ? `turn rotation: ${conversationId} — turn ${fencedTurn} stopped; continuing in a fresh turn`
         : `turn rotation: ${conversationId} — turn ${fencedTurn} stopped; a message was already waiting, so it goes instead of the continue`);
@@ -8613,6 +9435,15 @@ async function noteRecoveryObservations(
       continue;
     }
     if (item.recoverable !== true) continue;
+    // A page can keep a turn's clock after that turn ended and a newer one ran (a recovered page
+    // kept instead of reloaded): its report about the ended turn is stale, and recovering a chat
+    // that already moved on only interrupts it (#1922, 16:03 after a turn that ended at 15:54).
+    const staleReport = (summary: SessionSummary | null | undefined): boolean => {
+      if (!supersededTurn(summary, item.turnId)) return false;
+      logInfo(`bridge: ignored an error report for ${conversationId}: its turn ${item.turnId} ended before a newer turn`);
+      return true;
+    };
+    if (staleReport(recorded)) continue;
     // Resume can legitimately return 404 on an idle page. The recorder's exact current
     // generation (not a stale tab's turn or the newest question chosen below) must own H2.
     if (item.reason === 'stream_gone' && (!sessionId || recorded?.conversationId !== conversationId ||
@@ -8632,6 +9463,9 @@ async function noteRecoveryObservations(
       break;
     }
     const source = sessionId ? await assistantRepairSource(sessionId) : null;
+    // The reads above yield: the chat may have moved on since, so the report is checked again
+    // against the session as it is now, before any recovery is queued (CodeRabbit on #1927).
+    if (sessionId && item.turnId && staleReport(await getSession(sessionId))) continue;
     if (item.reason === 'stream_gone') {
       // Source reads yield. A newer question/turn can arrive after the admission check;
       // never attach the old 404 to that newly read question or reserve its budget.
@@ -9097,8 +9931,10 @@ function finishSilentChats(conversationIds: readonly string[], inspected?: Spent
  * with nothing arriving is this app's standing definition of a chat that has stopped, and a
  * conversation the loop is driving does not get a different definition just because what stalled
  * was the pickup rather than the turn. The next two wait 5 and 10 minutes; after the third
- * reload the schedule stops for good and the chat shows "Recovery stopped", with the
- * obligation kept for a manual return (2026-10-06: endless reloads did more harm than good).
+ * reload the chat shows "Recovery slowed" and the obligation is kept for a manual return. Quick
+ * reloads stop there (2026-10-06: endless reloads did more harm than good), but slow retries every
+ * 15 to 60 minutes go on within the pickup's lifetime: a chat must not stop for good while it is
+ * unfinished (user decision 2026-10-31). See `browserPickupDelay`.
  */
 // Asserted non-empty: the opening gap is read unconditionally when a schedule is armed, and a
 // schedule with no first step would be a watchdog that never starts.
@@ -9116,7 +9952,7 @@ const PICKUP_BACKOFF_MS = BROWSER_PICKUP_BACKOFF_MS;
  * obligation and gets its own schedule; a discharged one takes its schedule with it.
  */
 /** One durable source episode owns a bounded retry budget; the composer projects its stop reason. */
-const pickupWatch = new Map<string, { replyId: string; dueAt: number; attempts: number; expiresAt: number; stoppedAt?: number }>();
+const pickupWatch = new Map<string, { replyId: string; dueAt: number; attempts: number; expiresAt: number; stoppedAt?: number; inputId?: string; goalReplyId?: string }>();
 const PICKUP_WATCH_LIFETIME_MS = 12 * 60 * 60_000;
 
 /**
@@ -9154,13 +9990,25 @@ const COMPACTION_PICKUPS: Record<CompactionPhase, { every: number; attempts: num
   writing: { every: 5 * 60_000, attempts: 3 },
   opening: { every: 15 * 60_000, attempts: 3 }
 };
-const compactionWatch = new Map<string, { token: string; phase: CompactionPhase; nextAt: number; attempts: number; backoffs?: number; told?: boolean; streamLost?: boolean }>();
+const compactionWatch = new Map<string, { token: string; phase: CompactionPhase; nextAt: number; attempts: number; backoffs?: number; told?: boolean; streamLost?: boolean; continuedFromSaved?: boolean }>();
 /**
  * Why the source page last stopped an automatic ticket's attempt before asking (#1643), by token.
  * Kept until the next pickup lets the page try again, so the chat says it is held, not asking.
  */
 const compactionDeferrals = new Map<string, string>();
+/**
+ * Attempts of an automatic ticket that stopped at the tool-result receipt, by token (2026-11-03): a
+ * chat whose history ChatGPT limited never showed its latest results answered, and every attempt for
+ * two days ended there or was cut short by a recovery reload while the chat grew past its limit.
+ */
+const compactionReceiptMisses = new Map<string, { unconfirmed: number; changed: number }>();
+/** After one full wait without the receipt, or three attempts cut short, the next one asks without it. */
+export function compactionReceiptWaived(misses: { unconfirmed: number; changed: number } | undefined): boolean {
+  return !!misses && (misses.unconfirmed >= 1 || misses.unconfirmed + misses.changed >= 3);
+}
 const AUTOMATIC_ASKING_RETRY_PAUSE_MS = 10 * 60_000;
+/** How often an automatic ticket with a written brief tries again to open its new chat after the quick tries (#1882). */
+const AUTOMATIC_OPENING_SLOW_MS = 60 * 60_000;
 /**
  * How many slowed extra bursts an automatic pre-Send ticket gets before it is abandoned like a
  * manual one. Each pickup reloads the source page, so an unbounded retry turns a chat that can
@@ -9235,12 +10083,24 @@ function forgetGoalWatch(conversationId: string): void {
 let pickupWatchFloor: number | null = null;
 let compactionWatchFloor: number | null = null;
 
+/** A stopped pickup with no slow retry left: its attempts, or its lifetime, are used up. */
+function pickupExhausted(attempts: number, acceptedAt: number, now = Date.now()): boolean {
+  return attempts >= BROWSER_PICKUP_ATTEMPT_LIMIT || now - acceptedAt >= PICKUP_WATCH_LIFETIME_MS;
+}
+
 /** Any sign of life pushes the next reload out by the gap this chat is currently on. */
 function notePickupActivity(conversationId: string): void {
   const watch = pickupWatch.get(conversationId);
-  if (!watch || watch.stoppedAt) return;
-  const gap = PICKUP_BACKOFF_MS[Math.min(watch.attempts, PICKUP_BACKOFF_MS.length - 1)]!;
-  watch.dueAt = Date.now() + gap;
+  if (!watch) return;
+  watch.dueAt = Date.now() + browserPickupDelay(watch.attempts);
+  // A postponed deadline is saved with its owners, so a restart does not reload the chat early by
+  // the deadline it had before (CodeRabbit on #1971). Before the first reload there is none to save.
+  if (watch.attempts === 0) return;
+  const state = { attempts: watch.attempts, nextAt: watch.dueAt, ...(watch.stoppedAt ? { stoppedAt: watch.stoppedAt } : {}) };
+  if (watch.inputId) void syncQueuedPickupRecoveryNow(watch.inputId, watch.replyId, state)
+    .catch(error => logWarn(`bridge: could not save the postponed pickup in ${conversationId}: ${String(error)}`));
+  if (watch.goalReplyId) void syncGoalPickupRecoveryNow(conversationId, watch.goalReplyId, state)
+    .catch(error => logWarn(`bridge: could not save the postponed Goal pickup in ${conversationId}: ${String(error)}`));
 }
 
 /**
@@ -9300,7 +10160,10 @@ async function owedPickups(now: number): Promise<Map<string, OwedPickup>> {
   return owed;
 }
 
-async function inspectOwedPickups(now: number): Promise<boolean> {
+/** One chat whose outcome a caller of inspectOwedPickups needs: what started for it, if anything. */
+type PickupFocus = { conversationId: string; replyId: string; started?: 'queued' | 'retrying' };
+
+async function inspectOwedPickups(now: number, focus?: PickupFocus): Promise<boolean> {
   const floor = pickupWatchFloor;
   if (floor === null) return false;
   const owed = await owedPickups(now);
@@ -9314,7 +10177,15 @@ async function inspectOwedPickups(now: number): Promise<boolean> {
     if (repair?.reason === 'goal' && (now >= watch.expiresAt || repair.state !== 'handed' || owed.has(conversationId))) repairsInFlight.delete(conversationId);
   }
   let queued = false;
+  let focusSkipLogged = false;
   for (const reply of owed.values()) {
+    // The person's click is about one chat: another chat's pickup is neither tried nor spent by it
+    // (CodeRabbit on #1979).
+    if (focus && reply.conversationId !== focus.conversationId) {
+      // Said once per pass that skips anything: the person's click leaves other chats to the sweep.
+      if (!focusSkipLogged) { focusSkipLogged = true; logInfo(`bridge: the person's pickup click for ${focus.conversationId} leaves other chats' pickups to the regular sweep`); }
+      continue;
+    }
     const session = await getSession(reply.sessionId);
     if (session?.conversationId !== reply.conversationId || isChatBlocked(reply.conversationId) ||
         stopRequestedFor(reply.conversationId) || await conversationWasSuperseded(reply.conversationId) ||
@@ -9331,16 +10202,68 @@ async function inspectOwedPickups(now: number): Promise<boolean> {
       await syncGoalPickupRecoveryNow(reply.conversationId, reply.goalReplyId, sharedState);
     let watch = pickupWatch.get(reply.conversationId);
     if (!watch || watch.replyId !== reply.replyId) {
-      const attempts = Math.min(BROWSER_PICKUP_MAX_ATTEMPTS, reply.pickupAttempts);
+      const attempts = Math.min(BROWSER_PICKUP_ATTEMPT_LIMIT, reply.pickupAttempts);
+      const stopped = reply.pickupStoppedAt ?? (attempts >= BROWSER_PICKUP_MAX_ATTEMPTS ? reply.acceptedAt : undefined);
       watch = { replyId: reply.replyId, attempts,
+        ...(reply.queued && reply.inputId ? { inputId: reply.inputId } : {}),
+        ...(reply.goalReplyId ? { goalReplyId: reply.goalReplyId } : {}),
         expiresAt: reply.acceptedAt + PICKUP_WATCH_LIFETIME_MS,
-        dueAt: reply.pickupNextAt ?? Math.max(reply.acceptedAt, floor) + PICKUP_BACKOFF_MS[0],
+        // A stop recorded before slow retries existed has no next time: the first slow one follows it.
+        dueAt: reply.pickupNextAt ?? (stopped ? Math.max(stopped, floor) + BROWSER_PICKUP_SLOW_MS[0]
+          : Math.max(reply.acceptedAt, floor) + PICKUP_BACKOFF_MS[0]),
         ...(reply.pickupStoppedAt || attempts >= BROWSER_PICKUP_MAX_ATTEMPTS
           ? { stoppedAt: reply.pickupStoppedAt ?? reply.acceptedAt } : {}) };
       pickupWatch.set(reply.conversationId, watch);
     }
-    if (watch.stoppedAt || watch.attempts >= BROWSER_PICKUP_MAX_ATTEMPTS) continue;
-    if (now < watch.dueAt || now < reply.listenUntil) continue;
+    // The person's click is due now, also for a watch this pass just made again after a restart
+    // (CodeRabbit on #1979).
+    // Due now for the person's click only: a click that starts nothing leaves the schedule as it was
+    // (CodeRabbit on #1979).
+    const dueAt = focus?.conversationId === reply.conversationId && focus.replyId === reply.replyId ? Math.min(watch.dueAt, now) : watch.dueAt;
+    // An automatic Continue nothing took for long becomes an ordinary message rather than another
+    // reload or a stop: the chat must not stop while it is unfinished (user decision 2026-10-31).
+    // Checked between reloads and after a stop too; the conversion itself refuses while anything newer
+    // happened in the chat or anything runs.
+    // Not while its pages refuse it because the chat shows another last question: as an ordinary message it
+    // would lose that check and answer the wrong question (CodeRabbit on #2030).
+    if (reply.queued && reply.inputId && now - reply.acceptedAt >= RECOVERY_ORDINARY_AFTER_MS && !questionChangedRefusalActive(reply.inputId, now)) {
+      const stuck = watch.stoppedAt || watch.attempts >= 1 ? `not claimed after ${watch.attempts} reload(s)` : await queuedInputOfferBlocker(reply.inputId);
+      if (stuck) {
+        const outcome = await continueAsOrdinaryMessage(reply.inputId, stuck, RECOVERY_ORDINARY_AFTER_MS);
+        if ('row' in outcome) {
+          pickupWatch.delete(reply.conversationId);
+          wakeBrowserWork();
+          queued = true;
+          if (focus?.conversationId === reply.conversationId && focus.replyId === reply.replyId) focus.started = 'queued';
+          continue;
+        }
+        // Why it stays, once per chat, input and reason (CodeRabbit on #1960). Not for a ticket that
+        // is no automatic Continue or not old enough: those are ordinary waits.
+        if (!/no longer a queued automatic Continue|not old enough/.test(outcome.refused)) {
+          const key = `${reply.conversationId}|${reply.inputId}|ordinary:${outcome.refused}`;
+          if (!pickupWithheldLogged.has(key)) {
+            pickupWithheldLogged.add(key);
+            if (pickupWithheldLogged.size > 200) pickupWithheldLogged.delete(pickupWithheldLogged.values().next().value!);
+            logInfo(`bridge: the automatic Continue in ${reply.conversationId} is not sent as an ordinary message yet — ${outcome.refused}`);
+          }
+        }
+      }
+    }
+    if (watch.attempts >= BROWSER_PICKUP_ATTEMPT_LIMIT) continue;
+    if (now < dueAt || now < reply.listenUntil) continue;
+    // A reload inside a history limit cannot bring the page back and can extend the limit. Counting
+    // it anyway, at queue time, let it wait out the limit and then run with the next one due right
+    // behind it (2026-10-30: two of three reloads 61 seconds apart). It is counted when it can run.
+    const limitedUntil = providerHistoryBackoff(reply.conversationId, now);
+    if (limitedUntil !== null) {
+      if (pickupHeldLogged.get(reply.conversationId) !== limitedUntil) {
+        pickupHeldLogged.set(reply.conversationId, limitedUntil);
+        logInfo(`bridge: next automation/input step in ${reply.conversationId} waits for its history limit to end ` +
+          `(${Math.ceil((limitedUntil - now) / 1000)} s) — no reload is spent inside it`);
+      }
+      continue;
+    }
+    pickupHeldLogged.delete(reply.conversationId);
     if (!reply.queued && goalDraftBusy(reply.conversationId)) {
       notePickupActivity(reply.conversationId);
       continue;
@@ -9349,13 +10272,28 @@ async function inspectOwedPickups(now: number): Promise<boolean> {
     if (held?.state === 'done' && held.reason === 'goal') repairsInFlight.delete(reply.conversationId);
     else if (held && held.state !== 'done') continue;
     if (!workerRecoveryAllowed(reply.conversationId) || pagelessChats.has(reply.conversationId)) continue;
+    // A page cannot claim what the app itself does not offer: reloading it then changes nothing and
+    // only spends the budget (2026-10-31: three reloads for an automatic Continue the app withheld,
+    // then a stop, and no word of why). Say which gate holds it, once per chat and reason.
+    if (reply.queued && reply.inputId) {
+      const blocker = await queuedInputOfferBlocker(reply.inputId);
+      if (blocker) {
+        const key = `${reply.conversationId}|${reply.inputId}|${blocker}`;
+        if (!pickupWithheldLogged.has(key)) {
+          pickupWithheldLogged.add(key);
+          if (pickupWithheldLogged.size > 200) pickupWithheldLogged.delete(pickupWithheldLogged.values().next().value!);
+          logInfo(`bridge: next automation/input step in ${reply.conversationId} is not offered to the page — ${blocker}; no reload is spent on it`);
+        }
+        continue;
+      }
+    }
     const nextAttempts = watch.attempts + 1;
-    const nextAt = nextAttempts < BROWSER_PICKUP_MAX_ATTEMPTS
-      ? now + PICKUP_BACKOFF_MS[nextAttempts]! : undefined;
+    const wasStopped = !!watch.stoppedAt;
+    const nextAt = nextAttempts < BROWSER_PICKUP_ATTEMPT_LIMIT ? now + browserPickupDelay(nextAttempts) : undefined;
     const reserved = reply.queued && reply.inputId
-      ? await recordQueuedPickupAttemptNow(reply.inputId, reply.replyId, now, nextAt, sharedState)
+      ? await recordQueuedPickupAttemptNow(reply.inputId, reply.replyId, now, nextAt, sharedState, watch.attempts)
       : !reply.queued && reply.goalReplyId
-        ? await recordGoalPickupAttemptNow(reply.conversationId, reply.goalReplyId, now, nextAt)
+        ? await recordGoalPickupAttemptNow(reply.conversationId, reply.goalReplyId, now, nextAt, watch.attempts)
         : null;
     if (!reserved) continue;
     watch.attempts = reserved.attempts;
@@ -9365,12 +10303,31 @@ async function inspectOwedPickups(now: number): Promise<boolean> {
     // The session list's `recoveryStopped`, pushed as soon as the stop is recorded, whether or not
     // its last reload can still be queued. A queued input's stop already pushed with its outbox
     // write; a Goal reply's ledger has no push of its own.
-    if (watch.stoppedAt) notifyChanged();
+    const justStopped = Boolean(watch.stoppedAt && !wasStopped);
+    // The person may have blocked or stopped the chat while the stop mark was being saved: then nothing
+    // keeps trying, and a notice saying so would be wrong (CodeRabbit on #1979).
+    let skipped: string | null = null;
+    if (justStopped) {
+      if (isChatBlocked(reply.conversationId)) skipped = 'the chat was blocked';
+      else if (stopRequestedFor(reply.conversationId)) skipped = 'a Stop is pending';
+      else if ((await getSession(reply.sessionId).catch(() => null))?.conversationId !== reply.conversationId) skipped = 'the session moved to another chat';
+      notifyChanged();
+      if (skipped) logInfo(`bridge: no Recovery slowed notice for ${reply.conversationId} — ${skipped} while its stop mark was saved`);
+    }
+    const stillOwed = justStopped && !skipped;
+    if (stillOwed) {
+      // The alert goes with the saved stop mark, once, also when this pass's reload cannot be queued
+      // (another repair holds the chat): later passes see the chat already stopped (CodeRabbit on #1979).
+      logWarn(`bridge: browser pickup recovery has not collected the step in ${reply.conversationId} after ${watch.attempts} reloads; ` +
+        `the chat shows as stopped, and the app keeps trying every 15 to 60 minutes`);
+      noticeChatStopped('Recovery slowed', "The browser has not picked up this chat's next step. The app keeps trying; you can go on from the chat at once.", reply.sessionId);
+    }
     if (!queueBrowserRecovery(reply.conversationId, reply.sessionId,
       `goal:${reply.replyId}:${watch.attempts}`, 'goal', 0, now)) continue;
     queued = true;
-    logInfo(`bridge: next automation/input step uncollected in ${reply.conversationId} — reload ${watch.attempts}`);
-    if (watch.stoppedAt) logWarn(`bridge: browser pickup recovery stopped after ${watch.attempts} reloads; the original obligation remains queued in ${reply.conversationId}`);
+    if (focus?.conversationId === reply.conversationId && focus.replyId === reply.replyId) focus.started = 'retrying';
+    logInfo(`bridge: next automation/input step uncollected in ${reply.conversationId} — reload ${watch.attempts}` +
+      (wasStopped ? ' (slow retry)' : ''));
   }
   return queued;
 }
@@ -9387,6 +10344,9 @@ async function inspectOwedPickups(now: number): Promise<boolean> {
 async function inspectOwedCompactions(now: number): Promise<boolean> {
   if (compactionWatchFloor === null) return false;
   const owed = new Map(pendingContinuations().map((entry) => [entry.from, entry]));
+  for (const token of compactionReceiptMisses.keys()) {
+    if (![...owed.values()].some((entry) => entry.token === token)) compactionReceiptMisses.delete(token);
+  }
   for (const token of compactionDeferrals.keys()) {
     if (![...owed.values()].some((entry) => entry.token === token)) compactionDeferrals.delete(token);
   }
@@ -9447,7 +10407,22 @@ async function inspectOwedCompactions(now: number): Promise<boolean> {
             'The request was already sent, so it is not sent again. Open the chat to let it finish, or cancel compaction to return to it.'
         ).catch(() => undefined);
       }
+      // An automatic ticket whose brief is written keeps opening its new chat, once an hour after the
+      // quick tries: while it is open it owns the chat's recovery, so stopping here stopped the chat (#1882).
+      if (phase === 'opening' && entry.automatic) {
+        if (!watch.told) {
+          watch.told = true;
+          logWarn(`bridge: compaction ticket ${entry.token.slice(0, 8)} for ${entry.from} could not open its new chat after ${schedule.attempts} pickups — trying once an hour`);
+        }
+        watch.attempts = schedule.attempts - 1;
+        watch.nextAt = now + AUTOMATIC_OPENING_SLOW_MS - schedule.every;
+        continue;
+      }
       if (phase !== 'asking') continue;
+      // A Goal or Loop chat runs unattended: when a slowed burst too could not ask ChatGPT for a summary
+      // (2026-11-01: it no longer served the chat at all), it goes on from the last saved summary in a new
+      // chat of the same session, rather than waiting for someone to notice. One per ticket.
+      if ((watch.backoffs ?? 0) >= 1 && !watch.continuedFromSaved && await continueStuckFromSavedSummary(entry, watch)) continue;
       if (entry.automatic && (watch.backoffs ?? 0) < AUTOMATIC_ASKING_RETRY_BURSTS) {
         // A threshold-created ticket is durable work, not a ten-minute liveness verdict. The
         // source can spend this whole first budget draining native/local work without ever
@@ -9687,6 +10662,17 @@ function retireSpentRepairs(): void {
 let rotationHoldMs = 15_000;
 /** Test seam. */
 export function setRotationHoldForTests(ms: number): void { rotationHoldMs = ms; }
+/** What a restart loses of the pickup schedule: the in-memory watches; the saved attempts stay. */
+export function forgetPickupWatchesForTests(): void { pickupWatch.clear(); }
+/**
+ * Stops the 30-second maintenance timer. For tests that move a mocked Date.now by minutes on real
+ * timers: a real tick landing between two of their steps measures that jump as the computer
+ * waking from sleep and gives every chat 90 more seconds (noteRecoverySweepTick).
+ */
+export function stopRecoverySweepTimerForTests(): void {
+  if (staleSwarmTimer) clearInterval(staleSwarmTimer);
+  staleSwarmTimer = null;
+}
 
 /**
  * Waits, bounded, until the page has sent a fresh-turn continue into the call held for it (#1662).
@@ -9834,15 +10820,27 @@ function noteCallAttribution(
     if (!pro && sourceTurnId && filedSession?.activeTurnId === sourceTurnId &&
         filedSession.origin?.kind !== 'worker' && filedSession.origin?.kind !== 'helper' &&
         !isWorkerConversation(conversationId) && !(tool && GOAL_HOLD_TOOLS.has(tool)) && callHoldOpen(conversationId)) {
-      if (stopFallbackDue(conversationId, sourceTurnId, getConfig().ui.rotateStopFallback === true, Date.now()) && !rotationFenced(conversationId)) {
+      // Fresh turns switched off (0 minutes) since the declines: no fallback (CodeRabbit on #1954).
+      if ((getConfig().ui.rotateTurnMinutes ?? 30) > 0 &&
+          stopFallbackDue(conversationId, sourceTurnId, getConfig().ui.rotateStopFallback !== false, Date.now()) && !rotationFenced(conversationId)) {
         // ChatGPT offered no Send for this turn's continue twice: stop the turn once this result has
         // gone out, refusing (not running) any call that comes meanwhile, and continue after the stop.
         noteStopFallback(conversationId, sourceTurnId, Date.now());
-        armRotationFence(conversationId, sourceTurnId);
+        // The fence is on disk before the Stop can go out: a restart after ChatGPT took the Stop must
+        // still find it and file the continue (CodeRabbit on #1954).
+        const fenceSaved = armRotationFence(conversationId, sourceTurnId);
         logInfo(`turn rotation: ${conversationId} — ChatGPT offered no Send for the continue; stopping turn ${sourceTurnId} after this result to continue in a fresh one`);
         const timer = setTimeout(() => {
-          void stopSessionTurn(sessionId, sourceTurnId, { rotation: true }).catch(error => {
-            clearRotationFence(conversationId);
+          void fenceSaved.then(saved => {
+            if (!saved) {
+              void clearRotationFence(conversationId);
+              logWarn(`turn rotation: ${conversationId} — not stopping turn ${sourceTurnId}: its fence could not be saved, so a restart could lose the continue`);
+              return;
+            }
+            if (rotationFenceTurn(conversationId) !== sourceTurnId) return;
+            return stopSessionTurn(sessionId, sourceTurnId, { rotation: true });
+          }).catch(error => {
+            void clearRotationFence(conversationId);
             logWarn(`turn rotation: ${conversationId} — could not stop turn ${sourceTurnId}: ${String(error)}`);
           });
         }, ROTATION_STOP_DELAY_MS);
@@ -10020,7 +11018,11 @@ async function tickUnattributedIncident(): Promise<void> {
  */
 async function takePendingRepairs(
   now = Date.now(),
-  browser: string | null = null
+  browser: string | null = null,
+  /** Whether this browser may claim what it is offered; only its offers count toward the no-page budget. */
+  canClaim = true,
+  /** The chosen built-in browser, which takes a repair over from a browser that is not chosen (#1960). */
+  chosen = false
 ): Promise<Array<{ conversationId: string; token: string; reason: Repair['reason']; focus: boolean }>> {
   retireSpentRepairs();
   const pickupFloor = pickupWatchFloor;
@@ -10091,13 +11093,42 @@ async function takePendingRepairs(
     continueFollows?: boolean;
   }> = [];
   for (const [conversationId, repair] of repairsInFlight) {
-    // Another browser holds this chat. Offered here, a reload finds no tab and opens a copy.
-    if (chatHeldElsewhere(conversationId, browser)) continue;
+    // Another browser holds this chat. Offered here, a reload finds no tab and opens a copy. Not for
+    // the chosen built-in browser: the holder may not claim it, and the chat would sit (#1960, as
+    // inputs do since #1516).
+    if (!(chosen && repair.reason !== 'stalled') && chatHeldElsewhere(conversationId, browser)) continue;
+    // The chosen browser has no tab for a chat another browser holds, and with "browser only" it may
+    // not open one: offered, it would skip the repair unclaimed and spend the no-page budget on a chat
+    // that is open. It stays queued, said once, until a browser that can act asks (CodeRabbit on #1963).
+    if (chosen && repair.reason !== 'stalled' && getConfig().ui.browserOnly === true && chatHeldElsewhere(conversationId, browser)) {
+      const key = `${conversationId}:${repair.sessionId}:${repair.episode}`;
+      if (!browserOnlyHoldTold.has(key)) {
+        browserOnlyHoldTold.add(key);
+        if (browserOnlyHoldTold.size > 500) browserOnlyHoldTold.delete(browserOnlyHoldTold.values().next().value!);
+        logInfo(`bridge: the ${repair.reason} repair for ${conversationId} waits: another browser holds this chat, and "browser only" keeps the chosen built-in browser from opening it`);
+      }
+      continue;
+    }
+    // A browser that may not claim (not the chosen one, or out of date) is handed no repair that needs
+    // a claim: its claim is refused, and a failure it reported for a token another browser claimed
+    // would requeue that claim (CodeRabbit on #1963). The holder's own frozen tab is the exception.
+    if (!canClaim && repairNeedsClaim(repair) && !holdsStalledTab(repair, conversationId, browser)) continue;
     const unclaimed = repair.reason !== 'unattributed' && repairNeedsClaim(repair) && repair.state === 'handed' && !repair.claimed;
     if (repair.state !== 'queued' && !unclaimed) continue;
     if (now < repair.notBefore) continue;
+    // Keep the due repair queued: skipping its incident candidate would spend the pass,
+    // and marking it handed before this hold would leave nothing eligible after an answer.
+    if (repair.reason === 'unattributed' && approvalCardWaiting(conversationId, now)) {
+      logInfo(`bridge: holding the unattributed refresh for ${conversationId}: ChatGPT's tool approval card is waiting for the user`);
+      continue;
+    }
     if (unclaimed) {
-      repair.offers = (repair.offers ?? 1) + 1;
+      // A page that asked since the last offer was refused, not absent: that offer does not count.
+      // Nor does an offer to a browser that may not claim it (not the chosen one, or out of date):
+      // its polls would use up the budget while the chosen page keeps asking (CodeRabbit on #1953).
+      const askedRecently = repair.claimAskedAt !== undefined && now - repair.claimAskedAt < CLAIM_ASKED_FRESH_MS;
+      repair.offers = (repair.offers ?? 1) + (canClaim && !askedRecently ? 1 : 0);
+      if (repair.offers > UNCLAIMED_REPAIR_OFFERS && showUnclaimedChatOnce(conversationId, repair)) continue;
       if (repair.offers > UNCLAIMED_REPAIR_OFFERS) {
         // Nothing is listening. Say that, rather than go on offering into an empty room until
         // some other subsystem happens to clear the entry — and say it as what it is: the
@@ -10145,8 +11176,15 @@ async function takePendingRepairs(
     const currentSession = repair.attribution ? await getSession(repair.sessionId) : null;
     const allowed = await attributionRepairAllowed(repair, currentSession) && await assistantRepairCurrent(conversationId, repair) &&
       await silenceRepairCurrent(conversationId, repair) && compactionRepairCurrent(conversationId, repair);
+    // The card can appear during the asynchronous progress/authority reads above.
+    const heldByApproval = repair.reason === 'unattributed' && approvalCardWaiting(conversationId);
+    if (heldByApproval && repairsInFlight.get(conversationId) === repair && !repair.claimed) {
+      await updateRepairProgress(conversationId, repair, APPROVAL_REPAIR_DEFERRED_TEXT);
+      repair.state = 'queued';
+      logInfo(`bridge: holding the unattributed refresh for ${conversationId}: ChatGPT's tool approval card is waiting for the user`);
+    }
     if (allowed && repairsInFlight.get(conversationId) === repair && !isChatBlocked(conversationId) &&
-        !stopRequestedFor(conversationId))
+        !stopRequestedFor(conversationId) && !heldByApproval)
       {
         ready.push({ conversationId, token: repair.token, reason: repair.reason, focus: repair.reason === 'compaction',
           ...(repairNeedsClaim(repair) ? { requiresClaim: true } : {}),
@@ -10345,42 +11383,56 @@ function repairChangeDetail(detail: string | null): string | null {
   return `the answer made progress${source ? ` (${source})` : ''}`;
 }
 
+/** Repairs a still-loading tab only delays: the same episode retries after the navigation cooldown. */
+const NAVIGATION_RETRIED: ReadonlySet<string> = new Set(['assistant-error', 'no-tab', 'compaction']);
+
 async function failRepairAttempt(
   token: string,
   action: 'reloaded' | 'reopened' | 'resumed' | 'preserved' | 'present' | null,
   why: string | null = null,
-  changeDetail: string | null = null
+  changeDetail: string | null = null,
+  approval = false
 ): Promise<void> {
   for (const [conversationId, repair] of repairsInFlight) {
     if (repair.state !== 'handed' || repair.token !== token) continue;
     // ChatGPT recovered by itself and is answering: the page keeps the reload for after the answer
     // instead of ending it. Nothing failed, so it is neither a warning nor a "Reload failed" row.
     const streaming = why === 'streaming';
-    if (streaming) {
+    const heldByApproval = repair.reason === 'unattributed' && streaming && approval;
+    if (heldByApproval) {
+      // The pre-navigation page check can see the card before the next activity poll.
+      await noteApprovalCard(conversationId, true, repair.sessionId, approvalWaitDeps);
+      if (repairsInFlight.get(conversationId) !== repair) return;
+      logInfo(`bridge: holding the unattributed refresh for ${conversationId}: ChatGPT's tool approval card is waiting for the user`);
+    } else if (streaming) {
       if (!repair.awaitingStream)
         logInfo(`bridge: ChatGPT is answering again in ${conversationId}; the ${repair.reason} repair waits until it finishes`);
+    } else if (why === 'changed' && changeDetail === 'navigating' && NAVIGATION_RETRIED.has(repair.reason)) {
+      // A tab that is still loading (often the one a worker's wake just opened) is no failure: the
+      // same repair tries again after the short cooldown below. As a warning it counted as a problem
+      // in Activity, sixteen times in two days on the maintainer's Mac (2026-11-01).
+      logInfo(`bridge: the tab of ${conversationId} was still loading; the ${repair.reason} repair tries again in ${Math.round(NAVIGATION_RECOVERY_COOLDOWN_MS / 1000)} s`);
     } else {
       const exact = why === 'changed' ? repairChangeDetail(changeDetail) : null;
       const detail = why && Object.hasOwn(REPAIR_FAIL_REASONS, why) ? `: ${REPAIR_FAIL_REASONS[why]}${exact ? ` — ${exact}` : ''}` : '';
       logWarn(`bridge: the browser reported failed ${repair.reason} recovery for ${conversationId} (${action ?? 'action unspecified'}${detail})`);
     }
-    repair.awaitingStream = streaming;
+    repair.awaitingStream = streaming && !heldByApproval;
     await updateRepairProgress(
       conversationId,
       repair,
-      streaming
+      heldByApproval ? APPROVAL_REPAIR_DEFERRED_TEXT : streaming
         ? repair.attribution ? 'Not reloaded: ChatGPT is answering.' : 'ChatGPT is answering again; recovery waits until it finishes.'
         : `${action === 'reopened' ? 'Reopen' : action === 'resumed' ? 'Resume' : 'Reload'} failed while ${repairPurpose(repair).during}${repair.attribution ? '.' : '; will retry.'}`
     );
     if (repairsInFlight.get(conversationId) !== repair) return;
     if (repair.reason === 'assistant-error' && turnRepairSpent.get(conversationId)?.token === token)
       turnRepairSpent.delete(conversationId);
-    if (why === 'changed' && changeDetail === 'navigating' &&
-        (repair.reason === 'assistant-error' || repair.reason === 'no-tab' || repair.reason === 'compaction')) {
+    if (why === 'changed' && changeDetail === 'navigating' && NAVIGATION_RETRIED.has(repair.reason)) {
       // Navigation is transient; keep the same repair episode and retry after the short navigation cooldown.
       repair.notBefore = Math.max(repair.notBefore, Date.now() + NAVIGATION_RECOVERY_COOLDOWN_MS);
     }
-    if (repair.reason === 'unattributed') repair.state = 'done';
+    if (repair.reason === 'unattributed' && !heldByApproval) repair.state = 'done';
     else {
       repair.state = 'queued';
       repair.claimed = false;
@@ -10902,12 +11954,26 @@ function revivalFor(agent: string, runId: string): WorkerRevival | null {
  * gets here, and by the transaction itself if it somehow does. A continuation that can no
  * longer be claimed yields no text, and the command carries nothing to type.
  */
+/**
+ * The model a resume or a worker wake asks the page to choose before it types. A wake asks for the
+ * model and effort its worker was opened with (#1952): typed without one, it went out on whatever
+ * ChatGPT's box held. Only the exact worker of that run counts; anything else chooses nothing.
+ */
+function commandModelSelection(command: Command): { model: string | null; reasoningEffort: ReasoningEffort | null } | null {
+  const spec = command.spec;
+  if (spec.type === 'resume') return resumeModelSelection(continuationByToken(spec.token)?.requestedModel, spec.token);
+  if (spec.type !== 'revive') return null;
+  const agent = agentInfoForOwnedConversation(spec.conversationId);
+  if (!agent || agent.id !== spec.agent || (agent.runId !== undefined && agent.runId !== spec.runId)) return null;
+  return wakeModelSelection(agent, command.id);
+}
+
 function describe(command: Command, client: string | null, claimedSummary?: string): BridgeCommand {
   const spec = command.spec;
   // Only what this ChatGPT account offers: a Free plan has no picker to confirm a model with (#1766).
-  const selection = spec.type === 'resume' ? resumeModelSelection(continuationByToken(spec.token)?.requestedModel, spec.token) : null;
+  const selection = commandModelSelection(command);
   const expiresAt = Date.now() + Math.max(1, commandDeadlineDelay(command));
-  if (spec.type === 'stop') return { id: command.id, expiresAt, kind: 'stop-turn', type: 'stop', text: '', agent: null, model: null, reasoningEffort: null, conversationId: spec.conversationId, turnId: spec.turnId, ...(spec.userMessageId ? { userMessageId: spec.userMessageId } : {}) };
+  if (spec.type === 'stop') return { id: command.id, expiresAt, kind: 'stop-turn', type: 'stop', text: '', agent: null, model: null, reasoningEffort: null, conversationId: spec.conversationId, turnId: spec.turnId, ...(spec.userMessageId ? { userMessageId: spec.userMessageId } : {}), ...(spec.held ? { held: true } : {}) };
   // A resume's claim is persisted by /commands/redeem before this renderer is called. A
   // command shown to app/UI code without a browser document still carries no brief at all.
   const text = spec.type === 'resume'
@@ -11284,7 +12350,8 @@ function restoredCommandSpec(version: number, raw: Partial<CommandSpec>): Comman
         typeof stop.conversationId !== 'string' || !conversationId(stop.conversationId) ||
         typeof stop.turnId !== 'string' || !stop.turnId || stop.turnId.length > 256) return null;
     if (stop.userMessageId !== undefined && (typeof stop.userMessageId !== 'string' || !stop.userMessageId || stop.userMessageId.length > 256)) return null;
-    return { type: 'stop', sessionId: stop.sessionId, conversationId: stop.conversationId, turnId: stop.turnId, ...(stop.userMessageId ? { userMessageId: stop.userMessageId } : {}) };
+    return { type: 'stop', sessionId: stop.sessionId, conversationId: stop.conversationId, turnId: stop.turnId, ...(stop.userMessageId ? { userMessageId: stop.userMessageId } : {}), ...(stop.held === true ? { held: true as const } : {}),
+      ...(stop.rotation === true ? { rotation: true as const } : {}) };
   }
   if (
     version >= 3 &&
@@ -11568,6 +12635,16 @@ export async function restoreCommands(): Promise<void> {
   // This is the only publication point of restore. Everything above operated on local arrays;
   // everything below may again use ordinary live command helpers and timers.
   commands = plan.commands;
+  // Fences of the previous run come back for what is left of them, also when ChatGPT already took
+  // the Stop and only its stopped end is still to come (CodeRabbit on #1954).
+  const fencesBack = await restoreRotationFences();
+  if (fencesBack) logInfo(`turn rotation: restored ${fencesBack} fresh-turn fence(s) from the previous run; the continue follows each stopped end`);
+  // A fresh-turn Stop that survived the restart is still pending: its fence comes back with it, for
+  // what is left of the command's budget (CodeRabbit on #1954).
+  for (const command of commands) {
+    if (command.spec.type === 'stop' && command.spec.rotation)
+      void armRotationFence(command.spec.conversationId, command.spec.turnId, command.createdAt + FENCE_MS - Date.now());
+  }
   commandReceipts = plan.receipts;
   for (const token of plan.resumeTokens) rememberToken(token.sessionId, token.token);
   rearmRetainedCommandDeadlines();
@@ -11612,6 +12689,11 @@ export function resetBridgeForTests(): void {
   bridgeError = null;
   clearUnattributedIncident();
   providerHistoryBackoffUntil.clear();
+  pageNotesLogged.clear();
+  claimRefusalsLogged.clear();
+  providerHistoryStreaks.clear();
+  pickupHeldLogged.clear();
+  pickupWithheldLogged.clear();
   providerDeferredColdStarts.clear();
   activeUntil.clear();
   lastRecoverySweepTickAt = 0;

@@ -1,3 +1,4 @@
+import { ageOf, compactCount, elapsedParts, type AgeUnit } from '../shared/age.js';
 import { currentLanguage, t, ui } from './i18n.js';
 /**
  * The handful of DOM helpers both panels need.
@@ -46,7 +47,10 @@ const ICONS: Readonly<Record<string, string>> = {
   'i-globe': 'globe-hemisphere-west',
   'i-home': 'house',
   'i-image': 'image',
+  'i-keyboard': 'keyboard',
   'i-lock': 'lock-key',
+  'i-unlink': 'link-break',
+  'i-swap': 'arrows-left-right',
   'i-loop': 'arrows-clockwise',
   'i-monitor': 'monitor',
   'i-more': 'dots-three',
@@ -56,6 +60,7 @@ const ICONS: Readonly<Record<string, string>> = {
   'i-panel-right': 'fill:square-half',
   'i-palette': 'palette',
   'i-paw': 'paw-print',
+  'i-phone': 'device-mobile',
   'i-page-next': 'caret-right',
   'i-page-previous': 'caret-left',
   'i-pencil': 'pencil-simple',
@@ -66,8 +71,12 @@ const ICONS: Readonly<Record<string, string>> = {
   'i-plus': 'plus',
   'i-power': 'power',
   'i-pulse': 'activity',
+  'i-quote': 'quotes',
+  'i-related': 'link-simple',
   'i-retry': 'arrow-clockwise',
+  'i-restore': 'arrow-counter-clockwise',
   'i-search': 'magnifying-glass',
+  'i-shield': 'shield-check',
   'i-skill': 'cube',
   'i-sparkle': 'sparkle',
   'i-star': 'star',
@@ -132,21 +141,114 @@ export function el(tag: string, className = '', text: string | (() => string) = 
 
 export const $ = <T extends HTMLElement>(id: string): T => document.getElementById(id) as T;
 
+/**
+ * Paints a panel now when it is on screen, and otherwise once it is shown, with the newest paint
+ * only. Every state push used to rebuild Setup and Settings lists nobody could see: about 1,000
+ * nodes a minute of garbage, which left Blink's heap at 1.1 GB with 180 MB of it in use
+ * (2026-11-01, 80–92% fragmented pages that a collection never hands back).
+ */
+const pendingPaints = new Map<Element, () => void>();
+/** Elements the observer watches. Observing an element again, or inside the observer's own callback, makes
+ * Chromium report it once more in the same frame: "ResizeObserver loop completed with undelivered notifications". */
+const watched = new Set<Element>();
+let shownWatch: ResizeObserver | undefined;
+let rewatch = 0;
+
+/** The outermost hidden element around `node`: the one whose box appears when the panel is shown. */
+function hiddenRoot(node: Element): Element {
+  let root = node;
+  while (root.parentElement && !root.parentElement.checkVisibility()) root = root.parentElement;
+  return root;
+}
+
+function watch(node: Element): void {
+  shownWatch ??= new ResizeObserver(flushShownPaints);
+  for (const target of [hiddenRoot(node), node]) {
+    if (watched.has(target)) continue;
+    watched.add(target);
+    shownWatch.observe(target);
+  }
+}
+
+function flushShownPaints(): void {
+  for (const [node, paint] of [...pendingPaints]) {
+    if (!node.isConnected) { pendingPaints.delete(node); continue; }
+    if (!node.checkVisibility()) continue;
+    pendingPaints.delete(node);
+    paint();
+  }
+  // Keep watching what still waits; stop watching the rest. A hidden root that changed is watched
+  // after this frame, never from inside this callback.
+  const needed = new Set<Element>();
+  for (const node of pendingPaints.keys()) { needed.add(node); needed.add(hiddenRoot(node)); }
+  for (const target of [...watched]) {
+    if (needed.has(target)) continue;
+    watched.delete(target);
+    shownWatch!.unobserve(target);
+  }
+  if ([...needed].some(target => !watched.has(target)) && !rewatch) {
+    rewatch = window.setTimeout(() => {
+      rewatch = 0;
+      for (const node of pendingPaints.keys()) if (node.isConnected && !node.checkVisibility()) watch(node);
+    }, 0);
+  }
+}
+
+export function paintWhenShown(node: Element, paint: () => void): void {
+  // Without the two browser features (tests in jsdom), paint as before.
+  if (typeof node.checkVisibility !== 'function' || typeof ResizeObserver !== 'function' || node.checkVisibility()) {
+    pendingPaints.delete(node);
+    paint();
+    return;
+  }
+  pendingPaints.set(node, paint);
+  // A shown panel gets a box before the frame is painted, so it never shows the older list.
+  watch(node);
+}
+
 let toastTimer: number | undefined;
 let toastWatch: ResizeObserver | undefined;
 
-export function toast(message: string): void {
+/** How long a toast with an action (Undo) stays: long enough to read it and reach the button. */
+export const ACTION_TOAST_MS = 6000;
+
+/**
+ * A short notice. With `action`, it carries one button (Undo after a move, #1919) and stays
+ * `ACTION_TOAST_MS`; the pointer resting on it keeps it until the pointer leaves.
+ */
+export function toast(message: string, action?: { label: string; run: () => void }): void {
   document.querySelector('.toast')?.remove();
   toastWatch?.disconnect();
   const node = el('div', 'toast', message);
   node.setAttribute('role', 'status');
+  // Focus that was in the toast goes back to where it came from, never to the page body.
+  const before = document.activeElement as HTMLElement | null;
+  const close = () => {
+    const hadFocus = node.contains(document.activeElement);
+    node.remove(); toastWatch?.disconnect();
+    if (hadFocus && before?.isConnected && typeof before.focus === 'function') before.focus({ preventScroll: true });
+  };
+  if (action) {
+    node.classList.add('has-action');
+    const button = el('button', 'toast-action', action.label) as HTMLButtonElement;
+    button.type = 'button';
+    button.addEventListener('click', () => { window.clearTimeout(toastTimer); close(); action.run(); });
+    node.append(button);
+    // A pointer resting on it, or the keyboard on its button, keeps it until they leave.
+    const hold = () => window.clearTimeout(toastTimer);
+    const release = () => { window.clearTimeout(toastTimer); toastTimer = window.setTimeout(close, 2000); };
+    node.addEventListener('pointerenter', hold);
+    node.addEventListener('pointerleave', () => { if (!node.contains(document.activeElement)) release(); });
+    node.addEventListener('focusin', hold);
+    node.addEventListener('focusout', event => { if (!node.contains(event.relatedTarget as Node | null) && !node.matches(':hover')) release(); });
+  }
   document.body.append(node);
   placeToast(node);
   // The composer and its dock can grow or the window resize while the toast shows: it follows.
   toastWatch = typeof ResizeObserver === 'function' ? new ResizeObserver(() => { if (node.isConnected) placeToast(node); }) : undefined;
   for (const target of document.querySelectorAll('main, .card.is-session > .composer, .card.is-session > .composer-dock')) toastWatch?.observe(target);
   window.clearTimeout(toastTimer);
-  toastTimer = window.setTimeout(() => { node.remove(); toastWatch?.disconnect(); }, 3200);
+  toastTimer = window.setTimeout(close, action ? ACTION_TOAST_MS : 3200);
 }
 
 /** Shown over the content it is about: centred on the open chat's composer and just above it and
@@ -182,22 +284,41 @@ export async function run<T>(
 
 /** "12s ago" for a timestamp the main process vouched for, "never" for null. */
 export function ago(atMs: number | null): string {
-  if (atMs === null) return t("never");
-  const seconds = Math.max(0, Math.round((Date.now() - atMs) / 1000));
-  if (seconds < 3) return t("just now");
-  if (seconds < 90) return t("{0}s ago", [seconds]);
-  const minutes = Math.round(seconds / 60);
-  return minutes < 90 ? t("{0}m ago", [minutes]) : t("{0}h ago", [Math.round(minutes / 60)]);
+  // No time, or one that is not a number (a record without it), is "never", never a thrown error.
+  if (atMs === null || !Number.isFinite(atMs)) return t("never");
+  const age = ageOf(atMs, Date.now());
+  if (!age) return t("just now");
+  if (age.unit === 'second') return t("{0}s ago", [age.value]);
+  if (age.unit === 'minute') return t("{0}m ago", [age.value]);
+  if (age.unit === 'hour') return t("{0}h ago", [age.value]);
+  // Days and longer in the person's language (2.1.47 round: the chat list said "389h ago"). English
+  // reads "2d ago" beside "3h ago"; elsewhere the narrow style can drop the word "ago" for a minus
+  // sign ("-16 j"), so those use the short one ("il y a 16 j", "vor 16 Tagen").
+  const language = currentLanguage();
+  return new Intl.RelativeTimeFormat(language, { numeric: 'always', style: /^en\b/i.test(language) ? 'narrow' : 'short' })
+    .format(-age.value, age.unit);
 }
 
-/** The same age as one glanceable token: "8s", "2m", "—" when there is nothing. */
+/**
+ * The same age as one glanceable token in the person's language: "8s", "2m", "3d", "2w", "4mo" in
+ * English, "—" when there is nothing. The catalogs, not the platform's narrow units: those write
+ * four months as "4m" beside four minutes in English, Spanish and Japanese (CodeRabbit on #1902).
+ */
 export function shortAgo(atMs: number | null): string {
-  if (atMs === null) return '—';
-  const seconds = Math.max(0, Math.round((Date.now() - atMs) / 1000));
-  if (seconds < 3) return t("now");
-  if (seconds < 90) return `${seconds}s`;
-  const minutes = Math.round(seconds / 60);
-  return minutes < 90 ? `${minutes}m` : `${Math.round(minutes / 60)}h`;
+  if (atMs === null || !Number.isFinite(atMs)) return '—';
+  const age = ageOf(atMs, Date.now());
+  return age ? compactAgeText(age.value, age.unit) : t("now");
+}
+
+/** One age as a compact token from the catalogs: "45s", "4m", "5h", "3d", "2w", "4mo", "2y" in English. */
+export function compactAgeText(value: number, unit: AgeUnit): string {
+  const key = { second: "{0}s", minute: "{0}m", hour: "{0}h", day: "{0}d", week: "{0}w", month: "{0}mo", year: "{0}y" }[unit];
+  return t(key, [value]);
+}
+
+/** An elapsed time in the person's language, with the same tokens as ages: "3d 4h", German "3 T. 4 h". */
+export function elapsedDurationText(seconds: number, parts: 1 | 2): string {
+  return elapsedParts(seconds, parts).map(([value, unit]) => compactAgeText(value, unit)).join(' ');
 }
 
 /** A clock time for one event in a timeline. */
@@ -205,11 +326,28 @@ export function clockTime(atMs: number): string {
   return new Date(atMs).toLocaleTimeString(currentLanguage());
 }
 
+/**
+ * A chat row's time: hours and minutes ("3:52 PM", "15:52"), its full date in the title, and a
+ * machine-readable `datetime`. Shown only with "Show message times" on.
+ */
+export function rowTime(atMs: number): HTMLTimeElement {
+  const time = document.createElement('time');
+  const at = new Date(atMs);
+  // A damaged saved time (say 1e20) has no date; the row shows none rather than failing to draw.
+  if (!Number.isFinite(at.getTime())) return time;
+  // Bound, so a language change repaints rows already drawn. The full date is also the accessible
+  // name: the title alone is out of reach without a pointer (CodeRabbit on #1948).
+  ui(time, 'textContent', () => at.toLocaleTimeString(currentLanguage(), { hour: 'numeric', minute: '2-digit' }));
+  ui(time, 'title', () => at.toLocaleString(currentLanguage()));
+  ui(time, 'aria-label', () => at.toLocaleString(currentLanguage()));
+  time.dateTime = at.toISOString();
+  return time;
+}
+
 /** "1.2k", "3.4M" — for token and character counts that get large. */
+/** A count in a few characters: "999", "1.0k", "12k", "1.3M", "2.0B" (never "1000k" or "2000.0M"). */
 export function compactNumber(value: number): string {
-  if (value < 1000) return String(value);
-  if (value < 1_000_000) return `${(value / 1000).toFixed(value < 10_000 ? 1 : 0)}k`;
-  return `${(value / 1_000_000).toFixed(1)}M`;
+  return compactCount(value);
 }
 
 const cardMenuDocuments = new WeakSet<Document>();

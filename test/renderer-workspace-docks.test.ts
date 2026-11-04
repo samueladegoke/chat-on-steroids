@@ -260,3 +260,38 @@ it('keeps a greyed-out tab\'s reason in the app\'s language when the language ch
   expect(quick.title).toBe('Open a project to use Files and Review');
 });
 
+
+// The empty panel named its keys "Ctrl+Shift+3" in every language, beside "Strg+Umschalt+…" everywhere
+// else in German. They are Control on every system, so a Mac reads them with its own symbols.
+it('labels the empty panel keys as this keyboard prints them, in the language', async () => {
+  const { setLanguage } = await import('../src/renderer/i18n.js');
+  const kbd = () => document.querySelector('#workDockRight .work-dock-quick[data-view=files] kbd')!.textContent;
+  try {
+    vi.stubGlobal('navigator', { platform: 'Win32' });
+    setup().docks.register('files', 'Files', 'i-folder', vi.fn(), vi.fn(), () => true);
+    expect(kbd()).toBe('Ctrl+Shift+3');
+    setLanguage('de');
+    expect(kbd()).toBe('Strg+Umschalt+3');
+    setLanguage('en');
+    dom.window.close();
+    vi.stubGlobal('navigator', { platform: 'MacIntel' });
+    setup().docks.register('files', 'Files', 'i-folder', vi.fn(), vi.fn(), () => true);
+    expect(kbd()).toBe('⌃⇧3');
+  } finally {
+    setLanguage('en');
+    vi.unstubAllGlobals();
+  }
+});
+
+// CodeRabbit on #1890: opened from ⌘K, a view puts the keyboard on its tab, so the person is not left on a hidden page.
+it('puts the focus on the opened tab when asked', () => {
+  const { docks } = setup();
+  docks.register('files', 'Files', 'i-folder', vi.fn(), vi.fn(), () => true);
+  docks.register('review', 'Review', 'i-git-diff', vi.fn(), vi.fn(), () => true);
+  docks.activate('files');
+  expect(document.activeElement).toBe(document.body);
+  docks.activate('review', { focus: true });
+  const selected = document.querySelector<HTMLButtonElement>('#workDockRight [role=tab][aria-selected="true"]')!;
+  expect(selected.textContent).toContain('Review');
+  expect(document.activeElement).toBe(selected);
+});

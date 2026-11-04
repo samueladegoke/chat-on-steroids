@@ -77,6 +77,16 @@ describe('the diagnostics report', () => {
     for (const value of personal) expect(report.toLowerCase(), value).not.toContain(value.toLowerCase());
   });
 
+  it('says how long this start took, beside the earlier starts, after the crashes', () => {
+    const report = renderDiagnosticsReport({ ...sources, facts: {
+      install: [], system: [], crashes: ['Crash reports in the last 30 days: 0'], errors: [], tools: [], chats: [],
+      startup: ['This start: usable after 2.41 s (Electron ready 0.31 s, app window ready 2.41 s)',
+        'Earlier starts (9): usable after 1.60 s typically, 1.20 s at the fastest, 2.00 s at the slowest']
+    } });
+    expect(report).toContain('## Startup\n\nThis start: usable after 2.41 s (Electron ready 0.31 s, app window ready 2.41 s)\nEarlier starts (9)');
+    expect(report.indexOf('## Startup')).toBeGreaterThan(report.indexOf('## Crashes and restarts'));
+  });
+
   it('says which browser runs ChatGPT, its tabs by state and which page controls were found', () => {
     const report = renderDiagnosticsReport({ ...sources, extension: { status: {}, environment: {
       browser: { name: 'Google Chrome', version: '154.0.7400.12' },
@@ -89,6 +99,13 @@ describe('the diagnostics report', () => {
     const none = renderDiagnosticsReport({ ...sources, extension: { status: {}, environment: { browser: { name: 'Firefox', version: '144.0' },
       tabs: { open: 0, discarded: 0, frozen: 0, loading: 0, grouped: 0, inBackgroundWindow: 0 }, page: null } } });
     expect(none).toContain('Page checks: no awake ChatGPT tab answered');
+  });
+
+  it('says which language the extension stored and applied, and why not (2026-10-30)', () => {
+    const report = renderDiagnosticsReport({ ...sources, extension: { status: {}, language: { applied: null, stored: null, error: 'storage read did not answer within 5 s' } } });
+    expect(report).toContain("Extension language: stored none (uses the browser's), applied by this worker not yet, last attempt: storage read did not answer within 5 s");
+    const fine = renderDiagnosticsReport({ ...sources, extension: { status: {}, language: { applied: 'en', stored: 'en', error: null } } });
+    expect(fine).toContain('Extension language: stored en, applied by this worker en');
   });
 
   it('scrubs Windows paths inside JSON sections, where backslashes are doubled', () => {

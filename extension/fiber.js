@@ -86,7 +86,10 @@
   /** ChatGPT-rendered authored prose. Tool rows and this extension's own surfaces are excluded. */
   const MARKDOWN = '.markdown, [data-markdown-text-style="assistant-message"]';
   const TOOL = 'span[class*="tool-message"], div.pointer-events-none.contents, div:has(> [data-testid="cot-v5-tool-icon-pile"])';
-  const GENERATED_IMAGE = '[class~="group/imagegen-image"] img, [class~="group/generated-image-preview"] img';
+  // A gallery's thumbnails sit beside its large preview, outside both groups (#2005, seen 2026-11-02/03):
+  // `div[role=group] > button[aria-pressed] > img`. Being matched here is not ownership: each node still
+  // needs its exact typed image below.
+  const GENERATED_IMAGE = '[class~="group/imagegen-image"] img, [class~="group/generated-image-preview"] img, [role="group"] > button[aria-pressed] > img';
   const OWN_SURFACES = '.clf-stream, .clf-stage, .clf-composer, .clf-boot';
   const MAX_RENDERED_HTML = 120_000;
   // An exact, stable assistant final can have far more than 120k of decorative
@@ -791,6 +794,27 @@
    * uploads and every other role/channel is private or unknown. Only the provider message UUID,
    * sediment file id and bounded geometry cross worlds; no signed URL or arbitrary metadata does.
    */
+  /**
+   * The sediment file one mounted gallery image shows, or null. The gallery's own shell item is only its
+   * first image, so each image is found by its id among this turn's typed images (#2005: the large
+   * preview showing another image, and every thumbnail, were all "Image preview unavailable"). The large
+   * preview names its image (`imageId`) and says it is complete and not a preview; a thumbnail names its
+   * image object. Exactly one typed image of this turn must have that id, the same message and the
+   * same source, and be completed.
+   */
+  function galleryImageAsset(control, shown, shellImages) {
+    if (control && (control.isComplete !== true || control.isPreview !== false)) return null;
+    const wanted = control ? control.imageId : shown?.id;
+    if (typeof wanted !== 'string' || !wanted) return null;
+    if (control && shown && shown.id !== wanted) return null;
+    const matches = [...shellImages.keys()].filter(item => item?.id === wanted);
+    if (matches.length !== 1) return null;
+    const item = matches[0];
+    if (item.status !== 'completed' || item.isPreview === true) return null;
+    if (shown && (shown.chatGptMessageId !== item.chatGptMessageId || (typeof shown.src === 'string' && shown.src !== item.src))) return null;
+    return shellImages.get(item);
+  }
+
   function generatedImagesOf(sections, messages, exactImageNodes, shellImages = new Map()) {
     const out = [];
     const seen = new Set();
@@ -854,13 +878,13 @@
             // Current image previews use blob pixels. Only the mounted typed item
             // and its exact per-image control can identify those pixels; a blob URL
             // or a nearby gallery alone is not an asset identity.
-            let control = null;
+            let control = null, shown = null;
             for (let at = fiberOf(node), up = 0; at && up < MAX_CLIMB; up++, at = at.return) {
               const props = at.memoizedProps;
               if (props?.imageId && !control) control = props;
+              if (props?.image && typeof props.image === 'object' && !shown) shown = props.image;
               if (shellImages.has(props?.item)) {
-                if (control?.imageId === props.item.id && control.isComplete === true && control.isPreview === false)
-                  assetId = shellImages.get(props.item);
+                assetId = galleryImageAsset(control, shown, shellImages);
                 break;
               }
               if (props?.entry) break;
@@ -2262,6 +2286,16 @@
     // group while the turn runs. A top-level item owns its id; a nested copy of it is not read twice.
     const topLevel = new Set(entry.turn.items.filter(item => item?.type === 'assistant-message').map(item => str(item.messageId)).filter(Boolean));
     let work = 0;
+    // ChatGPT's own times for this turn (#2005): a question found in older history was recorded at the
+    // moment it was read, hours or months late. The question was sent when the turn's work started
+    // (its own `sentAtMs` once ChatGPT keeps it), and a finished answer was written when it completed.
+    // Only a plausible ChatGPT time counts: after 2020 and not later than a day from now (CodeRabbit on #2064).
+    const at = value => Number.isFinite(value) && value >= 1577836800000 && value <= Date.now() + 86_400_000 ? value : undefined;
+    const startedAt = at(entry.turn.workStartedAtMs), completedAt = at(entry.turn.workCompletedAtMs);
+    // The turn's start is its opening question's; its end is its last answer's. A follow-up sent into the
+    // running answer, or an answer a retry replaced, keeps only a time of its own.
+    const opening = entry.turn.items.findIndex(item => item?.type === 'user-message');
+    const closing = entry.turn.items.findLastIndex(item => item?.type === 'assistant-message' && item.phase === 'final_answer');
     for (const [index, item] of entry.turn.items.entries()) {
       if (++work > MAX_ROWS) return null;
       if (item?.type === 'user-message' || item?.type === 'assistant-message') {
@@ -2272,7 +2306,10 @@
         const final = !user && item.phase === 'final_answer';
         if (final) lastAnswer = item;
         const completed = final && item.completed === true && entry.turn.status === 'complete';
+        const written = user ? at(item.sentAtMs) ?? (index === opening ? startedAt : undefined)
+          : completed && index === closing ? completedAt : undefined;
         messages.push({ id, author: { role }, content: { content_type: 'text', parts: [typeof text === 'string' ? text : ''] },
+          ...(written !== undefined ? { create_time: written } : {}),
           channel: user ? null : final ? 'final' : 'commentary', end_turn: completed,
           status: completed ? 'finished_successfully' : 'in_progress',
           // The turn's place belongs to its first message. A message sent into the running answer
@@ -2293,7 +2330,9 @@
         images.set(item, asset);
         // Typed generated outputs are public tool media, never assistant prose.
         // Multiple assets may share their owning provider message.
+        const made = item.status === 'completed' && item.isPreview !== true && entry.turn.status === 'complete' ? completedAt : undefined;
         messages.push({ id, author: { role: 'tool' }, recipient: 'all', channel: 'final',
+          ...(made !== undefined ? { create_time: made } : {}),
           status: item.status === 'completed' && item.isPreview !== true ? 'finished_successfully' : 'in_progress',
           content: { content_type: 'multimodal_text', parts: [{ content_type: 'image_asset_pointer',
             asset_pointer: item.src, width: item.width, height: item.height }] } });
@@ -2793,6 +2832,10 @@
     if (!effort) return null;
     return model ? { id: model, effort } : null;
   }
+  /** How many versions and choices a picker may list: every model of an account, with room (#1905). */
+  const PICKER_MAX_VERSIONS = 48, PICKER_MAX_CHOICES = 48;
+  /** The slider's own lane order, unreadable lanes included (#1905): each one still takes an arrow key. */
+  const nativeLanes = lanes => lanes.length <= PICKER_MAX_CHOICES && lanes.every(Number.isInteger) && new Set(lanes).size === lanes.length ? { lanes } : {};
   function readPickerSnapshot(node) {
     let fiber = node && fiberOf(node);
     for (let up = 0; fiber && up < MAX_CLIMB; up++, fiber = fiber.return) {
@@ -2802,15 +2845,16 @@
       const props = owner?.composerIntelligencePickerState ? owner : owner?.dropdownContent?.props;
       const state = props?.composerIntelligencePickerState, data = props?.modelsData;
       if (!state || !Array.isArray(data?.versions)) continue;
-      if (data.versions.length > 20 || !Array.isArray(state.bucketSelections) || state.bucketSelections.length > 12) return null;
+      if (data.versions.length > PICKER_MAX_VERSIONS || !Array.isArray(state.bucketSelections) || state.bucketSelections.length > PICKER_MAX_CHOICES) return null;
       const id = value => typeof value === 'string' && /^[a-zA-Z0-9._-]{1,80}$/.test(value) ? value : null;
       // Native version groups may have spaces; execution slugs retain their strict contract.
-      const groupId = value => typeof value === 'string' && value.length <= 80 && /^[\p{L}\p{N}._ -]+$/u.test(value) && value.trim() === value && value.trim() ? value : null;
+      const groupId = value => typeof value === 'string' && value.length <= 80 && /^[\p{L}\p{N}._: -]+$/u.test(value) && value.trim() === value && value.trim() ? value : null;
       const label = value => typeof value === 'string' && value.trim().length > 0 && value.length <= 80 ? value.trim() : null;
       const effortOf = choice => choice.category?.modelLane === 'pro' ? 'pro'
         : ['auto', 'instant'].includes(choice.category?.modelLane) ? 'none'
         : choice.thinkingEffort === 'max' && choice.modelConfig?.isWorkModeModel === true ? 'max'
         : ({ min: 'low', standard: 'medium', extended: 'high', max: 'xhigh', minimal: 'minimal', low: 'low', medium: 'medium', high: 'high', xhigh: 'xhigh', ultra: 'ultra' })[choice.thinkingEffort] || null;
+      const lanes = nativeLanes(state.bucketSelections.map(choice => choice?.bucket));
       const choices = state.bucketSelections.map(choice => {
         const name = label(choice.category?.shortLabel);
         // Native navigation groups may contain spaces or localized names. Those
@@ -2822,15 +2866,18 @@
           familyId, familyLabel: label(family?.displayTextForIntelligence) || label(choice.modelConfig?.title) || (name && (/^\d/.test(name) ? `GPT-${name}` : name)),
           available: choice.availability?.status === 'available' && !props.modelSwitcherDenialsBySlug?.[choice.modelSlug] };
       });
-      const versions = data.versions.filter(version => version.enabled === true).map(version => ({ id: groupId(version.id), label: label(version.displayTextForIntelligence) }));
-      if (!versions.length || versions.some(v => !v.id || !v.label) || choices.some(c => !Number.isInteger(c.bucket) || !c.id || !c.label || !c.effort) ||
+      const versions = data.versions.filter(version => version.enabled === true).map(version => ({ id: groupId(version.id), label: label(version.displayTextForIntelligence) }))
+        .filter(v => v.id && v.label);
+      const readable = choices.filter(c => Number.isInteger(c.bucket) && c.id && c.label && c.effort);
+      choices.splice(0, choices.length, ...readable);
+      if (!versions.length || !choices.length ||
           new Set(versions.map(v => v.id)).size !== versions.length || new Set(choices.map(c => c.bucket)).size !== choices.length) return null;
       const version = groupId(state.selectedVersionEntry?.id), currentBucket = state.currentBucket;
       if (!versions.some(v => v.id === version) || !choices.some(c => c.bucket === currentBucket)) return null;
       const selected = state.currentSelection;
       const chosen = choices.find(c => c.bucket === currentBucket);
       if (selected?.modelSlug !== chosen.id || effortOf(selected) !== chosen.effort) return null;
-      return { version, currentBucket, versions, choices };
+      return { version, currentBucket, versions, choices, ...lanes };
     }
     return null;
   }
@@ -2842,9 +2889,11 @@
       const p = fiber.memoizedProps;
       if (!Array.isArray(p?.powerSelections)) continue;
       const selected = p.selectedPowerSelection ?? p.selectedLabelCandidate, options = p.modelListConfig?.options;
-      if (!selected || !Array.isArray(options) || options.length > 20 || p.powerSelections.length > 12) return null;
+      // ChatGPT's unified Chat/Work picker lists every model of the account in an existing chat (#1905).
+      if (!selected || !Array.isArray(options) || options.length > PICKER_MAX_VERSIONS || p.powerSelections.length > PICKER_MAX_CHOICES) return null;
       const id = value => typeof value === 'string' && /^[a-zA-Z0-9._-]{1,80}$/.test(value) ? value : null;
-      const group = value => typeof value === 'string' && /^[\p{L}\p{N}._ -]{1,80}$/u.test(value) && value.trim() === value ? value : null;
+      // Option ids now carry a colon too ("gpt-6-pro:", #1905); they are identities here, never execution slugs.
+      const group = value => typeof value === 'string' && /^[\p{L}\p{N}._: -]{1,80}$/u.test(value) && value.trim() === value ? value : null;
       const label = value => typeof value === 'string' && value.trim() && value.length <= 80 ? value.trim() : null;
       const effort = value => ({ none:'none', instant:'none', minimal:'minimal', min:'low', low:'low', standard:'medium', medium:'medium', extended:'high', high:'high', xhigh:'xhigh', 'extra high':'xhigh', max:'max', ultra:'ultra', pro:'pro' })[value] || null;
       // The machine reasoningEffort is a lane's transport setting, not its identity: the
@@ -2857,16 +2906,19 @@
       const current = options.filter(o => o?.selected === true);
       if (current.length !== 1) return null;
       const version = group(current[0].id);
-      const versions = options.filter(o => o && o.disabled !== true).map(o => ({ id: group(o.id), label: label(o.label) }));
+      // An option or lane it cannot read is left out, not a reason to drop the whole picker (#1905):
+      // the selected one must still read, below, and nothing is ever guessed.
+      const versions = options.filter(o => o && o.disabled !== true).map(o => ({ id: group(o.id), label: label(o.label) }))
+        .filter(v => v.id && v.label);
       // The shell names older models by number alone ("5.6"); the September picker's own rule
       // names them in full, so the list reads GPT-6, GPT-5.6, GPT-5.5 alike.
       const modelName = value => { const name = label(value); return name && /^\d/.test(name) ? `GPT-${name}` : name; };
       const choices = p.powerSelections.map(c => ({ bucket: c?.powerSettingIndex, id: id(c?.model),
         label: modelName(c?.modelLabel), familyId: id(c?.model), familyLabel: modelName(c?.modelLabel), effort: laneEffort(c),
         available: p.modelSelectionDisabled !== true && c?.disabled !== true &&
-          (!c?.availability || c.availability.status === 'available') && !p.modelSwitcherDenialsBySlug?.[c?.model] }));
-      if (!version || !versions.length || versions.some(v => !v.id || !v.label) || !choices.length ||
-          choices.some(c => !Number.isInteger(c.bucket) || !c.id || !c.label || !c.effort) ||
+          (!c?.availability || c.availability.status === 'available') && !p.modelSwitcherDenialsBySlug?.[c?.model] }))
+        .filter(c => Number.isInteger(c.bucket) && c.id && c.label && c.effort);
+      if (!version || !versions.length || !choices.length ||
           new Set(versions.map(v => v.id)).size !== versions.length || new Set(choices.map(c => c.bucket)).size !== choices.length || !versions.some(v => v.id === version)) return null;
       // One model's Instant and thinking lanes are separate slugs under one name (gpt-6 and
       // gpt-6-thinking, both "GPT-6"; observed 2026-10-07). They are one family, as the September
@@ -2884,7 +2936,7 @@
       }
       const matches = choices.filter(c => c.id === id(selected.model) && c.effort === laneEffort(selected));
       if (matches.length !== 1 || (selected.powerSettingIndex !== undefined && selected.powerSettingIndex !== matches[0].bucket)) return null;
-      return { version, currentBucket: matches[0].bucket, versions, choices };
+      return { version, currentBucket: matches[0].bucket, versions, choices, ...nativeLanes(p.powerSelections.map(c => c?.powerSettingIndex)) };
     }
     return null;
   }
@@ -2935,7 +2987,7 @@
    * `danger*` coloured; either marker disqualifies a control in any language. Every CoS connector refresh on the new layout failed with "the connector settings
    * card could not be read", so ChatGPT kept whatever tool list it had before an update.
    */
-  function pagePluginSnapshot(appId) {
+  function pagePluginSnapshot(appId, refresh) {
     const buttons = [...document.querySelectorAll('main button')].slice(0, 200);
     let connector = null, control = null;
     for (const button of buttons) {
@@ -2960,7 +3012,10 @@
       }
     }
     if (!connector || !Array.isArray(connector.actions) || typeof connector.name !== 'string') return null;
-    const externalPlugins = pluginsConnectorApp(connector.name, connector.id);
+    // A surface-qualified native refresh may know the durable App ID before the learned
+    // aliases catch up with a rename. This sets only the read bound, never refresh authority.
+    const surface = refresh?.appId === appId && SURFACES.includes(refresh.surface) ? refresh.surface : null;
+    const externalPlugins = surface ? surface === 'plugins' : pluginsConnectorApp(connector.name, connector.id);
     // A sanity bound, not a catalog: the app's own Core and Desktop declare a few dozen tools at most
     // (Windows Desktop 24 in 2.1.44, which the old bound of 16 refused, #1763); Plugins holds every
     // enabled external plugin's tools. A test keeps 64 above what Core and Desktop declare.
@@ -2978,9 +3033,9 @@
     return { appId, connectorName: connector.name.slice(0, 100), versionId: str(connector.app_metadata?.version_id), tools, refreshAvailable: !!control, tunnelId, settled: true };
   }
 
-  function pluginSnapshot() {
+  function pluginSnapshot(refresh) {
     const pageRoute = /^\/(?:settings\/plugins-settings|plugins)\/plugin_(asdk_app_[a-zA-Z0-9_-]+)$/.exec(location.pathname);
-    if (pageRoute && !location.hash) return pagePluginSnapshot(pageRoute[1]);
+    if (pageRoute && !location.hash) return pagePluginSnapshot(pageRoute[1], refresh);
     const route = /^#settings\/Plugins\/plugin_(asdk_app_[a-zA-Z0-9_-]+)$/.exec(location.hash);
     if (!route) return null;
     // The hash already names one exact installed connector settings route. Provider tab labels
@@ -3114,7 +3169,7 @@
     }
     if (data.source === 'clf-plugin-ask') {
       let plugin = null;
-      try { plugin = pluginSnapshot(); } catch { /* Unrecognized installed settings. */ }
+      try { plugin = pluginSnapshot(data.refresh); } catch { /* Unrecognized installed settings. */ }
       post({ source: 'clf-plugin-reply', nonce, v: 1, plugin }, location.origin);
       return;
     }

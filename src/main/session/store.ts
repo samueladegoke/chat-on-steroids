@@ -41,6 +41,7 @@ import type {
   ToolEditReview
 } from '../../shared/session.js';
 import type { WorkerAssignmentSummary } from '../../shared/session.js';
+import { APPROVAL_PROGRESS_PREFIX, APPROVAL_WAITING_TEXT } from '../../shared/approval-wait.js';
 import { continuationMarkerOf, DEFAULT_RECORDING_STORAGE_GIB, eventTokens, MAX_TOOL_RESULT_TOKENS, normalizedToolOutcome, RECORDING_STORAGE_LIMITS_GIB, storedTextTokens, workSequence, UNATTRIBUTED_SESSION_TITLE } from '../../shared/session.js';
 import { applyTurnIdentity, authoredTimeOf, chronological, injectedUserMessage, positionOf, projectTimeline, residenceOf,
   recordedRequestTurn, responseTurnId, type Chronological, type TimelineTurns } from '../../shared/chronology.js';
@@ -355,6 +356,8 @@ interface MetaCheckpoint {
   outcomeCountersMissing: boolean;
   /** Derived final-message activity boundary was added after the original summaries. */
   activityBoundaryMissing: boolean;
+  /** A worker's dock line (#1831: last answer's first line, approval wait) was added later still. */
+  workerLineMissing: boolean;
 }
 
 function messageKey(event: SessionEvent | Omit<MessageEvent, 'seq'> | NewNativeImageEvent): string | null {
@@ -397,6 +400,8 @@ function emptySummary(id: string, title: string, conversationId: string | null):
     lastToolCallAt: null,
     lastToolActivity: null,
     lastAssistantFinalAt: null,
+    lastAnswerLine: null,
+    approvalWaitingAt: null,
     lastTurnEndAt: null,
     lastFinishReportAt: null,
     processExitNonzero: 0,
@@ -544,13 +549,19 @@ export async function flushSessions(): Promise<void> {
  * it also waits for an in-flight reconstruction of this exact session before deciding whether
  * there is anything live to flush.
  */
-async function flushSession(sessionId: string): Promise<void> {
+/**
+ * Waits until every append already queued for this chat is in events.jsonl, without writing
+ * its summary. Event readers need only that: an open chat's summary is read from memory, and
+ * meta.json (two disk syncs) stays batched by scheduleMeta. Each of them used to force that
+ * write first, so every tool call paid one before ChatGPT got its answer.
+ */
+async function settleSessionWrites(sessionId: string): Promise<void> {
   let entry = open.get(sessionId);
   if (!entry) {
     const reconstructing = opening.get(sessionId);
     if (reconstructing) entry = await reconstructing;
   }
-  if (entry) await flushSessionEntry(entry);
+  if (entry) await entry.queue;
 }
 
 async function flushSessionEntry(entry: OpenSession): Promise<void> {
@@ -921,9 +932,13 @@ async function rebuildSummaryFromHistory(
         nativeQuestion: rebuilt.nativeQuestion,
         userMessages: rebuilt.userMessages,
         toolCalls: rebuilt.toolCalls,
+        provisionalToolCalls: rebuilt.provisionalToolCalls ?? 0,
+        providerSessionToolCalls: rebuilt.providerSessionToolCalls ?? 0,
         lastToolCallAt: rebuilt.lastToolCallAt,
         lastToolActivity: rebuilt.lastToolActivity,
         lastAssistantFinalAt: rebuilt.lastAssistantFinalAt,
+        lastAnswerLine: rebuilt.lastAnswerLine,
+        approvalWaitingAt: rebuilt.approvalWaitingAt,
         lastTurnEndAt: rebuilt.lastTurnEndAt,
         lastFinishReportAt: rebuilt.lastFinishReportAt,
         processExitNonzero: rebuilt.processExitNonzero,
@@ -978,6 +993,7 @@ async function readDurableSnapshot(id: string): Promise<DurableSessionSnapshot |
       (!aliasesCollapsed || checkpoint.canonicalProjectionCurrent) &&
       !checkpoint.outcomeCountersMissing &&
       !checkpoint.activityBoundaryMissing &&
+      !checkpoint.workerLineMissing &&
       checkpoint.summary.timelineTurns !== undefined &&
       checkpoint.summary.requestTurns !== undefined &&
       checkpoint.summary.nativeQuestion !== undefined &&
@@ -1083,11 +1099,32 @@ async function ensureOpen(id: string): Promise<OpenSession> {
 /** A hold-call result or app status is not evidence of new work. */
 function noteFinishWork(summary: SessionSummary, event: SessionEvent): void {
   if (!summary.finishTurn || (event.turnId && event.turnId !== summary.finishTurn.turnId)) return;
+  // A progress note of this turn reported after it completed or was stopped is not work, as in
+  // readCompletedFinal; a turn whose view failed is reopened by its fresh note, which stays work.
+  if (event.kind === 'assistant_message' && event.final !== true && event.state !== 'final' && !!event.turnId &&
+      summary.activeTurnId !== event.turnId && summary.timelineTurns?.[event.turnId]?.endOrigin !== undefined &&
+      (summary.lastTurnOutcome === 'completed' || summary.lastTurnOutcome === 'stopped')) return;
   const meaningful = event.kind === 'user_message' || event.kind === 'assistant_message' ||
     (event.kind === 'progress' && event.source !== 'app') ||
     (event.kind === 'tool_call' && !['keep_astra_on_forever', 'session_finish'].includes(event.call.tool));
   if (meaningful) summary.finishTurn = { ...summary.finishTurn, workSeq: Math.max(summary.finishTurn.workSeq,
     workSequence(event)) };
+}
+
+/** The first line of an answer with its Markdown marks taken off, at most 200 characters, or null. */
+export function answerLine(text: string): string | null {
+  for (const raw of text.split('\n')) {
+    // A code fence's marker, on the raw line: stripping inline marks first would turn ``` into `.
+    if (/^\s*(?:```|~~~)/.test(raw)) continue;
+    const line = raw
+      .replace(/^\s*(?:#{1,6}\s+|>\s*|[-*+]\s+|\d+[.)]\s+)/, '')
+      .replace(/(\*\*|__|\*|_|`)(.+?)\1/g, '$2')
+      .replace(/\[([^\]]+)\]\([^)]*\)/g, '$1')
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (line && !/^(?:---+|\*\*\*+)$/.test(line)) return line.length > 200 ? `${line.slice(0, 199)}…` : line;
+  }
+  return null;
 }
 
 function applyToSummary(summary: SessionSummary, event: SessionEvent): void {
@@ -1105,15 +1142,23 @@ function applyToSummary(summary: SessionSummary, event: SessionEvent): void {
   if (event.kind === 'user_message') summary.userMessages += 1;
   if (event.kind === 'tool_call') {
     summary.toolCalls += 1;
+    if (event.call.attributionMethod === 'generation') summary.provisionalToolCalls = (summary.provisionalToolCalls ?? 0) + 1;
+    if (event.call.providerSessionAnchor) summary.providerSessionToolCalls = (summary.providerSessionToolCalls ?? 0) + 1;
     const priorToolAt = summary.lastToolCallAt ?? 0;
     summary.lastToolCallAt = Math.max(priorToolAt, event.time);
     // Attribution repair can append an older call after newer activity. Keep the projection
     // aligned with lastToolCallAt rather than letting append order make an old action look latest.
     if (event.time >= priorToolAt) {
+      const tone = event.call.summary.tone;
       summary.lastToolActivity = {
         kind: event.call.summary.kind,
-        title: event.call.summary.title.slice(0, 200)
+        title: event.call.summary.title.slice(0, 200),
+        // A failed or doubtful step keeps its tool row's color in the worker's dock line (#1831).
+        ...(tone === 'bad' || tone === 'warn' ? { tone } : {})
       };
+      // A new step means ChatGPT's approval card, if one held the turn, was answered. By time, not by
+      // the order events are applied in: a rebuild applies canonical answers after the journal.
+      if ((summary.approvalWaitingAt ?? 0) <= event.time) summary.approvalWaitingAt = null;
     }
     if (event.call.endsActivity === true) {
       summary.lastFinishReportAt = Math.max(summary.lastFinishReportAt ?? 0, event.time);
@@ -1127,7 +1172,14 @@ function applyToSummary(summary: SessionSummary, event: SessionEvent): void {
     }
   }
   if (event.kind === 'assistant_message' && (event.final === true || event.state === 'final')) {
+    if (event.time >= (summary.lastAssistantFinalAt ?? 0)) {
+      summary.lastAnswerLine = answerLine(event.message.text);
+      if ((summary.approvalWaitingAt ?? 0) <= event.time) summary.approvalWaitingAt = null;
+    }
     summary.lastAssistantFinalAt = Math.max(summary.lastAssistantFinalAt ?? 0, event.time);
+  }
+  if (event.kind === 'progress' && event.progressId?.startsWith(APPROVAL_PROGRESS_PREFIX)) {
+    summary.approvalWaitingAt = event.message.text === APPROVAL_WAITING_TEXT ? event.time : null;
   }
   if (event.kind === 'chat_error') summary.errors += 1;
   if (event.kind === 'turn_end') {
@@ -1401,6 +1453,7 @@ export function upsertMessageEvent(
             }
           : previous?.kind === 'user_message' && event.kind === 'user_message'
             ? { ...event, inputId: event.inputId ?? previous.inputId,
+                ...(event.scheduled ?? previous.scheduled ? { scheduled: event.scheduled ?? previous.scheduled } : {}),
                 authoredAt: previous.authoredAt ?? event.authoredAt,
                 authoredText: event.authoredText ?? previous.authoredText,
                 wireTokenEstimate: event.wireTokenEstimate ?? previous.wireTokenEstimate,
@@ -1651,10 +1704,12 @@ function retainedAssets(assets: readonly AssetRef[] | undefined, retired: readon
   return kept.length ? kept : undefined;
 }
 
-/** Canonical background launch: the call UUID owns its later process status. */
-export async function recordProcessCall(sessionId: string, event: Omit<Extract<SessionEvent, { kind: 'tool_call' }>, 'seq'>): Promise<void> {
+/** Canonical call: process updates and provisional attribution revise this same UUID. */
+export async function recordProcessCall(sessionId: string, event: Omit<Extract<SessionEvent, { kind: 'tool_call' }>, 'seq'>,
+  admit?: () => boolean): Promise<boolean> {
   const entry = await ensureOpen(sessionId);
-  await enqueueSessionOperation(entry, 'process call', async () => {
+  return enqueueSessionOperation(entry, 'process call', async () => {
+    if (admit && !admit()) return false;
     const key = messageKey({ ...event, seq: 0 })!;
     if (entry.messages.has(key)) throw new Error('Process call identity already recorded');
     const denied = deniedAssetIds(sessionId, event.call.assets);
@@ -1674,6 +1729,39 @@ export async function recordProcessCall(sessionId: string, event: Omit<Extract<S
     entry.historySeq = full.seq;
     applyToSummary(entry.summary, full);
     scheduleMeta(entry);
+    return true;
+  });
+}
+
+/** Revise/remove only canonical provisional calls after exact request proof arrives.
+ * The recorder copies assets and a conflicting destination before requesting removal.
+ * Keep journal seqs unchanged: canonical messages and turn boundaries must not move. */
+export async function reviseProvisionalCall(sessionId: string, callId: string,
+  replacement: Omit<Extract<SessionEvent, { kind: 'tool_call' }>, 'seq'> | null): Promise<void> {
+  const entry = await ensureOpen(sessionId);
+  await enqueueSessionOperation(entry, 'provisional attribution', async () => {
+    const key = `tool_call\u0000${callId}`;
+    const previous = entry.messages.get(key);
+    if (previous?.kind !== 'tool_call' || previous.call.attributionMethod !== 'generation' && !previous.call.providerSessionAnchor) return;
+    // Invalidate the checkpoint before changing shards, including when the deleted shard
+    // was not the newest. A crash at any following boundary must rebuild the counters.
+    await writeSummary(entry.summary, -1);
+    if (replacement) {
+      const full = { ...replacement, seq: entry.nextSeq, origin: previous.origin ?? previous.seq };
+      await writeCanonicalMessage(sessionId, key, full);
+      entry.messages.set(key, full);
+      entry.nextSeq++;
+      entry.historySeq = full.seq;
+    } else {
+      const name = `${createHash('sha256').update(key).digest('hex')}.json`;
+      await fs.rm(path.join(sessionDir(sessionId), 'messages', name), { force: true });
+      entry.messages.delete(key);
+    }
+    entry.summary = await rebuildSummaryFromHistory(sessionId, entry.messages, entry.summary, entry.historySeq, true);
+    // Canonical calls are read from messages; an old incremental tail must not replay one.
+    entry.tail = entry.tail.filter(event => event.kind !== 'tool_call' || event.call.callId !== callId);
+    scheduleMeta(entry);
+    publishAttachmentSummary(entry.summary);
   });
 }
 
@@ -1728,7 +1816,7 @@ export interface ReadOptions {
  */
 export async function readEvents(sessionId: string, options: ReadOptions = {}): Promise<SessionEvent[]> {
   assertSessionId(sessionId);
-  await flushSession(sessionId);
+  await settleSessionWrites(sessionId);
   const from = options.from ?? 0;
   const limit = options.limit ?? Number.MAX_SAFE_INTEGER;
 
@@ -1862,19 +1950,52 @@ export async function readRecentEvents(
   } = {}
 ): Promise<SessionEvent[]> {
   assertSessionId(sessionId);
-  await flushSession(sessionId);
+  await settleSessionWrites(sessionId);
   return readRecentEventsFromDisk(sessionId, limit, options);
+}
+
+type UserMessageEvent = Extract<SessionEvent, { kind: 'user_message' }>;
+/**
+ * The latest authored question of a chat, per revision. Finding it scans the journal without a read budget,
+ * and questions live outside it, so the scan reaches the start every time: on 2026-11-02 a Continue offered
+ * several times a minute rescanned a 16 MB journal on each offer, and tool calls took up to 86 s. The answer
+ * changes only when the chat records something (`nextSeq`) or its turn map is replaced, so it is kept until then.
+ */
+const latestQuestionCache = new Map<string, { revision: number; turns: unknown; message: UserMessageEvent | undefined }>();
+
+/** A scan already running for a revision; callers at that revision share it (CodeRabbit on #2030). */
+const latestQuestionScans = new Map<string, { revision: number; turns: unknown; scan: Promise<SessionEvent[]> }>();
+
+async function latestAuthoredQuestion(sessionId: string, turns: TimelineTurns | undefined): Promise<UserMessageEvent | undefined> {
+  const revision = open.get(sessionId)?.nextSeq;
+  const cached = latestQuestionCache.get(sessionId);
+  if (revision !== undefined && cached && cached.revision === revision && cached.turns === turns) return cached.message;
+  const running = latestQuestionScans.get(sessionId);
+  const shared = revision !== undefined && running && running.revision === revision && running.turns === turns ? running.scan : null;
+  const scan = shared ?? readRecentEventsFromDisk(sessionId, 1, { kinds: ['user_message'], orderByOrigin: true,
+    before: Number.POSITIVE_INFINITY, acceptEvent: (event: SessionEvent) => !injectedUserMessage(event, turns) });
+  if (!shared && revision !== undefined) {
+    const entry = { revision, turns, scan };
+    latestQuestionScans.set(sessionId, entry);
+    void scan.finally(() => { if (latestQuestionScans.get(sessionId) === entry) latestQuestionScans.delete(sessionId); }).catch(() => undefined);
+  }
+  const [found] = await scan;
+  const message = found?.kind === 'user_message' ? found : undefined;
+  // Only a read no write overtook may be kept.
+  if (revision !== undefined && open.get(sessionId)?.nextSeq === revision) {
+    latestQuestionCache.set(sessionId, { revision, turns, message });
+    if (latestQuestionCache.size > 200) latestQuestionCache.delete(latestQuestionCache.keys().next().value!);
+  }
+  return message;
 }
 
 /** The latest authored question. A recovery source excludes its injected corrections,
  * which have no native user bubble and cannot grant another error reload. */
-export async function readLatestUserMessage(sessionId: string, _turnId?: string | null): Promise<Extract<SessionEvent, { kind: 'user_message' }> | undefined> {
+export async function readLatestUserMessage(sessionId: string, _turnId?: string | null): Promise<UserMessageEvent | undefined> {
   assertSessionId(sessionId);
-  await flushSession(sessionId);
+  await settleSessionWrites(sessionId);
   const summary = await readAuthoritativeSummary(sessionId);
-  const [message] = await readRecentEventsFromDisk(sessionId, 1, { kinds: ['user_message'], orderByOrigin: true,
-    before: Number.POSITIVE_INFINITY, acceptEvent: (event: SessionEvent) => !injectedUserMessage(event, summary?.timelineTurns) });
-  return message?.kind === 'user_message' ? message : undefined;
+  return latestAuthoredQuestion(sessionId, summary?.timelineTurns);
 }
 
 /** An injected instruction belongs to its existing generation, even after native reconciliation. */
@@ -1888,7 +2009,7 @@ function isTurnCorrection(event: SessionEvent, turnId?: string | null, turns?: T
  * retain their authored position so replaying an old question cannot cancel current work. */
 export async function readRecoveryBoundary(sessionId: string, turnId?: string | null): Promise<SessionEvent | undefined> {
   const entry = await ensureOpen(sessionId);
-  await flushSession(sessionId);
+  await settleSessionWrites(sessionId);
   // Read under this session's existing queue. Another read or metadata flush
   // must not invalidate the boundary and permanently spend a valid silence grant.
   return enqueueSessionOperation(entry, 'recovery boundary read', async () => {
@@ -1909,14 +2030,14 @@ export async function readCompletedFinal(sessionId: string, conversationId: stri
   messageId: string; turnId: string | null; completedAt: number; contentSeq: number; text: string;
 } | null> {
   const entry = await ensureOpen(sessionId);
-  await flushSession(sessionId);
+  await settleSessionWrites(sessionId);
   const revision = entry.nextSeq;
   if (entry.summary.conversationId !== conversationId) return null;
-  const [recent, questions] = await Promise.all([
+  const [recent, latestQuestion] = await Promise.all([
     readRecentEventsFromDisk(sessionId, 256, { kinds: ['turn_start', 'turn_end', 'user_message', 'assistant_message', 'native_image', 'tool_call', 'page_tool'] }),
-    readRecentEventsFromDisk(sessionId, 1, { kinds: ['user_message'], orderByOrigin: true,
-      before: Infinity, acceptEvent: event => !injectedUserMessage(event, entry.summary.timelineTurns) })
+    latestAuthoredQuestion(sessionId, entry.summary.timelineTurns)
   ]);
+  const questions = latestQuestion ? [latestQuestion] : [];
   if (entry.nextSeq !== revision || entry.summary.conversationId !== conversationId) return null;
   const sameTurn = (left: string | null | undefined, right: string | null | undefined) => !!left && !!right &&
     responseTurnId(entry.summary.timelineTurns, left) === responseTurnId(entry.summary.timelineTurns, right);
@@ -1969,8 +2090,26 @@ export async function readCompletedFinal(sessionId: string, conversationId: stri
   const last = boundaries.at(-1), prior = boundaries.at(-2);
   const nativeReopen = !!final.providerMessageId && last?.kind === 'turn_start' && last.source === 'app' &&
     last.turnId === final.turnId && prior?.kind === 'turn_end' && prior.turnId === final.turnId && prior.outcome === 'completed';
+  // A progress note of a turn that had ended is not new work: ChatGPT draws a finished turn's steps
+  // as one collapsed group, and the note written before its tool calls can reach the page only then
+  // (2.1.48 release round). The recorder no longer stamps it as work; decided here too, from the stored
+  // owner and turn index, so notes saved before that, or of turns older than the recorder's memory,
+  // still let the final settle. A turn open again counts its notes.
+  const turns = entry.summary.timelineTurns;
+  const finalTurn = final.turnId && turns ? turns[responseTurnId(turns, final.turnId)] : undefined;
+  const lateNote = (event: SessionEvent): boolean => {
+    if (event.kind !== 'assistant_message' || event.final === true || event.state === 'final' || !event.turnId ||
+        sameTurn(entry.summary.activeTurnId, event.turnId)) return false;
+    if (!sameTurn(event.turnId, final.turnId)) {
+      const own = turns?.[responseTurnId(turns, event.turnId)];
+      return !!own && !!finalTurn && own !== finalTurn && own.endOrigin !== undefined && own.origin < finalTurn.origin;
+    }
+    return nativeFinal && recent.some(end => end.kind === 'turn_end' && end.outcome === 'completed' &&
+      sameTurn(end.turnId, final.turnId) && end.seq < event.seq &&
+      !recent.some(start => start.kind === 'turn_start' && sameTurn(start.turnId, final.turnId) && start.seq > end.seq && start.seq < event.seq));
+  };
   if (recent.some(event => {
-    if (event === final || workSequence(event) <= seq) return false;
+    if (event === final || workSequence(event) <= seq || lateNote(event)) return false;
     if (event.kind === 'tool_call') {
       if (event.time <= completedAt) return false;
       // A public native final settles its request even when Pro delivers another
@@ -2014,7 +2153,7 @@ export async function readHandoffResponse(sessionId: string, conversationId: str
 > {
   const pending = { status: 'pending' } as const, ambiguous = { status: 'ambiguous' } as const;
   const entry = await ensureOpen(sessionId);
-  await flushSession(sessionId);
+  await settleSessionWrites(sessionId);
   const revision = entry.nextSeq;
   if (entry.summary.conversationId !== conversationId) return pending;
   const anchor = entry.messages.get(`user_message\u0000${anchorMessageId}`);
@@ -2058,7 +2197,7 @@ export async function readHandoffResponse(sessionId: string, conversationId: str
 /** Recorded local execution, not a native tool label or a request-id sighting alone. */
 export async function turnHasMcpCall(sessionId: string, conversationId: string, turnId: string): Promise<boolean> {
   assertSessionId(sessionId);
-  await flushSession(sessionId);
+  await settleSessionWrites(sessionId);
   // Attribution repair appends historical calls, often without a known turn. Such a tail
   // cannot erase earlier exact proof. Filter inside one bounded-buffer reverse scan so a
   // missing proof does not repeatedly rescan the journal for each presentation page.
@@ -2093,7 +2232,7 @@ export async function requestTurnOwnershipCutoff(
   conversationId: string
 ): Promise<number | null> {
   const entry = await ensureOpen(sessionId);
-  await flushSession(sessionId);
+  await settleSessionWrites(sessionId);
   if (entry.summary.conversationId !== conversationId) return null;
   return Math.max(0, entry.nextSeq - 1);
 }
@@ -2105,7 +2244,7 @@ export async function turnEndedDurably(
   expectedTurnId: string
 ): Promise<boolean> {
   const entry = await ensureOpen(sessionId);
-  await flushSession(sessionId);
+  await settleSessionWrites(sessionId);
   if (entry.summary.conversationId !== conversationId) return false;
   const sameTurn = (turnId: string | null | undefined): boolean =>
     !!turnId && responseTurnId(entry.summary.timelineTurns, turnId) ===
@@ -2150,7 +2289,7 @@ export async function conversationHasMcpCallSince(
   sessionId: string, conversationId: string, startedAt: number, turnId: string | null
 ): Promise<boolean> {
   assertSessionId(sessionId);
-  await flushSession(sessionId);
+  await settleSessionWrites(sessionId);
   const calls = await readRecentEventsFromDisk(sessionId, 1, {
     kinds: ['tool_call'], before: Number.POSITIVE_INFINITY,
     // Repaired calls may lack a local turn id. Exact conversation and original call
@@ -2369,11 +2508,34 @@ export async function readHydratedActivityCall(
   });
 }
 
+/** Recorded edits already said to be unreadable, so a card drawn again does not say it again. */
+const unreadableEdits = new Set<string>();
+function noteUnreadableEdit(assetId: string, why: string): void {
+  if (unreadableEdits.has(assetId)) return;
+  if (unreadableEdits.size >= 256) unreadableEdits.delete(unreadableEdits.values().next().value!);
+  unreadableEdits.add(assetId);
+  logWarn(`turn changes: recorded edit ${assetId.slice(0, 12)} ${why}; its file shows approximate counts`);
+}
+
+/** One recorded edit's before and after by its stored asset (#1827); null when gone, too large or damaged. */
+export async function readEditReviewAsset(sessionId: string, assetId: string): Promise<{ before: string; after: string } | null> {
+  assertSessionId(sessionId);
+  const data = await readAsset(sessionId, assetId, 512 * 1024);
+  if (!data) { noteUnreadableEdit(assetId, 'is missing or too large'); return null; }
+  try {
+    const parsed = JSON.parse(data.toString('utf8')) as { before?: unknown; after?: unknown };
+    if (typeof parsed.before === 'string' && typeof parsed.after === 'string') return { before: parsed.before, after: parsed.after };
+  } catch { /* said below */ }
+  noteUnreadableEdit(assetId, 'is damaged');
+  return null;
+}
+
 /** Retrieves one immutable, bounded edit artifact by its durable session/call/index identity. */
+
 export async function readToolEditReview(sessionId: string, callId: string, changeIndex: number): Promise<ToolEditReview | null> {
   assertSessionId(sessionId);
   if (!/^[0-9a-f-]{36}$/i.test(callId) || !Number.isSafeInteger(changeIndex) || changeIndex < 0 || changeIndex >= 64) return null;
-  await flushSession(sessionId);
+  await settleSessionWrites(sessionId);
   const [event] = await readRecentEventsFromDisk(sessionId, 1, {
     kinds: ['tool_call'], before: Number.POSITIVE_INFINITY,
     acceptEvent: value => value.kind === 'tool_call' && value.call.callId === callId
@@ -2474,6 +2636,8 @@ export async function rewriteUnattributedToolCalls(
       lastToolCallAt: null,
       lastToolActivity: null,
       lastAssistantFinalAt: null,
+      lastAnswerLine: null,
+      approvalWaitingAt: null,
       lastTurnEndAt: null,
       lastFinishReportAt: null,
       processExitNonzero: 0,
@@ -2528,6 +2692,8 @@ function normalizeSummary(id: string, raw: string): MetaCheckpoint | null {
         : {};
     }
     if (publicSummary.titleSource !== undefined && !['fallback', 'provider', 'manual'].includes(publicSummary.titleSource)) delete publicSummary.titleSource;
+    if (publicSummary.projectChosen !== undefined && publicSummary.projectChosen !== true) delete publicSummary.projectChosen;
+    if (publicSummary.projectNotePending !== undefined && publicSummary.projectNotePending !== true) delete publicSummary.projectNotePending;
     const auto = publicSummary.autoTitle;
     if (auto !== undefined && (publicSummary.titleSource !== 'manual' || !auto || typeof auto !== 'object' ||
         typeof auto.title !== 'string' || !['fallback', 'provider'].includes(auto.source))) delete publicSummary.autoTitle;
@@ -2545,6 +2711,12 @@ function normalizeSummary(id: string, raw: string): MetaCheckpoint | null {
       lastToolActivity.title.length > 200 ||
       !/^(?:edit|create|delete|move|read|search|browse|run|process|screen|input|clipboard|session|agent|other)$/.test(lastToolActivity.kind)
     )) delete publicSummary.lastToolActivity;
+    if (publicSummary.lastToolActivity?.tone !== undefined && publicSummary.lastToolActivity.tone !== 'bad' &&
+        publicSummary.lastToolActivity.tone !== 'warn') delete publicSummary.lastToolActivity.tone;
+    if (publicSummary.lastAnswerLine !== undefined && publicSummary.lastAnswerLine !== null &&
+        (typeof publicSummary.lastAnswerLine !== 'string' || publicSummary.lastAnswerLine.length > 200)) delete publicSummary.lastAnswerLine;
+    if (publicSummary.approvalWaitingAt !== undefined && publicSummary.approvalWaitingAt !== null &&
+        !Number.isFinite(publicSummary.approvalWaitingAt)) delete publicSummary.approvalWaitingAt;
     const assignment = publicSummary.workerAssignment;
     if (assignment !== undefined && (!assignment || typeof assignment.conversationId !== 'string' ||
         typeof assignment.agentId !== 'string' || typeof assignment.label !== 'string' || assignment.label.length > 60 ||
@@ -2569,12 +2741,16 @@ function normalizeSummary(id: string, raw: string): MetaCheckpoint | null {
       typeof publicSummary.toolRejected !== 'number' ||
       typeof publicSummary.toolInternalErrors !== 'number';
     const activityBoundaryMissing = !Object.prototype.hasOwnProperty.call(publicSummary, 'lastAssistantFinalAt');
+    // Saved before #1831 when either key is absent (current summaries always write both, null included): rebuilt once.
+    const workerLineMissing = !Object.prototype.hasOwnProperty.call(publicSummary, 'lastAnswerLine') ||
+      !Object.prototype.hasOwnProperty.call(publicSummary, 'approvalWaitingAt');
     return {
       historySeq,
       canonicalProjectionCurrent: canonicalProjection === 1,
       tokenEstimateCurrent: tokenEstimate === 1,
       outcomeCountersMissing,
       activityBoundaryMissing,
+      workerLineMissing,
       summary: {
         ...publicSummary,
         // Keep in-place increments numeric until the forced rebuild supplies the real values.
@@ -2716,7 +2892,8 @@ async function readCatalogSummary(id: string): Promise<SessionSummary | null> {
     const metadata = await fs.stat(path.join(dir, 'meta.json'));
     const checkpoint = normalizeSummary(id, await fs.readFile(path.join(dir, 'meta.json'), 'utf8'));
     if (checkpoint && checkpoint.historySeq !== null && checkpoint.canonicalProjectionCurrent && checkpoint.tokenEstimateCurrent &&
-        !checkpoint.outcomeCountersMissing && !checkpoint.activityBoundaryMissing && checkpoint.summary.finishTurn !== undefined && !legacyContextTitle(checkpoint.summary) &&
+        !checkpoint.outcomeCountersMissing && !checkpoint.activityBoundaryMissing && !checkpoint.workerLineMissing &&
+        checkpoint.summary.finishTurn !== undefined && !legacyContextTitle(checkpoint.summary) &&
         // Old Plan helpers and project page titles are repaired by the full read below, once.
         !legacyLabelPending(checkpoint.summary)) {
       const mutations = await Promise.all(['events.jsonl', 'messages.json', 'messages'].map(async name => {
@@ -3486,6 +3663,54 @@ export async function bindSessionProject(id: string, projectId: string): Promise
 }
 
 /**
+ * The person moves a chat to another project, or out of one (#1919): unlike the one-time binding
+ * above, this replaces a project. Its commands then run in the new project's folder.
+ */
+export async function moveSessionProject(id: string, projectId: string | null): Promise<void> {
+  if (projectId !== null && !/^[a-f0-9-]{36}$/i.test(projectId)) throw new Error('Invalid project id');
+  const entry = await ensureOpen(id);
+  await enqueueSessionOperation(entry, 'project move', async () => {
+    const { projectId: _previous, projectNotePending: _note, ...rest } = entry.summary;
+    // Into a project: the person's next message tells ChatGPT the folder, once (#1919). Not a
+    // sub-agent's: an isolated worker keeps working in its own allocated workspace.
+    const subAgent = rest.origin?.kind === 'worker' || rest.origin?.kind === 'helper';
+    const staged: SessionSummary = { ...rest, ...(projectId ? { projectId, ...(subAgent ? {} : { projectNotePending: true as const }) } : {}), projectChosen: true };
+    await writeSummary(staged, entry.historySeq);
+    entry.summary = staged;
+    publishAttachmentSummary(staged);
+  });
+}
+
+/**
+ * The person changed this chat's project's related folders (#1689): their next message tells ChatGPT
+ * the project folder and the related folders again, once, as after a move. Old messages stay as they are.
+ */
+export async function markProjectNote(id: string, projectId: string): Promise<boolean> {
+  const entry = await ensureOpen(id);
+  return enqueueSessionOperation(entry, 'project note', async () => {
+    const subAgent = entry.summary.origin?.kind === 'worker' || entry.summary.origin?.kind === 'helper';
+    if (entry.summary.projectId !== projectId || subAgent || entry.summary.projectNotePending) return false;
+    const staged: SessionSummary = { ...entry.summary, projectNotePending: true };
+    await writeSummary(staged, entry.historySeq);
+    entry.summary = staged;
+    publishAttachmentSummary(staged);
+    return true;
+  });
+}
+
+/** The person's message that told ChatGPT a moved chat's folder was delivered. */
+export async function clearProjectNote(id: string): Promise<void> {
+  const entry = await ensureOpen(id);
+  await enqueueSessionOperation(entry, 'project note', async () => {
+    if (!entry.summary.projectNotePending) return;
+    const { projectNotePending: _done, ...staged } = entry.summary;
+    await writeSummary(staged, entry.historySeq);
+    entry.summary = staged;
+    publishAttachmentSummary(staged);
+  });
+}
+
+/**
  * Records that this app opened the chat, and names the session accordingly.
  *
  * One write rather than a rename followed by a stamp, because the two are the same
@@ -3494,14 +3719,30 @@ export async function bindSessionProject(id: string, projectId: string): Promise
  * name contradicts.
  */
 export async function setSessionOrigin(id: string, origin: SessionOrigin, title: string): Promise<void> {
-  const inheritedProject = origin.fromSessionId ? (await getSession(origin.fromSessionId))?.projectId : undefined;
+  const parentProject = async () => origin.fromSessionId ? (await getSession(origin.fromSessionId))?.projectId : undefined;
   const entry = await ensureOpen(id);
+  let written: string | undefined;
   await enqueueSessionOperation(entry, 'origin write', async () => {
+    // Read when the write happens, not before it waited its turn: the main chat may have moved.
+    const inheritedProject = await parentProject();
+    written = inheritedProject;
     if (inheritedProject && entry.summary.projectId && entry.summary.projectId !== inheritedProject) throw new Error('Session origin belongs to another project');
     // A name the user gave the chat stays; the origin's title becomes the one clearing it restores.
     const named = entry.summary.titleSource === 'manual';
     const staged = { ...entry.summary, origin, ...(named ? { autoTitle: { title: title.slice(0, 120), source: 'fallback' as const } } : { title: title.slice(0, 120) }),
       ...(inheritedProject ? { projectId: inheritedProject } : {}) };
+    await writeSummary(staged, entry.historySeq);
+    entry.summary = staged;
+    publishAttachmentSummary(staged);
+  });
+  // A worker or helper follows its main chat: if that chat moved to another project while this was
+  // written, follow it (#1919). The move itself also looks for such stragglers once it is done.
+  const now = await parentProject();
+  if (!origin.fromSessionId || (origin.kind !== 'worker' && origin.kind !== 'helper') || now === written) return;
+  await enqueueSessionOperation(entry, 'origin project follow', async () => {
+    if ((entry.summary.projectId ?? undefined) !== written) return;
+    const { projectId: _previous, ...rest } = entry.summary;
+    const staged: SessionSummary = { ...rest, ...(now ? { projectId: now } : {}) };
     await writeSummary(staged, entry.historySeq);
     entry.summary = staged;
     publishAttachmentSummary(staged);
@@ -3596,6 +3837,12 @@ export async function rebindSession(
       browserRecoveryDismissedAt: undefined,
       ...(committedResumeHandoffId !== undefined
         ? { lastCommittedResumeHandoffId: committedResumeHandoffId }
+        : {}),
+      // After Compact & Resume the person's next message tells the new chat its project folder and
+      // the project's related folders as they are then (#1689), not as the old chat's brief knew them.
+      ...(committedResumeHandoffId !== undefined && entry.summary.projectId &&
+        entry.summary.origin?.kind !== 'worker' && entry.summary.origin?.kind !== 'helper'
+        ? { projectNotePending: true as const }
         : {}),
       updatedAt: Date.now(),
       // A session whose chat was closed during the handover is live again the moment its new
@@ -4188,7 +4435,12 @@ function invalidateAssetUsage(sessionId: string): void {
   globalAssetUsage = null;
 }
 
-export async function readAsset(sessionId: string, assetId: string, maxBytes?: number): Promise<Buffer | null> {
+export async function readAsset(
+  sessionId: string,
+  assetId: string,
+  maxBytes?: number,
+  options?: { throwOnReadError?: boolean }
+): Promise<Buffer | null> {
   assertSessionId(sessionId);
   if (!/^[0-9a-f]{8,64}\.(png|jpg|txt|bin)$/.test(assetId)) return null;
   try {
@@ -4210,7 +4462,8 @@ export async function readAsset(sessionId: string, assetId: string, maxBytes?: n
       }
       return null;
     } finally { await handle.close(); }
-  } catch {
+  } catch (err) {
+    if (options?.throwOnReadError && (err as NodeJS.ErrnoException)?.code !== 'ENOENT') throw err;
     return null;
   }
 }
@@ -4332,6 +4585,8 @@ export async function deleteSession(id: string): Promise<void> {
 /** Test seam: forgets in-memory state without touching the files. */
 export function resetSessionStoreForTests(): void {
   recentUnreadableWarned.clear();
+  latestQuestionCache.clear();
+  latestQuestionScans.clear();
   for (const entry of open.values()) if (entry.metaTimer) clearTimeout(entry.metaTimer);
   open.clear();
   opening.clear();

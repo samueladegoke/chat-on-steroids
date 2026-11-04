@@ -32,6 +32,11 @@ const activeTabs = globalThis.chrome?.debugger ? createActiveTabs(chrome) : null
 const PORTS = [8765, 8766, 8767, 8768, 8769, 18765, 18766, 18767, 18768, 18769, 38765, 38766, 38767, 38768, 38769];
 const HELLO_TIMEOUT_MS = 1200;
 const REQUEST_TIMEOUT_MS = 10_000;
+/**
+ * A page's reason for releasing an input before Send: one of its own short codes, some naming what
+ * moved the turn ("turn-progressed by app-tool_call"). Free text never travels (#820, #1787).
+ */
+const RELEASE_DETAIL = /^[a-z][a-z0-9 _-]{0,79}$/;
 /** A journal receipt follows durable session writes, which can outlast an ordinary read. */
 const EVENTS_REQUEST_TIMEOUT_MS = 60_000;
 /**
@@ -182,6 +187,8 @@ const journalPreferences = new Set();
 let delivery = { at: 0, ok: null, events: 0, total: 0, conversationId: null, status: 0, error: null };
 /** Idempotent conversation-close deliveries awaiting an app ACK. */
 let closeOutbox = [];
+/** Last autonomous close decision, without chat IDs, for the existing /diagnostics report. */
+let closeOutboxDecision = null;
 /** Successful managed removals awaiting onRemoved; exact document receipts survive MV3 sleep. */
 let tabRemovals = {};
 /**
@@ -368,6 +375,14 @@ async function loadOnce() {
   stored.inputOpenings = { ...(stored.desktopInputTabs || {}), ...(stored.inputOpenings || {}) };
   inputOpenings = stored.inputOpenings && typeof stored.inputOpenings === 'object' && !Array.isArray(stored.inputOpenings)
     ? Object.fromEntries(Object.entries(stored.inputOpenings).filter(([id, row]) => /^[a-f0-9-]{36}$/i.test(id) && row && (row.tab === null || Number.isInteger(row.tab))).slice(-1000)) : {};
+  // Elections saved under the old key move once into `inputOpenings`: left behind, one forgotten
+  // there would come back at the next start (CodeRabbit on #1980).
+  if (stored.desktopInputTabs !== undefined) {
+    try {
+      await chrome.storage.local.set({ inputOpenings });
+      await chrome.storage.local.remove('desktopInputTabs');
+    } catch { /* The next start merges them again; nothing is lost. */ }
+  }
   stopOpenings = stored.stopOpenings && typeof stored.stopOpenings === 'object' && !Array.isArray(stored.stopOpenings)
     ? Object.fromEntries(Object.entries(stored.stopOpenings).filter(([id, row]) => commandMarkerId(id) && row &&
       (row.tab === null || Number.isInteger(row.tab)) && cleanConversationId(row.conversationId) &&
@@ -1210,7 +1225,7 @@ async function latchAppDisconnect() {
   void getBrowserController().then(controller => controller?.revoke()).catch(() => undefined);
   token = null;
   disconnected = true;
-  await activeTabs?.revoke().catch(() => undefined);
+  await renderingLeases(() => activeTabs?.revoke());
   await persist();
 }
 
@@ -2220,6 +2235,13 @@ async function protectCreatedTab(tab, commandId = null) {
 }
 
 /** Bound waiting for a page; a missing reply never grants action or replay authority. */
+/** How long a status pass waits for the rendering leases before it goes on to its repairs. */
+const RENDERING_LEASE_WAIT_MS = 3000;
+/** A rendering lease change, waited for a bounded time and never failing its caller; it goes on by itself. */
+function renderingLeases(change) {
+  return browserReply(async () => { await change(); return null; }, RENDERING_LEASE_WAIT_MS);
+}
+
 async function browserReply(read, timeoutMs = 3000) {
   let timer;
   try {
@@ -2251,8 +2273,35 @@ function offerDesktopInput(tabId, message) {
   void chrome.tabs.sendMessage(tabId, message).catch(() => undefined);
 }
 
+// Missing-tab reports only expose a pre-claim failure in main; they never
+// authorize a new tab or Send. Keep their slow bridge requests off the single
+// maintenance flight, with a small bound shared across consecutive passes.
+// A failed report leaves the durable election intact for the next normal pass.
+const openingUnavailableReports = new Map();
+const MAX_OPENING_UNAVAILABLE_REPORTS = 3;
+function reportUnavailableOpening(id, tab, stage) {
+  if (openingUnavailableReports.has(id) || openingUnavailableReports.size >= MAX_OPENING_UNAVAILABLE_REPORTS) return;
+  const pending = call('/input/opening-unavailable', { method: 'POST',
+    body: JSON.stringify({ id, tab, stage }) }).then(async reply => {
+    // The app proved nothing reached the lost tab and grants a fresh one: forget the old election,
+    // so the next pass opens a new tab for this new chat (#1950 follow-up). Only then.
+    if (reply?.ok && reply.data?.reopen === true && inputOpenings[id]?.tab === tab) {
+      delete inputOpenings[id];
+      await persistLive();
+    }
+    return reply;
+  });
+  openingUnavailableReports.set(id, pending);
+  void pending.catch(() => undefined).finally(() => {
+    if (openingUnavailableReports.get(id) === pending) openingUnavailableReports.delete(id);
+  });
+}
+
 async function deliverDesktopInputs(inputs, background, reusableConversations = [], activeIds, refreshRendering = async () => {}) {
   if (!Array.isArray(inputs)) return;
+  // A reload into a new build is under way: no tab is elected or message started now; the app offers
+  // them again to the reloaded extension (and refuses claims meanwhile).
+  if (extensionReloadPending) return;
   // Only the app's complete outbox projection retires spent opening authority.
   if (Array.isArray(activeIds)) {
     const active = new Set(activeIds);
@@ -2386,7 +2435,19 @@ async function deliverDesktopInputs(inputs, background, reusableConversations = 
     if (!tab) {
       // Handout is opening authority, not a missing delivery receipt. A closed or
       // unresponsive elected document never grants another opening attempt.
-      if (elections[input.id] && !recoveredReuse) continue;
+      if (elections[input.id] && !recoveredReuse) {
+        // Chrome tab ids do not survive every close/restart. Keep spent opening
+        // authority, but let main expose a safe pre-claim failure instead of waiting
+        // forever. A successful all-tab scan must prove absence, not just navigation
+        // away from ChatGPT; another marked tab or an unreadable scan stays ambiguous.
+        if (!target && !branchInput && !input.lifetime && Number.isInteger(elected?.tab) &&
+            ['ready', 'preparing'].includes(elected.stage)) {
+          const currentTabs = await chrome.tabs.query({}).catch(() => null);
+          if (Array.isArray(currentTabs) && !currentTabs.some(row => row.id === elected.tab || matchesInput(input, row)))
+            reportUnavailableOpening(input.id, elected.tab, elected.stage);
+        }
+        continue;
+      }
       if (Object.keys(elections).length >= 1000) continue;
       // A new chat of a project with a native ChatGPT Project opens on that Project's own page;
       // borrowing another tab would go through ChatGPT's New chat, which is the root.
@@ -2621,7 +2682,7 @@ function inspectProjectCreates(requests) {
       // A helper the person closed comes back, at most every two minutes: never a tab on every
       // status pass, and never a request left waiting for good.
       if (mine && Date.now() - (mine.openedAt ?? 0) < PROJECT_CREATE_REOPEN_MS) return;
-      const created = await createChatTab(`https://chatgpt.com/?cos-project-create=${request.id}`, false);
+      const created = await createChatTab(`https://chatgpt.com/projects?cos-project-create=${request.id}`, false);
       await chrome.storage.session.set({ projectCreateOwner: { id: request.id, tab: created.id, openedAt: Date.now() } });
       return;
     }
@@ -2812,7 +2873,9 @@ function inspectRequestedModels(request) {
       ...(typeof tabDocuments[key] === 'string' ? { documentId: tabDocuments[key] } : {}),
       ...(Number.isSafeInteger(tabEpochs[key]) ? { navigationEpoch: tabEpochs[key] } : {}) });
     if (intent !== connectionEpoch || !token || disconnected || Date.now() >= wanted.expiresAt) return;
-    await activeTabs?.set(`catalog:${wanted.nonce}`, [tab]);
+    // Bounded and never failing, like every lease change: another tab's pending release must not end this
+    // inspection (CodeRabbit on #2027).
+    await renderingLeases(() => activeTabs?.set(`catalog:${wanted.nonce}`, [tab]));
     await waiting('inspecting');
     if (!current()) return;
     const inspected = await send({ type: 'clf-model-catalog', nonce: wanted.nonce, expiresAt: wanted.expiresAt });
@@ -2821,7 +2884,7 @@ function inspectRequestedModels(request) {
     if (inspected === true || inspected?.ok === true) await retireCatalogTabs();
     else await waiting(inspected?.reason || 'result_unconfirmed');
   })().catch(() => waiting('inspection_failed')).finally(async () => {
-    if (targetNonce) await activeTabs?.set(`catalog:${targetNonce}`, []).catch(() => undefined);
+    if (targetNonce) await renderingLeases(() => activeTabs?.set(`catalog:${targetNonce}`, []));
     if (targetNonce) await releaseModelCatalogTarget(targetNonce);
     modelCatalogFlight = null;
   });
@@ -3072,17 +3135,140 @@ function maintain(woken = false) {
  */
 const APP_LANGUAGE_KEY = 'appLanguage';
 const APP_LANGUAGES = new Set(['en', 'de', 'es', 'fr', 'pt-BR', 'pt-PT', 'ru', 'tr', 'vi', 'ja', 'ko', 'zh-CN', 'zh-TW']);
-async function followApp(data) {
-  const stored = await chrome.storage.local.get([APP_LANGUAGE_KEY, RENDER_STREAM_KEY, SHOW_TIMES_KEY]);
-  const patch = {};
-  if (APP_LANGUAGES.has(data?.language) && stored[APP_LANGUAGE_KEY] !== data.language) patch[APP_LANGUAGE_KEY] = data.language;
+/*
+ * 2026-10-30: the extension in one Chrome never stored the app's language in weeks (the same build
+ * stored it at once elsewhere) and showed Chrome's language until its worker restarted. Nothing said
+ * why: a storage read that never answers, or a refused write, was swallowed. So the read is bounded,
+ * the language is written once per worker and again on a change rather than trusted to the stored copy,
+ * and the outcome is kept for the diagnostics report (`appLanguageState`).
+ */
+const FOLLOW_READ_MS = 5_000;
+let appLanguageApplied = null;
+let appLanguageError = null;
+/** A write that failed or timed out may still land later, so the next status writes again (CodeRabbit on #1940). */
+let appLanguageUnconfirmed = false;
+function appLanguageState() {
+  return { applied: appLanguageApplied, error: appLanguageError };
+}
+/** A storage call that gives up after FOLLOW_READ_MS instead of waiting for good. */
+async function boundedStorage(call, what) {
+  let timer = null;
+  try {
+    return await Promise.race([
+      call,
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error(`storage ${what} did not answer within ${FOLLOW_READ_MS / 1000} s`)), FOLLOW_READ_MS); })
+    ]);
+  } finally { clearTimeout(timer); }
+}
+function boundedStorageGet(keys) {
+  return boundedStorage(chrome.storage.local.get(keys), 'read');
+}
+// Statuses are applied one at a time, so a slow older read can never write its language after a
+// newer one. While one runs, only the newest waiting status is kept: a burst of statuses must not
+// queue a read each and hold a newer language back (CodeRabbit on #1940). A status without a
+// language or kept preferences keeps the waiting one's.
+let followWaiting = null;
+let followRunning = null;
+function followApp(data) {
+  followWaiting = {
+    language: data?.language ?? followWaiting?.language,
+    browserPreferences: data?.browserPreferences ?? followWaiting?.browserPreferences
+  };
+  followRunning ??= (async () => {
+    try {
+      while (followWaiting) {
+        const next = followWaiting;
+        followWaiting = null;
+        await followAppNow(next).catch(() => undefined);
+      }
+    } finally { followRunning = null; }
+  })();
+  return followRunning;
+}
+/**
+ * Settles once no status is being applied, at most after two bounded storage calls and a little: a
+ * diagnostics snapshot read just after a language change otherwise saw the old stored language,
+ * and the app logged a mismatch that was not one (CodeRabbit on #1940).
+ */
+function followSettled() {
+  let timer = null;
+  return Promise.race([followRunning ?? Promise.resolve(), new Promise(resolve => { timer = setTimeout(resolve, 2 * FOLLOW_READ_MS + 1_000); })])
+    .catch(() => undefined).finally(() => clearTimeout(timer));
+}
+async function followAppNow(data) {
+  const language = APP_LANGUAGES.has(data?.language) ? data.language : null;
   const kept = data?.browserPreferences;
-  if (kept && typeof kept.overwrite === 'boolean' && typeof kept.durations === 'boolean' &&
-      !(RENDER_STREAM_KEY in stored) && !(SHOW_TIMES_KEY in stored)) {
+  const keptValid = kept && typeof kept.overwrite === 'boolean' && typeof kept.durations === 'boolean';
+  if ((!language || (language === appLanguageApplied && !appLanguageUnconfirmed)) && !keptValid) return;
+  let readFailed = null;
+  const stored = await boundedStorageGet([APP_LANGUAGE_KEY, RENDER_STREAM_KEY, SHOW_TIMES_KEY])
+    .catch(error => { readFailed = String(error?.message || error).slice(0, 200); return null; });
+  const patch = {};
+  // Unread storage still gets the language: it is the app's, not a preference the person set here.
+  if (language && (language !== appLanguageApplied || appLanguageUnconfirmed) && (!stored || stored[APP_LANGUAGE_KEY] !== language)) patch[APP_LANGUAGE_KEY] = language;
+  // Kept preferences only fill an extension that provably has none, so they need the read.
+  if (keptValid && stored && !(RENDER_STREAM_KEY in stored) && !(SHOW_TIMES_KEY in stored)) {
     patch[RENDER_STREAM_KEY] = kept.overwrite;
     patch[SHOW_TIMES_KEY] = kept.durations;
   }
-  if (Object.keys(patch).length) await chrome.storage.local.set(patch);
+  // The worker takes the app's language at once, whatever storage does: a page that asks
+  // (`i18n_catalog` with `current`) gets it even while the write below fails (CodeRabbit on #1940).
+  // A failed write stays unconfirmed, so the next status writes again.
+  if (language) appLanguageApplied = language;
+  try {
+    // A write that never answers is bounded too: it must not hold every later status (CodeRabbit on #1940).
+    if (Object.keys(patch).length) await boundedStorage(chrome.storage.local.set(patch), 'write');
+    if (language) appLanguageApplied = language;
+    // Confirmed only by writing the language, or by reading it already stored: a status with kept
+    // preferences alone proves nothing about it (CodeRabbit on #1940).
+    if (patch[APP_LANGUAGE_KEY] || (language && stored?.[APP_LANGUAGE_KEY] === language)) appLanguageUnconfirmed = false;
+    // An unconfirmed language keeps the error that left it unsaved (CodeRabbit on #1940).
+    if (!appLanguageUnconfirmed) appLanguageError = readFailed;
+  } catch (error) {
+    if (patch[APP_LANGUAGE_KEY]) appLanguageUnconfirmed = true;
+    // A failed preferences-only write does not replace the reason the language is still unsaved (CodeRabbit on #1940).
+    if (patch[APP_LANGUAGE_KEY] || !appLanguageUnconfirmed) appLanguageError = String(error?.message || error).slice(0, 200);
+  }
+}
+
+/**
+ * The popup paints with the app's colors and theme (the app's extension-appearance.ts sends them with
+ * every status). Stored when they change, so a popup opened while the app is closed keeps the last look.
+ */
+const APP_APPEARANCE_KEY = 'appAppearance';
+const APPEARANCE_THEMES = new Set(['light', 'dark', 'system']);
+// Every color the app sends (main/extension-appearance.ts); a palette missing one is no palette.
+const APPEARANCE_TOKENS = ['--page', '--card', '--ink', '--soft', '--faint', '--line', '--edge', '--hover', '--track',
+  '--accent', '--accent-wash', '--accent-fill', '--on-accent', '--knob-off', '--knob-on', '--green', '--green-wash',
+  '--red', '--red-wash'];
+let appAppearanceApplied = null;
+let appAppearanceWriting = null;
+let appAppearancePending = null;
+function validAppearanceTokens(tokens) {
+  if (!tokens || typeof tokens !== 'object' || Array.isArray(tokens)) return false;
+  const entries = Object.entries(tokens);
+  return entries.length > 0 && entries.length <= 40 && entries.every(([name, value]) => /^--[a-z-]{2,30}$/.test(name) && /^#[0-9a-f]{6}$/i.test(value)) &&
+    APPEARANCE_TOKENS.every(name => Object.hasOwn(tokens, name));
+}
+function followAppearance(value) {
+  if (!value || !APPEARANCE_THEMES.has(value.theme) || !validAppearanceTokens(value.light) || !validAppearanceTokens(value.dark)) return;
+  writeAppearance(JSON.stringify({ theme: value.theme, light: value.light, dark: value.dark }));
+}
+function writeAppearance(json) {
+  // One write at a time. Colors that arrive meanwhile wait, and only the newest of them is written
+  // after it: a theme changed during a slow write is not lost if no status follows.
+  if (appAppearanceWriting) { appAppearancePending = json; return; }
+  appAppearancePending = null;
+  if (json === appAppearanceApplied) return;
+  appAppearanceWriting = boundedStorage(chrome.storage.local.set({ [APP_APPEARANCE_KEY]: JSON.parse(json) }), 'write')
+    .then(() => { appAppearanceApplied = json; })
+    // A write that failed or timed out may still land later: nothing is known to be stored, so the
+    // next colors are written even when they equal the last ones written (CodeRabbit on #2013).
+    .catch(() => { appAppearanceApplied = null; })
+    .finally(() => {
+      appAppearanceWriting = null;
+      if (appAppearancePending) writeAppearance(appAppearancePending);
+    });
 }
 
 /**
@@ -3192,16 +3378,21 @@ async function revealChats(ids) {
   for (const raw of ids.slice(0, 5)) {
     const conversationId = cleanConversationId(raw);
     if (!conversationId) continue;
-    const tabs = await chrome.tabs.query({ url: CHATGPT_TAB_URLS });
-    const [tab] = tabs.filter(candidate => conversationForTab(candidate) === conversationId).sort((a, b) => a.id - b.id);
-    const shown = tab
-      ? await chrome.tabs.update(tab.id, { active: true })
-      : await createUserWindowTab(`https://chatgpt.com/c/${conversationId}`, true);
-    const windowId = shown?.windowId ?? tab?.windowId;
-    if (!Number.isInteger(windowId)) continue;
-    // A worker tab can sit in the app's minimized background window; the user asked to see it.
-    const window = await chrome.windows.get(windowId).catch(() => null);
-    await chrome.windows.update(windowId, window?.state === 'minimized' ? { state: 'normal', focused: true } : { focused: true });
+    try {
+      const tabs = await chrome.tabs.query({ url: CHATGPT_TAB_URLS });
+      const [tab] = tabs.filter(candidate => conversationForTab(candidate) === conversationId).sort((a, b) => a.id - b.id);
+      const shown = tab
+        ? await chrome.tabs.update(tab.id, { active: true })
+        : await createUserWindowTab(`https://chatgpt.com/c/${conversationId}`, true);
+      const windowId = shown?.windowId ?? tab?.windowId;
+      if (!Number.isInteger(windowId)) throw new Error('no window');
+      // A worker tab can sit in the app's minimized background window; the user asked to see it.
+      const window = await chrome.windows.get(windowId).catch(() => null);
+      await chrome.windows.update(windowId, window?.state === 'minimized' ? { state: 'normal', focused: true } : { focused: true });
+    } catch {
+      // Taking the chat is not showing it: say so, so the app does not count it as shown (CodeRabbit on #2027).
+      await call('/reveal/failed', { method: 'POST', body: JSON.stringify({ conversationId }) }).catch(() => undefined);
+    }
   }
 }
 
@@ -3239,7 +3430,25 @@ function updatedByBrowser() {
   return typeof chrome.runtime.getBrowserInfo === 'function';
 }
 
-async function reloadForExtensionUpdate(offer, liveOpenings, liveCommands) {
+/** How long an offered update waits only for answering ChatGPT pages before it goes ahead anyway. */
+const CHAT_BUSY_UPDATE_AFTER_MS = 30 * 60_000;
+/** Since when this update attempt has waited for answering pages, kept across worker restarts. */
+let chatBusySince = null;
+async function chatBusyWait(attempt) {
+  const key = 'extensionUpdateBusySince';
+  if (!chatBusySince) {
+    const stored = await chrome.storage.session?.get?.(key).catch(() => null);
+    const saved = stored?.[key];
+    if (saved && saved.attempt === attempt && Number.isFinite(saved.at)) chatBusySince = saved;
+  }
+  if (!chatBusySince || chatBusySince.attempt !== attempt) {
+    chatBusySince = { attempt, at: Date.now() };
+    await chrome.storage.session?.set?.({ [key]: chatBusySince }).catch(() => undefined);
+  }
+  return Math.max(0, Date.now() - chatBusySince.at);
+}
+
+async function reloadForExtensionUpdate(offer, liveOpenings, liveCommands, liveSending = null) {
   if (extensionReloadPending) return;
   if (updatedByBrowser()) { extensionUpdateHold = offer ? 'browser-updates-itself' : null; return; }
   if (!offer || typeof offer.build !== 'string' || !/^[0-9a-f]{12}$/.test(offer.build)) { extensionUpdateHold = null; return; }
@@ -3247,20 +3456,41 @@ async function reloadForExtensionUpdate(offer, liveOpenings, liveCommands) {
   if (!workerStampValue || workerStampValue === offer.build) { extensionUpdateHold = null; return; }
   // A chat with an agent or an active Goal is usually just waiting; only running work counts.
   if (offer.busy !== false) { extensionUpdateHold = 'app-busy'; return; }
-  if (liveOpenings.size) { extensionUpdateHold = 'sending'; return; }
+  // Only a message being sent holds the update: one the browser claimed, or one whose tab this browser is
+  // still preparing. A message that only waits in the queue (a blocked chat can keep one for hours) is
+  // offered again after the reload. An app that does not list the ones being sent keeps the old rule.
+  // A tab only kept for a message (`ready`, the send check holding it) prepares nothing (CodeRabbit).
+  const sending = liveSending
+    ? liveSending.size > 0 || [...liveOpenings].some(id => ['opening', 'preparing'].includes(inputOpenings[id]?.stage))
+    : liveOpenings.size > 0;
+  if (sending) { extensionUpdateHold = 'sending'; return; }
   if (liveCommands.size) { extensionUpdateHold = 'commands'; return; }
   const attempt = `${workerStampValue}>${offer.build}`;
   if ((await chrome.storage.local.get('extensionReloadAttempt')).extensionReloadAttempt === attempt) { extensionUpdateHold = 'already-tried'; return; }
+  let busyFor = 0;
   for (const tab of await chrome.tabs.query({ url: CHATGPT_TAB_URLS })) {
     if (!Number.isInteger(tab.id) || tab.discarded === true) continue;
     const ping = await tabReply(tab.id, { type: 'clf-recorder-ping' }).catch(() => null);
     // A page that cannot answer has nothing running here. One that answers without `busy` runs an
     // older recorder that cannot say, so it is treated as busy.
-    if (ping && ping.busy !== false) { extensionUpdateHold = 'chat-busy'; return; }
+    if (ping && ping.busy !== false) {
+      // Long Goal and Loop chats answer almost without a pause, so an update that waits for every
+      // page to be idle could wait for days (2026-10-31, the maintainer's Mac). After waiting this
+      // long only for answering pages, it goes ahead at a moment when no tool call runs and nothing
+      // is being sent: the reload re-injects the pages, and the app recovers an answer in progress.
+      busyFor = await chatBusyWait(attempt);
+      if (busyFor < CHAT_BUSY_UPDATE_AFTER_MS) { extensionUpdateHold = 'chat-busy'; return; }
+      break;
+    }
   }
   extensionReloadPending = true;
   try {
-    const prepared = await call('/extension/update', { method: 'POST', body: '{}' });
+    const prepared = await call('/extension/update', { method: 'POST',
+      body: JSON.stringify(busyFor ? { pastBusyChatsMs: busyFor } : {}) });
+    // The app saw a message go out since the last status: that holds the update, as one listed would.
+    if (prepared.ok && prepared.data?.hold === 'sending') { extensionUpdateHold = 'sending'; return; }
+    // A tool call started after the last status: the app holds the update at the last moment too.
+    if (prepared.ok && prepared.data?.hold === 'app-busy') { extensionUpdateHold = 'app-busy'; return; }
     if (!prepared.ok || prepared.data?.ready !== true || prepared.data.build !== offer.build) { extensionUpdateHold = 'folder-not-ready'; return; }
     extensionUpdateHold = null;
     await chrome.storage.local.set({ extensionReloadAttempt: attempt });
@@ -3274,7 +3504,7 @@ async function maintainOnce() {
   // The app decides whether there is recovery work; a worker holding no tabs is not a worker
   // with nothing to do, it is the one that has to open the chat the app is owed.
   if (token === null) {
-    await activeTabs?.revoke();
+    await renderingLeases(() => activeTabs?.revoke());
     if (!(await ensurePaired().catch(() => false)) || token === null) return;
   }
   const intent = connectionEpoch;
@@ -3309,13 +3539,15 @@ async function maintainOnce() {
     chatGptSignedIn: chatGptSignedInState, ...(typeof chatgptAccess === 'boolean' ? { chatgptAccess } : {}),
     ...(extensionUpdateHold ? { updateHold: extensionUpdateHold } : {}) }) });
   if (intent !== connectionEpoch || !token || disconnected) return;
-  if (!reply.ok || !reply.data) { await activeTabs?.revoke(); return; }
+  if (!reply.ok || !reply.data) { await renderingLeases(() => activeTabs?.revoke()); return; }
   await rememberBackgroundPlacement(reply.data.backgroundPlacement);
   const liveChats = new Set(Array.isArray(reply.data.nonDiscardableConversations) ? reply.data.nonDiscardableConversations : []);
   const liveOpenings = new Set(Array.isArray(reply.data.inputOpeningIds) ? reply.data.inputOpeningIds : []);
   const liveCommands = new Set(Array.isArray(reply.data.commandIds) ? reply.data.commandIds : []);
-  void reloadForExtensionUpdate(reply.data.extensionUpdate, liveOpenings, liveCommands).catch(() => undefined);
+  const liveSending = Array.isArray(reply.data.inputSendingIds) ? new Set(reply.data.inputSendingIds) : null;
+  void reloadForExtensionUpdate(reply.data.extensionUpdate, liveOpenings, liveCommands, liveSending).catch(() => undefined);
   void followApp(reply.data).catch(() => undefined);
+  followAppearance(reply.data.appearance);
   void revealChats(reply.data.reveals).catch(() => undefined);
   void followChat(reply.data.follow).catch(() => undefined);
   void runImageExports(reply.data.imageExports).catch(() => undefined);
@@ -3361,8 +3593,11 @@ async function maintainOnce() {
   const refreshRendering = async (tabs) => {
     if (!activeTabs || intent !== connectionEpoch || !token || disconnected) return;
     tabs ||= await chrome.tabs.query({ url: CHATGPT_TAB_URLS });
+    // Bounded, and never fatal to the pass: a lease is a debugger command to each background chat tab,
+    // and one that never answered, or failed to release, kept every later pass from reaching its repairs
+    // (2026-11-01: a Loop chat's repairs were handed out ten times and never claimed, twice).
     if (intent === connectionEpoch && token && !disconnected)
-      await activeTabs.set('policy', tabs.filter(renderingWanted), renderingWanted);
+      await renderingLeases(() => activeTabs.set('policy', tabs.filter(renderingWanted), renderingWanted));
   };
   // Reuse the app's current work policy. Old history, pins and tab presence do not qualify.
   await refreshRendering(observedTabs);
@@ -3618,10 +3853,14 @@ async function performBrowserRepairs(repairs, policy) {
         // transport error has disappeared. A still-visible error keeps the existing reload path.
         const status = await tabReply(target.id, { type: 'clf-page-status' },
           documentId ? { documentId } : undefined);
+        if (status?.ok === true && status.conversationId !== conversationId) {
+          await call(`/status?repairFailed=${encodeURIComponent(token)}&repairAction=${repairAction}&why=changed&detail=other-chat`);
+          continue;
+        }
         if (status?.ok === true && status.streaming === true &&
             (reason !== 'assistant-error' || status.assistantError === false)) {
           // Not a failure: ChatGPT is answering, and the app says so instead of "Reload failed".
-          await call(`/status?repairFailed=${encodeURIComponent(token)}&repairAction=${repairAction}&why=streaming`);
+          await call(`/status?repairFailed=${encodeURIComponent(token)}&repairAction=${repairAction}&why=streaming${status.approval === true ? '&approval=1' : ''}`);
           continue;
         }
         if (reason === 'assistant-error' && status?.ok === true && status.assistantError === false) {
@@ -3678,6 +3917,42 @@ function conversationStillOpen(conversationId) {
   return Object.values(tabConversations).some((value) => value === conversationId);
 }
 
+/**
+ * The persisted tab-to-chat cache is an optimization, not proof that a user closed a tab.
+ * After a worker restart or a document reload, the cache can be temporarily empty even
+ * while Chrome still has the conversation open. Never file a deliberate close from that
+ * absence alone. A failed tab query must defer the close rather than assert departure.
+ */
+async function verifiedConversationGone(conversationId) {
+  if (conversationStillOpen(conversationId)) return 'present';
+  let tabs;
+  try { tabs = await chrome.tabs.query({ url: CHATGPT_TAB_URLS }); }
+  catch { return 'unknown'; }
+  if (!Array.isArray(tabs)) return 'unknown';
+  // A navigation in progress still carries its *old* committed tab.url. The
+  // pending URL is authoritative for departure so we do not keep a chat open
+  // merely because the tab is on its way to a different page.
+  if (tabs.some(tab => conversationFromUrl(tab.pendingUrl || tab.url) === conversationId)) return 'present';
+  // A fresh content-script bind may have arrived while tabs.query was pending.
+  return conversationStillOpen(conversationId) ? 'present' : 'gone';
+}
+
+// Each pending close is a distinct attempt. Repeated drains may see the same
+// reason hundreds of times while a tab stays open; the activity log only needs
+// the transition. Weak keys disappear with completed/replaced outbox entries and
+// add no fields to persisted closeOutbox records.
+const closeDecisionByEntry = new WeakMap();
+function noteCloseDecision(entry, action, reason) {
+  const previous = closeDecisionByEntry.get(entry);
+  if (previous?.action === action && previous?.reason === reason) return;
+  closeDecisionByEntry.set(entry, { action, reason });
+  // Keep the reason finite and data-free. The app's existing diagnostics report
+  // logs one actionable line; the worker console also shows it immediately.
+  closeOutboxDecision = { at: Math.max(Date.now(), (closeOutboxDecision?.at || 0) + 1), action, reason };
+  console.info(`close outbox: ${action} close; ${reason}`);
+  if (typeof publishCompanionDiagnostics === 'function') void publishCompanionDiagnostics(true);
+}
+
 async function enqueueClose(conversationId, byExtension = false) {
   const id = cleanConversationId(conversationId);
   if (!id) return false;
@@ -3710,7 +3985,29 @@ async function drainCloses() {
         changed = true;
         continue;
       }
-      if (conversationStillOpen(conversationId)) continue;
+      // An extension-owned navigation already has exact authority for this
+      // departure. Its old tab URL may still be visible while Chrome navigates;
+      // checking it would incorrectly suppress the close (#1086).
+      if (entry.byExtension !== true) {
+        const presence = await verifiedConversationGone(conversationId);
+        if (presence === 'present') {
+          if (conversationStillOpen(conversationId)) {
+            // A new binding proves this queued close was superseded.
+            noteCloseDecision(entry, 'discarded', 'conversation_binding_open');
+            closeOutbox = closeOutbox.filter((candidate) => candidate !== entry);
+            changed = true;
+          } else {
+            // A close can be queued before Chrome finishes the navigation.
+            // Keep it for the next pass rather than discard the only departure.
+            noteCloseDecision(entry, 'deferred', 'chrome_tab_open');
+          }
+          continue;
+        }
+        if (presence === 'unknown') {
+          noteCloseDecision(entry, 'deferred', 'chrome_inventory_unavailable');
+          continue;
+        }
+      }
       const result = await call('/closed', {
         method: 'POST',
         // Only a proven managed removal is non-manual; legacy/unknown departures stay conservative.
@@ -3894,7 +4191,7 @@ const COMPACT_CHECKPOINT_FLAGS = [
   'destinationDispatch',
   'destinationLost'
 ];
-const COMPACT_CHECKPOINT_TEXT = ['summary', 'sourceMessageId', 'destinationMessageId', 'sourceError', 'before', 'newestUserMessage'];
+const COMPACT_CHECKPOINT_TEXT = ['summary', 'sourceMessageId', 'destinationMessageId', 'sourceError', 'sourceErrorCode', 'before', 'newestUserMessage'];
 // Not a checkpoint of its own: it qualifies `sourceMessageId` by saying how far that exact
 // marked response has grown. Sent only alongside the field it describes, so a bare count can
 // never move a deadline by itself. `documentSince` likewise only qualifies the newest message a
@@ -4003,6 +4300,18 @@ const HANDLERS = {
     if (['current', 'manual', 'complete', 'fail'].includes(message.action) && result.ok && result.data?.ok) void maintain();
     return result;
   },
+  /** The Projects a ChatGPT page's sidebar lists (#1756), for linking a project to one of them. */
+  async project_catalog(message, _sender, source) {
+    if (!ownsDocument(source) || !Array.isArray(message.projects) || message.projects.length > 400) return { ok: false };
+    const projects = message.projects
+      .filter((project) => project && typeof project.id === 'string' && /^g-p-[0-9a-f]{32}$/.test(project.id) && typeof project.name === 'string')
+      .map((project) => ({ id: project.id, name: project.name.slice(0, 200) }));
+    // Rows that were all invalid say nothing; an empty sidebar still names the workspace in use.
+    if (message.projects.length && !projects.length) return { ok: false };
+    const workspace = typeof message.workspace === 'string' && message.workspace.length <= 200 ? message.workspace : null;
+    const result = await call('/chatgpt-projects', { method: 'POST', body: JSON.stringify({ projects, workspace }) });
+    return { ok: result.ok === true };
+  },
   async model_catalog(message, _sender, source) {
     if (!ownsDocument(source) || typeof message.nonce !== 'string' || !/^[a-f0-9-]{36}$/i.test(message.nonce)) return { ok: false };
     const tab = await chrome.tabs.get(source.tab);
@@ -4046,6 +4355,23 @@ const HANDLERS = {
     return call('/core-plugin', { method: 'POST', body: JSON.stringify({ appId: message.appId }) });
   },
   // A page read ChatGPT's own `conversation_deleted` answer for this chat (usage.js).
+  // A new chat's tab for a linked Project found that Project gone (#1759): ChatGPT now keeps such a
+  // page on "loading" instead of sending it home, which the outbox loop above reports. Only the tab
+  // opened for that message, still on that Project's page, may say so.
+  async project_unavailable(message, _sender, source) {
+    const id = String(message.id || '');
+    const project = String(message.project || '');
+    if (!ownsDocument(source) || !/^[a-f0-9-]{36}$/i.test(id) || !/^g-p-[0-9a-f]{32}$/.test(project)) return { ok: false };
+    const opening = inputOpenings[id];
+    if (opening?.tab !== source.tab || opening.project !== project) return { ok: false };
+    const tab = await chrome.tabs.get(source.tab).catch(() => null);
+    // The document may have been replaced while asking, or the tab may already be leaving.
+    if (!tab || !ownsDocument(source) || tab.pendingUrl) return { ok: false };
+    let home = null;
+    try { home = /^\/g\/(g-p-[0-9a-f]{32})(?:-[^/]+)?\/project\/?$/i.exec(new URL(tab.url).pathname)?.[1]?.toLowerCase() ?? null; } catch {}
+    if (home !== project) return { ok: false };
+    return call('/project-create', { method: 'POST', body: JSON.stringify({ action: 'gone', inputId: id, chatgptId: project }) });
+  },
   async conversation_deleted(message, _sender, source) {
     const conversationId = String(message.conversationId || '').toLowerCase();
     if (!ownsDocument(source) || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(conversationId)) return { ok: false };
@@ -4088,7 +4414,7 @@ const HANDLERS = {
     }
     if (message.recoveryAction && message.owner !== owner) return { ok: false };
     const result = await call(typeof message.partial === 'string' ? '/input/progress' : typeof message.response === 'string' ? '/input/answer' : message.fail === true ? '/input/fail' : message.ack === true ? '/input/ack' : '/input/claim', {
-      method: 'POST', body: JSON.stringify({ id, owner, conversationId, recoveryAction: ['stop', 'stopped'].includes(message.recoveryAction) ? message.recoveryAction : undefined, silenceBusyTurnId: typeof message.silenceBusyTurnId === 'string' ? message.silenceBusyTurnId : undefined, recoveryVeto: message.recoveryVeto === 'page-final' ? 'page-final' : undefined, requiresAuthorization: message.requiresAuthorization === true, authorize: message.authorize === true, partial: typeof message.partial === 'string' ? message.partial.slice(-8000) : undefined, messageId: typeof message.messageId === 'string' ? message.messageId : undefined, error: message.error, detail: typeof message.detail === 'string' && /^[a-z-]{1,40}$/.test(message.detail) ? message.detail : undefined, response: typeof message.response === 'string' ? message.response.slice(0, 16001) : undefined, project: typeof message.project === 'string' && /^g-p-[0-9a-f]{32}$/.test(message.project) ? message.project : undefined })
+      method: 'POST', body: JSON.stringify({ id, owner, conversationId, recoveryAction: ['stop', 'stopped'].includes(message.recoveryAction) ? message.recoveryAction : undefined, silenceBusyTurnId: typeof message.silenceBusyTurnId === 'string' ? message.silenceBusyTurnId : undefined, recoveryVeto: message.recoveryVeto === 'page-final' ? 'page-final' : undefined, requiresAuthorization: message.requiresAuthorization === true, authorize: message.authorize === true, partial: typeof message.partial === 'string' ? message.partial.slice(-8000) : undefined, messageId: typeof message.messageId === 'string' ? message.messageId : undefined, error: message.error, detail: typeof message.detail === 'string' && RELEASE_DETAIL.test(message.detail) ? message.detail : undefined, response: typeof message.response === 'string' ? message.response.slice(0, 16001) : undefined, project: typeof message.project === 'string' && /^g-p-[0-9a-f]{32}$/.test(message.project) ? message.project : undefined })
     });
     if (typeof message.response === 'string' && message.lifetime === 'temporary-planner' && result.ok && result.data?.ok === true && ownsDocument(source)) {
       // Acceptance retires this exact helper immediately. Fresh page proof still
@@ -4126,8 +4452,12 @@ const HANDLERS = {
     return result;
   },
   async i18n_catalog(message) {
-    const messages = await globalThis.CLF_I18N?.catalogFor?.(String(message?.language || '')).catch(() => null);
-    return messages ? { ok: true, messages } : { ok: false };
+    // `current`: the language this worker applied from the app's last status (see followApp), so a
+    // page whose own storage read hangs still shows it.
+    const language = message?.current === true ? appLanguageApplied : String(message?.language || '');
+    if (!language) return { ok: false };
+    const messages = await globalThis.CLF_I18N?.catalogFor?.(language).catch(() => null);
+    return messages ? { ok: true, ...(message?.current === true ? { language } : {}), messages } : { ok: false };
   },
   async register_document(_message, sender) {
     let result = await registerDocument(sender, _message);
@@ -4248,7 +4578,7 @@ const HANDLERS = {
     // Remembered, not just cleared. Otherwise the next request — two seconds away in any
     // open tab — provisions a new token and the browser is connected again.
     disconnected = true;
-    await activeTabs?.revoke().catch(() => undefined);
+    await renderingLeases(() => activeTabs?.revoke());
     pairingError = null;
     await persist();
     return { ok: true };
@@ -4786,6 +5116,23 @@ const HANDLERS = {
    * How far a redeemed command's page got: a step name only, never its text. The app keeps the
    * last one so a command that runs out of time can say where it stopped. Best effort.
    */
+  /** A ChatGPT announcement the page closed (CLF_DOM.dismissAnnouncements), for one app log line. */
+  async page_note(message) {
+    const conversationId = cleanConversationId(message?.conversationId);
+    let body = null;
+    if (message?.note === 'announcement-closed') {
+      const heading = typeof message.heading === 'string' ? message.heading.replace(/\s+/g, ' ').trim().slice(0, 80) : '';
+      body = { note: 'announcement-closed', heading, conversationId };
+    } else if (message?.note === 'input-held' && ['page-moved', 'chat-moved-on', 'question-gone', 'still-answering', 'turn-held', 'tool-running', 'no-composer', 'composer-hidden', 'recovery-question-changed',
+        'recovery-question-unreadable', 'recovery-not-ready'].includes(message.reason) &&
+        typeof message.inputId === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(message.inputId)) {
+      body = { note: 'input-held', reason: message.reason, inputId: message.inputId, conversationId };
+    }
+    if (!body) return { ok: false };
+    // Best effort, and never in the tab's queue: a claim or receipt behind it must not wait on a log line.
+    void call('/page-note', { method: 'POST', body: JSON.stringify(body) }).catch(() => undefined);
+    return { ok: true };
+  },
   async command_step(message) {
     const id = typeof message.id === 'string' ? message.id.slice(0, 128) : '';
     const step = typeof message.step === 'string' ? message.step.slice(0, 32) : '';
@@ -4923,9 +5270,17 @@ async function cachedEnvironmentDiagnostics() {
 
 /** Snapshot sent only to the current paired bridge; it does not grant work or recovery. */
 async function companionDiagnosticSnapshot(found) {
-  const preferences = await chrome.storage.local.get([RENDER_STREAM_KEY, SHOW_TIMES_KEY]);
+  // Bounded like followApp's read: a storage that never answers must not hold every later report back.
+  await followSettled();
+  let readFailed = null;
+  const preferences = await boundedStorageGet([RENDER_STREAM_KEY, SHOW_TIMES_KEY, APP_LANGUAGE_KEY])
+    .catch(error => { readFailed = String(error?.message || error).slice(0, 200); return {}; });
+  const languageState = appLanguageState();
   return {
     capturedAt: Date.now(),
+    ...(closeOutboxDecision ? { closeOutboxDecision } : {}),
+    language: { ...languageState, error: languageState.error ?? readFailed,
+      stored: typeof preferences[APP_LANGUAGE_KEY] === 'string' ? preferences[APP_LANGUAGE_KEY] : null },
     status: {
       connected: found !== null,
       port: found ? found.port : null,
@@ -4946,11 +5301,17 @@ async function companionDiagnosticSnapshot(found) {
     // Defaults on a fresh install are not choices; the app keeps only values someone stored.
     preferencesStored: RENDER_STREAM_KEY in preferences || SHOW_TIMES_KEY in preferences,
     tab: await HANDLERS.tabStatus(),
-    environment: await cachedEnvironmentDiagnostics()
+    environment: await cachedEnvironmentDiagnostics(),
+    errorPageReloads: await loadErrorPageReloads().then(() => ({ count: errorPageReloadCount, lastAt: lastErrorPageReloadAt,
+      ...(errorPageSkip ? { skipped: errorPageSkip } : {}) }))
   };
 }
 
-function publishCompanionDiagnostics() {
+// A change that must reach the app (an error-page reload) while a report is already under way:
+// that report may have taken its snapshot before the change, so one more follows it.
+let companionDiagnosticsDirty = false;
+function publishCompanionDiagnostics(changed = false) {
+  if (companionDiagnosticsFlight && changed) companionDiagnosticsDirty = true;
   if (companionDiagnosticsFlight || !token || disconnected) return companionDiagnosticsFlight;
   const intent = connectionEpoch, credential = token, endpoint = port;
   const work = (async () => {
@@ -4961,6 +5322,7 @@ function publishCompanionDiagnostics() {
     await call('/diagnostics', { method: 'POST', body: JSON.stringify(snapshot) });
   })().catch(() => undefined).finally(() => {
     if (companionDiagnosticsFlight === work) companionDiagnosticsFlight = null;
+    if (companionDiagnosticsDirty) { companionDiagnosticsDirty = false; void publishCompanionDiagnostics(); }
   });
   companionDiagnosticsFlight = work;
   return work;
@@ -4976,12 +5338,15 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
     'stop_redeem',
     'stop_ack',
     'desktop_input',
+    'page_note',
     'model_catalog',
+    'project_catalog',
     'plugin_refresh',
     'project_create',
     'core_plugin',
     'load_failure',
     'conversation_deleted',
+    'project_unavailable',
     'usage_observation',
     'events',
     'bind',
@@ -5097,7 +5462,7 @@ chrome.tabs.onUpdated.addListener((id, changeInfo, tab) => {
       // minimized window for app-opened chats, 2026-10-15); a Send waiting there on its new
       // chat's address learns it now. Messages reach such a page at once; its timers do not.
       if (same) void tabReply(id, { type: 'clf-route-changed' }, { documentId }).catch(() => undefined);
-      await activeTabs?.navigation(id, same ? tab : null);
+      await renderingLeases(() => activeTabs?.navigation(id, same ? tab : null));
       if (rendering && same) return maintain(true);
     }).catch(() => undefined);
   }
@@ -5559,6 +5924,66 @@ function recoverDeferredRevivals() {
   return tracked;
 }
 
+// A chat tab that loaded while offline shows Chrome's own error page, where nothing can be injected.
+// Chrome reloads such a page by itself only in a visible tab, and the app's chat tabs usually are not
+// (2.1.47 round: every send to that chat expired). It holds no draft and no answer, so once the
+// browser is online again it is reloaded, at most every 1, 2, 4 … 15 minutes per tab.
+// The backoff and the counter live in session storage: Chrome stops the worker between passes, and a
+// fresh worker must neither reload at once again nor report old reloads as new (CodeRabbit on #1911).
+const ERROR_PAGE_RELOADS_KEY = 'errorPageReloads';
+const errorPageReloads = new Map();
+// For the app's log (via the diagnostics snapshot): how many, and when the last one was.
+let errorPageReloadCount = 0, lastErrorPageReloadAt = 0, errorPageReloadsLoaded = null;
+// The last reload skipped, and why, for the app's log; a new key reports once more.
+let errorPageSkip = null, errorPageSkipKey = '';
+/** True once the saved backoff is read. A failed read is retried by the next call, never taken for none. */
+function loadErrorPageReloads() {
+  errorPageReloadsLoaded ??= chrome.storage.session.get(ERROR_PAGE_RELOADS_KEY).then(stored => {
+    const saved = stored?.[ERROR_PAGE_RELOADS_KEY];
+    if (!saved || typeof saved !== 'object') return;
+    for (const entry of Array.isArray(saved.tabs) ? saved.tabs.slice(-64) : []) {
+      const [id, state] = Array.isArray(entry) ? entry : [];
+      if (Number.isInteger(id) && Number.isFinite(state?.tries) && Number.isFinite(state?.nextAt) && !errorPageReloads.has(id))
+        errorPageReloads.set(id, { tries: state.tries, nextAt: state.nextAt });
+    }
+    if (Number.isFinite(saved.count)) errorPageReloadCount = Math.max(errorPageReloadCount, saved.count);
+    if (Number.isFinite(saved.lastAt)) lastErrorPageReloadAt = Math.max(lastErrorPageReloadAt, saved.lastAt);
+  }).then(() => true, () => { errorPageReloadsLoaded = null; return false; });
+  return errorPageReloadsLoaded;
+}
+function noteErrorPageSkip(id, reason, nextAt = 0) {
+  const key = `${id}:${reason}:${nextAt}`;
+  if (key === errorPageSkipKey) return;
+  errorPageSkipKey = key;
+  errorPageSkip = { reason, at: Date.now(), ...(nextAt ? { nextAt } : {}) };
+  void publishCompanionDiagnostics(true);
+}
+function saveErrorPageReloads() {
+  return chrome.storage.session.set({ [ERROR_PAGE_RELOADS_KEY]: { tabs: [...errorPageReloads], count: errorPageReloadCount, lastAt: lastErrorPageReloadAt } })
+    .catch(() => undefined);
+}
+async function forgetErrorPage(id) {
+  if (!await loadErrorPageReloads()) return;
+  if (errorPageReloads.delete(id)) await saveErrorPageReloads();
+}
+async function reloadErrorPage(id) {
+  if (typeof navigator !== 'undefined' && navigator.onLine === false) return noteErrorPageSkip(id, 'offline');
+  // Unread is not "never reloaded": reloading now could skip the backoff, and saving would overwrite it.
+  if (!await loadErrorPageReloads()) return noteErrorPageSkip(id, 'unreadable');
+  const now = Date.now(), prior = errorPageReloads.get(id);
+  if (prior && now < prior.nextAt) return noteErrorPageSkip(id, 'backoff', prior.nextAt);
+  const tries = (prior?.tries ?? 0) + 1;
+  errorPageReloads.delete(id);
+  errorPageReloads.set(id, { tries, nextAt: now + Math.min(15 * 60_000, 60_000 * 2 ** (tries - 1)) });
+  if (errorPageReloads.size > 64) errorPageReloads.delete(errorPageReloads.keys().next().value);
+  try {
+    await chrome.tabs.reload(id);
+    errorPageReloadCount += 1; lastErrorPageReloadAt = now;
+    await saveErrorPageReloads();
+    void publishCompanionDiagnostics(true);
+  } catch { await saveErrorPageReloads(); /* The tab went away; nothing to reload. */ }
+}
+
 async function restoreChatgptTab(id, current = () => true, documentId = null) {
   if (!current()) return false;
   const target = { tabId: id, ...(documentId ? { documentIds: [documentId] } : {}) };
@@ -5576,6 +6001,7 @@ async function restoreChatgptTab(id, current = () => true, documentId = null) {
       } catch {
         // The tab can navigate between the ping and repair. Static injection covers it.
       }
+      await forgetErrorPage(id);
       return true;
     }
   } catch {
@@ -5592,6 +6018,10 @@ async function restoreChatgptTab(id, current = () => true, documentId = null) {
     // Rebuild the isolated-world DOM adapter before the recorder that consumes it.
     await chrome.scripting.executeScript({ target, files: ['chatgpt-dom.js'] });
     if (!current()) return false;
+    // The app's colors for the CoS parts of the page, before content.js, as the manifest loads them
+    // (CodeRabbit on #2038): a restored tab otherwise keeps the defaults until it reloads.
+    await chrome.scripting.executeScript({ target, files: ['app-palette.js'] });
+    if (!current()) return false;
     // Keep the React/Fiber reader in ChatGPT's own world, exactly like the static manifest
     // declaration. An older helper may still answer too; the nonce/version gate in
     // content.js makes those replies harmless, and a future version bump rejects them.
@@ -5600,10 +6030,12 @@ async function restoreChatgptTab(id, current = () => true, documentId = null) {
     await chrome.scripting.executeScript({ target, files: ['content.js'] });
     if (!current()) return false;
     await chrome.scripting.insertCSS({ target, files: ['overlay.css'] });
+    await forgetErrorPage(id);
     // Successful injection means this exact tab is recovering. Its document registration will
     // re-run revival routing; opening a second tab during that handoff recreates the race.
     return current();
-  } catch {
+  } catch (error) {
+    if (/showing error page/i.test(String(error?.message ?? ''))) await reloadErrorPage(id);
     // Injection failure does not transfer ownership to a replacement tab.
     return false;
   }

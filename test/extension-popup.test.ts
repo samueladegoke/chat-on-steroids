@@ -164,3 +164,144 @@ it('keeps blocked delivery distinct from network unreachability and requires pai
   expect(result.why[1]).toContain('protocol compatibility');
   expect(result.why[1]).not.toContain('not reachable');
 });
+
+it('says a ChatGPT page that is not a chat (a Dot, the library) is not followed, instead of waiting for a first message', () => {
+  openPopup();
+  const pipeline = (url: string, events = 0) =>
+    (popup!.window as any).pipeline({ isChat: true, url, recorder: true, page: { events }, pending: 0 }, true);
+  for (const url of [
+    'https://chatgpt.com/dots/home',
+    'https://chatgpt.com/library',
+    'https://chatgpt.com/gpts',
+    'https://chatgpt.com/share/c/0123abcd-0000-4000-8000-000000000000'
+  ]) {
+    const result = pipeline(url);
+    expect(result.read[0], url).toBe('off');
+    expect(result.why[1], url).toContain('not a chat');
+  }
+  // Every route a chat lives on or starts from keeps waiting for its first message.
+  for (const url of [
+    'https://chatgpt.com/',
+    'https://chatgpt.com/?temporary-chat=true',
+    'https://chatgpt.com/c/0123abcd-0000-4000-8000-000000000000',
+    'https://chatgpt.com/g/g-p-0123456789abcdef0123456789abcdef-site/project',
+    'https://chatgpt.com/g/g-p-0123456789abcdef0123456789abcdef-site/c/0123abcd-0000-4000-8000-000000000000',
+    'https://chatgpt.com/g/g-abc123-writer',
+    'https://chat.openai.com/c/0123abcd-0000-4000-8000-000000000000'
+  ]) {
+    expect(pipeline(url).why[1], url).toContain('Waiting for the first message');
+  }
+  // Observations from the page outrank the route: whatever the page records is shown as usual.
+  expect(pipeline('https://chatgpt.com/dots/home', 3).why[1]).not.toContain('not a chat');
+  // No recorder answers on a page that is not a chat: nothing to reload, it is still not a chat.
+  const silent = (popup!.window as any).pipeline({ isChat: true, url: 'https://chatgpt.com/dots/home', recorder: false, page: null, pending: 0 }, true);
+  expect(silent.why[1]).toContain('not a chat');
+});
+
+it('marks the recording, chat, request and app rows as not applicable on a Dot page, and as a new chat at the start page', async () => {
+  const document = openPopup();
+  const show = async (url: string) => {
+    (popup!.window as any).chrome.runtime.sendMessage = async (message: { type: string }) =>
+      message.type === 'status'
+        ? { connected: true, paired: true, compatible: true, port: 8765 }
+        : { isChat: true, url, conversationId: null, recorder: true, page: { events: 0 }, pending: 0, chatTabs: 1 };
+    await (popup!.window as any).refresh();
+    const state = (name: string) => [document.getElementById(`r-${name}`)!.className, document.getElementById(`d-${name}`)!.textContent];
+    return { rec: state('rec'), chat: state('chat'), req: state('req'), app: state('app'), why: document.getElementById('why')!.textContent };
+  };
+  const dot = await show('https://chatgpt.com/dots/home');
+  expect(dot.rec).toEqual(['row off', '']);
+  expect(dot.chat).toEqual(['row off', 'not a chat']);
+  expect(dot.req).toEqual(['row off', '']);
+  expect(dot.app).toEqual(['row off', '']);
+  expect(dot.why).toContain('not a chat');
+  const start = await show('https://chatgpt.com/');
+  expect(start.rec).toEqual(['row ok', '']);
+  expect(start.chat).toEqual(['row wait', 'new chat']);
+  expect(start.req).toEqual(['row wait', 'none yet']);
+  expect(start.why).toContain('Waiting for the first message');
+});
+
+// 2026-11-01: a pairing call that fails left Try again / Connect disabled until the popup was reopened.
+it('enables Try again again when the pairing call fails', async () => {
+  const document = openPopup();
+  (popup!.window as any).paintHeader({ connected: false, paired: false });
+  const retry = document.getElementById('retryBtn') as HTMLButtonElement;
+  expect(retry.hidden).toBe(false);
+  (popup!.window as any).chrome.runtime.sendMessage = async (message: { type: string }) => {
+    if (message.type === 'pair') throw new Error('Could not establish connection. Receiving end does not exist.');
+    return null;
+  };
+  retry.click();
+  await new Promise(resolve => setTimeout(resolve, 0));
+  await new Promise(resolve => setTimeout(resolve, 0));
+  expect(retry.disabled).toBe(false);
+});
+
+// 2026-11-01: the fallback names were read once at load, before the app's language arrived.
+it('names a fallback attribution in the language current when it is painted', () => {
+  const messages: Record<string, string> = {};
+  const document = openPopup(messages, 'de');
+  messages.popup_attribution_only_chat_generating = 'der einzige Chat, der gerade antwortet';
+  messages.popup_pipeline_call_fallback_one = 'Ausweichlösung: $1.';
+  const state = (popup!.window as any).pipeline({ isChat: true, url: 'https://chatgpt.com/c/x', recorder: true, conversationId: 'c',
+    page: { events: 3, session: 's', trace: [{ requestId: 'r', read: true, sent: true, app: 'generation' }] }, pending: 0 }, true);
+  expect(state.why[1]).toBe('Ausweichlösung: der einzige Chat, der gerade antwortet.');
+  expect(document).toBeTruthy();
+});
+
+// 2026-11-01: a page without send counts showed "undefined · undefined failed" under Advanced.
+it('shows a dash for page sends the page did not report', () => {
+  const document = openPopup();
+  (document.getElementById('more') as HTMLDetailsElement).open = true;
+  (popup!.window as any).paintDetails({ connected: true, paired: true, compatible: true, port: 8765 },
+    { isChat: true, tab: 7, page: { events: 3, calls: 1 } });
+  const cells = [...document.querySelectorAll('#grid dd')].map(node => node.textContent);
+  expect(cells.join(' ')).not.toContain('undefined');
+  (popup!.window as any).paintDetails({ connected: true, paired: true, compatible: true, port: 8765 },
+    { isChat: true, tab: 7, page: { events: 3, calls: 1, sends: 4, failures: 1 } });
+  expect([...document.querySelectorAll('#grid dd')].map(node => node.textContent)).toContain('4 · 1 failed');
+});
+
+// CodeRabbit on #2012: a failed tabStatus answers with an error and no counts; "0 held · 0 total" claimed a journal nobody read.
+it('shows a dash for queue counts the worker could not read', () => {
+  const document = openPopup();
+  (document.getElementById('more') as HTMLDetailsElement).open = true;
+  const row = () => [...document.querySelectorAll('#grid dt')].find(node => node.textContent === 'in this browser')?.nextElementSibling?.textContent;
+  (popup!.window as any).paintDetails({ connected: true, paired: true, compatible: true, port: 8765 }, { isChat: true, tab: 7, error: 'journal unavailable' });
+  expect(row()).not.toMatch(/\d/);
+  (popup!.window as any).paintDetails({ connected: true, paired: true, compatible: true, port: 8765 }, { isChat: true, tab: 7, pending: 0, pendingAll: 2 });
+  expect(row()).toBe('0 held · 2 total');
+});
+
+it('rounds the page up to a whole pixel, so Chrome does not size the popup a fraction short and scroll it', () => {
+  // Chrome sizes a popup to the page's height rounded down: a page 566.56 px tall got a 566 px
+  // window and could be scrolled by a pixel (2026-11-03, measured in the real popup).
+  let height = 566.56;
+  let resized: (() => void) | undefined;
+  popup = new JSDOM(html, { url: 'https://extension-popup.test/', runScripts: 'outside-only' });
+  const unavailable = () => new Promise(() => undefined);
+  Object.assign(popup.window, {
+    chrome: {
+      i18n: { getMessage: () => '', getUILanguage: () => 'en' },
+      runtime: { sendMessage: unavailable },
+      storage: { local: { get: unavailable } }
+    },
+    setInterval: () => 0,
+    ResizeObserver: class { constructor(callback: () => void) { resized = callback; } observe() { resized?.(); } }
+  });
+  popup.window.HTMLElement.prototype.getBoundingClientRect = function () { return { height } as DOMRect; };
+  popup.window.eval(i18nScript);
+  popup.window.eval(script);
+  const root = popup.window.document.documentElement;
+  expect(root.style.minHeight).toBe('567px');
+
+  // The Advanced drawer opens and closes: the page follows, still in whole pixels.
+  height = 897.3; resized!();
+  expect(root.style.minHeight).toBe('898px');
+  height = 566.56; resized!();
+  expect(root.style.minHeight).toBe('567px');
+  // Already whole: no extra pixel.
+  height = 540; resized!();
+  expect(root.style.minHeight).toBe('540px');
+});

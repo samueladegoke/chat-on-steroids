@@ -255,9 +255,10 @@ async function worker(inputs: Array<{ id: string; conversationId: string | null;
   const event = { addListener: () => {} };
   const tabUpdated = { addListener: vi.fn() };
   const localSaved: Record<string, unknown> = { port: 8765, token: 'test-pairing', ...priorLocal };
-  const local = { get: async () => ({ ...localSaved }), set: vi.fn(async (value: object) => { Object.assign(localSaved, value); }), remove: async () => {} };
+  const local = { get: async () => ({ ...localSaved }), set: vi.fn(async (value: object) => { Object.assign(localSaved, value); }), remove: async (keys: string | string[]) => { for (const key of [keys].flat()) delete localSaved[key]; } };
   const saved: Record<string, unknown> = { ...priorSession };
-  const session = { get: async () => ({ ...saved }), set: async (value: object) => { Object.assign(saved, value); }, remove: async (key: string) => { delete saved[key]; } };
+  // A key listed in `__unreadable` fails to read, as session storage can.
+  const session = { get: async (key?: string) => { if (typeof key === 'string' && (saved.__unreadable as string[] | undefined)?.includes(key)) throw new Error('storage unavailable'); return { ...saved }; }, set: async (value: object) => { Object.assign(saved, value); }, remove: async (key: string) => { delete saved[key]; } };
   const create = vi.fn(async ({ url, windowId }: { url: string; windowId?: number }): Promise<Tab> => {
     const tab = { id: tabs.length + 1, pendingUrl: url, windowId }; tabs.push(tab); return tab;
   });
@@ -294,7 +295,14 @@ async function worker(inputs: Array<{ id: string; conversationId: string | null;
     return func && target.documentIds?.includes(documentId)
       ? [{ documentId, frameId: 0, result: tabs.find(tab => tab.id === target.tabId)?.url }] : [];
   }), insertCSS: async () => {} };
+  const browserNavigator = { onLine: true };
+  // The worker's clock, which `advance` moves on: its once-a-minute checks run again only after it.
+  let clockOffset = 0;
+  const WorkerDate = class extends Date { static override now() { return Date.now() + clockOffset; } };
+  const advance = (ms: number) => { clockOffset += ms; };
   const context = vm.createContext({
+    Date: WorkerDate,
+    navigator: browserNavigator,
     chrome: {
       ...(rendered ? { debugger: debuggerApi } : {}),
       storage: { local, session },
@@ -314,8 +322,131 @@ async function worker(inputs: Array<{ id: string; conversationId: string | null;
   Object.assign(api, { query });
   const updated = (id: number, change: object) => tabUpdated.addListener.mock.calls[0]![0](id, change, tabs.find(tab => tab.id === id));
   vm.runInContext('Object.assign(testMaintenance, { offerStopTurns, noteTabConversation, ackCommand })', context);
-  return { ...api, scripting, updated, update, inspectModels: (context.testMaintenance as any).inspectRequestedModels as (request: unknown, background: boolean) => Promise<void>, ackDesktopInput: (context.testMaintenance as any).ackDesktopInput as (...args: string[]) => Promise<any>, drainCommandAcks: (context.testMaintenance as any).drainCommandAcks as () => Promise<any>, desktopInput: (context.testMaintenance as any).desktopInput as (...args: any[]) => Promise<any>, events: (context.testMaintenance as any).events as (message: any, sender: any, source: any) => Promise<any>, bind: (context.testMaintenance as any).bind as (message: any, sender: any, source: any) => Promise<any>, correlate: (context.testMaintenance as any).correlate as (message: any, sender: any, source: any) => Promise<any>, closed: (context.testMaintenance as any).closed as (message: any, sender: any, source: any) => Promise<any>, loadFailure: (context.testMaintenance as any).loadFailure as (message: any, sender: any, source: any) => Promise<any>, create, sendMessage, tabs, fetch, windows, remove, reload, local, localSaved, saved };
+  return { ...api, scripting, updated, update, advance, navigator: browserNavigator, inspectModels: (context.testMaintenance as any).inspectRequestedModels as (request: unknown, background: boolean) => Promise<void>, ackDesktopInput: (context.testMaintenance as any).ackDesktopInput as (...args: string[]) => Promise<any>, drainCommandAcks: (context.testMaintenance as any).drainCommandAcks as () => Promise<any>, desktopInput: (context.testMaintenance as any).desktopInput as (...args: any[]) => Promise<any>, events: (context.testMaintenance as any).events as (message: any, sender: any, source: any) => Promise<any>, bind: (context.testMaintenance as any).bind as (message: any, sender: any, source: any) => Promise<any>, correlate: (context.testMaintenance as any).correlate as (message: any, sender: any, source: any) => Promise<any>, closed: (context.testMaintenance as any).closed as (message: any, sender: any, source: any) => Promise<any>, loadFailure: (context.testMaintenance as any).loadFailure as (message: any, sender: any, source: any) => Promise<any>, query, create, sendMessage, tabs, fetch, windows, remove, reload, local, localSaved, saved };
 }
+
+// 2.1.47 round: a chat tab that loaded offline in the app's background window stayed on Chrome's
+// error page (Chrome reloads those only in a visible tab), no recorder could be injected, and every
+// send to that chat expired. Online again, the maintenance pass reloads it, backing off.
+describe('a chat tab left on Chrome\'s error page', () => {
+  const errorPage = async (online: boolean, prior: Record<string, unknown> = {}, failure = 'Frame with ID 0 is showing error page', healthy = false) => {
+    const h = await worker([], undefined, {}, prior);
+    h.navigator.onLine = online;
+    h.tabs.push({ id: 8, url: `https://chatgpt.com/c/${secondId}`, status: 'complete' } as Tab);
+    h.sendMessage.mockImplementation(async (_tabId: number, message: any) => {
+      if (message.type === 'clf-recorder-ping') {
+        if (healthy) return { ok: true, recorderVersion: 22 };
+        throw new Error('Could not establish connection. Receiving end does not exist.');
+      }
+      return { ok: true };
+    });
+    h.scripting.executeScript.mockImplementation(async () => { throw new Error(failure); });
+    await h.maintain();
+    return h;
+  };
+  const backoff = (tries: number, nextAt: number, count = tries, lastAt = Date.now() - 1_000) =>
+    ({ errorPageReloads: { tabs: [[8, { tries, nextAt }]], count, lastAt } });
+  it('is reloaded once the browser is online', async () => {
+    const h = await errorPage(true);
+    expect(h.reload).toHaveBeenCalledExactlyOnceWith(8);
+    // The app's log learns of it through the next diagnostics report.
+    await vi.waitFor(() => expect(h.fetch.mock.calls.some(([url, init]: any) => new URL(url).pathname === '/diagnostics' &&
+      JSON.parse(init.body).errorPageReloads?.count === 1)).toBe(true), { timeout: 5_000 });
+  });
+  // Each skip once, by when it happened: a report sent again (a change while one was in flight) carries
+  // the same skip, and the app logs it once by that time (#1940 made the snapshot's read bounded).
+  const reported = (h: Awaited<ReturnType<typeof errorPage>>) => [...new Map(h.fetch.mock.calls
+    .filter(([url]: any) => new URL(url).pathname === '/diagnostics').map(([, init]: any) => JSON.parse(init.body).errorPageReloads?.skipped).filter(Boolean)
+    .map((skip: any) => [`${skip.reason}:${skip.at}`, skip])).values()];
+  // CodeRabbit on #1911: a skipped reload says why in the app's log, once per reason.
+  const pings = (h: Awaited<ReturnType<typeof errorPage>>) => h.sendMessage.mock.calls.filter(([, message]: any) => message.type === 'clf-recorder-ping').length;
+  // The next recorder check, a minute later on the worker's clock.
+  const nextCheck = async (h: Awaited<ReturnType<typeof errorPage>>, ms = 61_000) => {
+    const before = pings(h);
+    h.advance(ms);
+    await h.maintain();
+    await vi.waitFor(() => expect(pings(h)).toBeGreaterThan(before), { timeout: 5_000 });
+    await new Promise(resolve => setTimeout(resolve, 50));
+  };
+  it('is left alone while the browser is offline, says so once, and is reloaded once online', async () => {
+    const h = await errorPage(false);
+    expect(h.reload).not.toHaveBeenCalled();
+    await vi.waitFor(() => expect(reported(h)).toEqual([expect.objectContaining({ reason: 'offline' })]), { timeout: 5_000 });
+    // Still offline at the next check: the same skip, reported once (later reports carry it; the app logs it by when it happened).
+    await nextCheck(h);
+    expect(h.reload).not.toHaveBeenCalled();
+    expect(new Set(reported(h).map((skip: any) => skip.at)).size).toBe(1);
+    h.navigator.onLine = true;
+    await nextCheck(h);
+    expect(h.reload).toHaveBeenCalledExactlyOnceWith(8);
+  });
+  it('says when a reload waits out its backoff', async () => {
+    const nextAt = Date.now() + 60_000;
+    const h = await errorPage(true, backoff(1, nextAt));
+    await vi.waitFor(() => expect(reported(h)).toEqual([expect.objectContaining({ reason: 'backoff', nextAt })]), { timeout: 5_000 });
+  });
+  // CodeRabbit on #1911: an unreadable saved backoff is not "no backoff". Nothing is reloaded or
+  // overwritten, and a later check reads it again and keeps to it.
+  it('neither reloads nor overwrites its saved backoff while that cannot be read, and keeps to it once read', async () => {
+    const nextAt = Date.now() + 3 * 60_000;
+    const h = await errorPage(true, { ...backoff(1, nextAt), __unreadable: ['errorPageReloads'] });
+    expect(h.reload).not.toHaveBeenCalled();
+    expect((h.saved as any).errorPageReloads.tabs).toEqual([[8, { tries: 1, nextAt }]]);
+    await vi.waitFor(() => expect(reported(h)).toEqual([expect.objectContaining({ reason: 'unreadable' })]), { timeout: 5_000 });
+    // Still unreadable a minute later: still nothing reloaded or saved.
+    await nextCheck(h);
+    expect(h.reload).not.toHaveBeenCalled();
+    expect((h.saved as any).errorPageReloads.tabs).toEqual([[8, { tries: 1, nextAt }]]);
+    // Readable again within the saved backoff: it is kept to.
+    (h.saved as any).__unreadable = [];
+    await nextCheck(h);
+    expect(h.reload).not.toHaveBeenCalled();
+    expect(reported(h).at(-1)).toMatchObject({ reason: 'backoff', nextAt });
+    // Past it: reloaded, and the backoff goes on from the saved tries.
+    await nextCheck(h, 2 * 60_000);
+    expect(h.reload).toHaveBeenCalledExactlyOnceWith(8);
+    expect((h.saved as any).errorPageReloads.tabs[0]).toEqual([8, expect.objectContaining({ tries: 2 })]);
+  });
+  // CodeRabbit on #1911: the backoff and the counter outlive a stopped worker.
+  it('waits out its backoff, also after the worker restarted', async () => {
+    const h = await errorPage(true, backoff(1, Date.now() + 60_000));
+    expect(h.reload).not.toHaveBeenCalled();
+  });
+  it('is reloaded once its backoff ran out, which then doubles, and the count goes on', async () => {
+    const before = Date.now();
+    const h = await errorPage(true, backoff(2, before - 1, 2));
+    expect(h.reload).toHaveBeenCalledExactlyOnceWith(8);
+    const saved = (h.saved as any).errorPageReloads;
+    expect(saved.count).toBe(3);
+    const [[id, state]] = saved.tabs;
+    expect([id, state.tries]).toEqual([8, 3]);
+    expect(state.nextAt - before).toBeGreaterThanOrEqual(4 * 60_000);
+    expect(state.nextAt - Date.now()).toBeLessThanOrEqual(4 * 60_000);
+  });
+  it('waits at most 15 minutes between reloads', async () => {
+    const h = await errorPage(true, backoff(9, Date.now() - 1));
+    expect(h.reload).toHaveBeenCalledOnce();
+    expect((h.saved as any).errorPageReloads.tabs[0][1].nextAt - Date.now()).toBeLessThanOrEqual(15 * 60_000);
+  });
+  it('is not reloaded for any other injection failure', async () => {
+    const h = await errorPage(true, {}, 'Cannot access contents of the page.');
+    expect(h.reload).not.toHaveBeenCalled();
+  });
+  // Saved data: nothing older than this version stored it; a damaged value is read as nothing.
+  it.each([['not an object', 'garbage'], ['broken entries', { tabs: [['8', { tries: 'x' }], [8], null], count: 'many', lastAt: -1 }]])(
+    'reads a damaged saved backoff (%s) as none', async (_name, value) => {
+      const h = await errorPage(true, { errorPageReloads: value });
+      expect(h.reload).toHaveBeenCalledExactlyOnceWith(8);
+      const saved = (h.saved as any).errorPageReloads;
+      expect(saved.tabs.map(([id, state]: any) => [id, state.tries])).toEqual([[8, 1]]);
+      expect(saved.count).toBe(1);
+    });
+  it('forgets its backoff once its recorder answers', async () => {
+    const h = await errorPage(true, backoff(3, Date.now() + 60_000), undefined, true);
+    expect(h.reload).not.toHaveBeenCalled();
+    expect((h.saved as any).errorPageReloads.tabs).toEqual([]);
+  });
+});
 
 describe('one browser maintenance flight per desktop outbox publication', () => {
   it.each(['same', 'missing', 'wrong-document', 'wrong-url', 'wrong-frame', 'replaced-during-proof'])('uses exact Chrome document proof for loading+URL events (%s)', async scenario => {
@@ -387,7 +518,7 @@ describe('one browser maintenance flight per desktop outbox publication', () => 
     });
     await h.maintain();
     for (let i = 0; i < 10; i++) await new Promise(resolve => setTimeout(resolve, 0));
-    expect(h.create).toHaveBeenCalledWith(expect.objectContaining({ url: `https://chatgpt.com/?cos-project-create=${secondId}`, active: true }));
+    expect(h.create).toHaveBeenCalledWith(expect.objectContaining({ url: `https://chatgpt.com/projects?cos-project-create=${secondId}`, active: true }));
     expect(h.create.mock.calls.some(([options]) => String(options.url).includes(firstId))).toBe(false);
   });
 
@@ -513,7 +644,7 @@ describe('one browser maintenance flight per desktop outbox publication', () => 
   it.each(['owned-home', 'foreign-chat', 'replacement-document', 'extra-navigation'])('keeps a reused conversation rendering only through its authorized transition (%s)', async transition => {
     const rendered = new Set<number>();
     const h = await worker([{ id: firstId, conversationId: null }], undefined, {}, {}, rendered);
-    const tab = { id: 7, url: `https://chatgpt.com/c/${secondId}`, active: false };
+    const tab: Tab = { id: 7, url: `https://chatgpt.com/c/${secondId}`, active: false };
     h.tabs.push(tab);
     const sender = { tab, documentId: 'reused-document', frameId: 0, url: tab.url };
     await h.authorizeDocument(sender, { navigationEpoch: 1 });
@@ -558,7 +689,7 @@ describe('one browser maintenance flight per desktop outbox publication', () => 
     // #1086: a new chat took an idle app-owned chat's tab. The page then reported that chat as
     // closed, the app read it as the user closing it on purpose, and paused its recovery for good.
     const h = await worker([{ id: firstId, conversationId: null }]);
-    const tab = { id: 7, url: `https://chatgpt.com/c/${secondId}`, active: false };
+    const tab: Tab = { id: 7, url: `https://chatgpt.com/c/${secondId}`, active: false };
     h.tabs.push(tab);
     const sender = { tab, documentId: 'reused-document', frameId: 0, url: tab.url };
     const source = await h.authorizeDocument(sender, { navigationEpoch: 1 });
@@ -586,6 +717,7 @@ describe('one browser maintenance flight per desktop outbox publication', () => 
       // The record is spent: a later departure of the same chat is the user's again.
       tab.url = `https://chatgpt.com/c/${secondId}`;
       const back = await h.authorizeDocument({ ...sender, url: tab.url, documentId: 'reused-document' }, { navigationEpoch: 3 });
+      tab.pendingUrl = 'https://chatgpt.com/';
       await h.closed({ conversationId: secondId }, { ...sender, url: tab.url }, back);
       expect(closes().at(-1)).toEqual({ conversationId: secondId, manual: true });
     }
@@ -595,12 +727,15 @@ describe('one browser maintenance flight per desktop outbox publication', () => 
     // #1086: Retry on ChatGPT's load-failure surface (pressed by the page's own recovery or by the
     // user) took the tab to the home page, and the app paused the chat's recovery as if closed.
     const h = await worker([]);
-    const tab = { id: 7, url: `https://chatgpt.com/c/${secondId}`, active: false };
+    const tab: Tab = { id: 7, url: `https://chatgpt.com/c/${secondId}`, active: false };
     h.tabs.push(tab);
     const sender = { tab, documentId: 'failed-document', frameId: 0, url: tab.url };
     const source = await h.authorizeDocument(sender, { navigationEpoch: 1 });
     await h.noteTabConversation(source, secondId);
     if (reported) expect(await h.loadFailure({ conversationId: secondId }, sender, source)).toEqual({ ok: true });
+    // The page reported departure while Chrome is navigating to home; its
+    // committed tab.url still names the now-left conversation.
+    tab.pendingUrl = 'https://chatgpt.com/';
     await h.closed({ conversationId: secondId }, sender, source);
     const closes = h.fetch.mock.calls.filter(([url]) => new URL(url).pathname === '/closed')
       .map(([, init]) => JSON.parse(String(init!.body)));
@@ -761,6 +896,125 @@ describe('one browser maintenance flight per desktop outbox publication', () => 
     const restarted = await worker([input], undefined, h.localSaved);
     await restarted.maintain();
     expect(restarted.create).not.toHaveBeenCalled();
+  });
+  it.each(['ready', 'preparing'])('reports a missing %s opening tab without replacing it, including after restart', async stage => {
+    const input = { id: firstId, conversationId: null };
+    const local = { inputOpenings: { [firstId]: { tab: 7, stage, conversationId: null } } };
+    const h = await worker([input], undefined, local);
+    await h.maintain();
+    const reports = h.fetch.mock.calls.filter(([url]) => new URL(url).pathname === '/input/opening-unavailable');
+    expect(reports).toHaveLength(1);
+    expect(JSON.parse(String(reports[0]![1]?.body))).toEqual({ id: firstId, tab: 7, stage });
+    expect(h.create).not.toHaveBeenCalled();
+    expect(h.sendMessage.mock.calls.some(([, message]) => message.type === 'clf-desktop-input')).toBe(false);
+    expect(h.localSaved.inputOpenings).toEqual(local.inputOpenings);
+    const restarted = await worker([input], undefined, h.localSaved);
+    await restarted.maintain();
+    expect(restarted.create).not.toHaveBeenCalled();
+    expect(restarted.fetch.mock.calls.some(([url]) => new URL(url).pathname === '/input/opening-unavailable')).toBe(true);
+  });
+  // #1950 follow-up: the app proved nothing reached the lost tab and grants a fresh one.
+  it('opens a fresh tab for a lost new chat only when the app answers reopen', async () => {
+    const input = { id: firstId, conversationId: null };
+    const h = await worker([input], undefined, { inputOpenings: { [firstId]: { tab: 7, stage: 'ready', conversationId: null } } });
+    const fetch = h.fetch.getMockImplementation()!;
+    h.fetch.mockImplementation((url, init) => new URL(url).pathname === '/input/opening-unavailable'
+      ? Promise.resolve({ ok: true, status: 200, json: async () => ({ ok: true, reopen: true }) }) : fetch(url, init));
+    await h.maintain();
+    await vi.waitFor(() => expect((h.localSaved.inputOpenings as Record<string, unknown> | undefined)?.[firstId]).toBeUndefined(), { timeout: 10_000, interval: 20 });
+    expect(h.create).not.toHaveBeenCalled();
+    await h.maintain();
+    expect(h.create).toHaveBeenCalledTimes(1);
+    expect((h.localSaved.inputOpenings as Record<string, unknown> | undefined)?.[firstId]).toMatchObject({ stage: expect.any(String) });
+  });
+
+  // CodeRabbit on #1980: an election saved under the old key must not come back after a restart.
+  it('forgets a lost opening saved under the old key too, so a restart does not report it again', async () => {
+    const input = { id: firstId, conversationId: null };
+    const h = await worker([input], undefined, { desktopInputTabs: { [firstId]: { tab: 7, stage: 'ready', conversationId: null } } });
+    expect(h.localSaved.desktopInputTabs).toBeUndefined();
+    const fetch = h.fetch.getMockImplementation()!;
+    h.fetch.mockImplementation((url, init) => new URL(url).pathname === '/input/opening-unavailable'
+      ? Promise.resolve({ ok: true, status: 200, json: async () => ({ ok: true, reopen: true }) }) : fetch(url, init));
+    await h.maintain();
+    await vi.waitFor(() => expect((h.localSaved.inputOpenings as Record<string, unknown> | undefined)?.[firstId]).toBeUndefined(), { timeout: 10_000, interval: 20 });
+    const restarted = await worker([input], undefined, h.localSaved);
+    await restarted.maintain();
+    expect(restarted.fetch.mock.calls.some(([url]) => new URL(url).pathname === '/input/opening-unavailable')).toBe(false);
+    expect(restarted.create).toHaveBeenCalledTimes(1);
+  });
+
+  it('does not hold later input opening or the next maintenance pass behind a slow missing-tab report', async () => {
+    const inputs = [{ id: firstId, conversationId: null }, { id: secondId, conversationId: null }];
+    const h = await worker(inputs, undefined, { inputOpenings: { [firstId]: { tab: 7, stage: 'ready' } } });
+    const fetch = h.fetch.getMockImplementation()!;
+    let finish!: (response: any) => void;
+    const pending = new Promise<any>(resolve => { finish = resolve; });
+    h.fetch.mockImplementation((url, init) => new URL(url).pathname === '/input/opening-unavailable'
+      ? pending : fetch(url, init));
+    try {
+      await h.maintain();
+      await vi.waitFor(() => expect(h.fetch.mock.calls.filter(([url]) =>
+        new URL(url).pathname === '/input/opening-unavailable')).toHaveLength(1));
+      // A slow bridge does not delay creation of an unrelated new chat.
+      expect(h.create).toHaveBeenCalledTimes(1);
+      await h.maintain();
+      expect(h.create).toHaveBeenCalledTimes(1);
+      expect(h.fetch.mock.calls.filter(([url]) => new URL(url).pathname === '/input/opening-unavailable')).toHaveLength(1);
+      expect(h.localSaved.inputOpenings).toMatchObject({ [firstId]: { tab: 7, stage: 'ready' } });
+    } finally { finish({ ok: true, status: 200, json: async () => ({ ok: true }) }); }
+  });
+  it('bounds concurrent missing-tab reports and retries a failed report on a later pass', async () => {
+    const ids = [firstId, secondId, 'cccccccc-dddd-4eee-8fff-111111111111',
+      'dddddddd-eeee-4fff-8aaa-222222222222', 'eeeeeeee-ffff-4111-8bbb-333333333333'];
+    const inputs = ids.map(id => ({ id, conversationId: null }));
+    const openings = Object.fromEntries(ids.map((id, i) => [id, { tab: i + 7, stage: 'ready' }]));
+    const h = await worker(inputs, undefined, { inputOpenings: openings });
+    const fetch = h.fetch.getMockImplementation()!;
+    const finishes: Array<(response: any) => void> = [];
+    h.fetch.mockImplementation((url, init) => new URL(url).pathname === '/input/opening-unavailable'
+      ? new Promise(resolve => { finishes.push(resolve); }) : fetch(url, init));
+    const reportCalls = () => h.fetch.mock.calls.filter(([url]) => new URL(url).pathname === '/input/opening-unavailable');
+    const succeed = { ok: true, status: 200, json: async () => ({ ok: true }) };
+    try {
+      await h.maintain();
+      await vi.waitFor(() => expect(reportCalls()).toHaveLength(3));
+      expect(h.create).not.toHaveBeenCalled();
+      await h.maintain();
+      expect(reportCalls()).toHaveLength(3); // Same IDs are not reported twice in flight.
+      finishes[0]!({ ok: false, status: 503, json: async () => ({ error: 'temporarily_unavailable' }) });
+      await vi.waitFor(() => expect(finishes).toHaveLength(3));
+      await h.maintain();
+      await vi.waitFor(() => expect(reportCalls()).toHaveLength(4));
+      // The rejected first ID retries on the next normal pass; neither it nor
+      // the other queued work is held by the two outstanding bridge requests.
+      const body = JSON.parse(String(reportCalls()[3]![1]?.body));
+      expect(body.id).toBe(firstId);
+      expect(h.create).not.toHaveBeenCalled();
+    } finally { for (const finish of finishes) finish(succeed); }
+  });
+  it.each(['existing-unmarked', 'alternate-marker', 'unreadable-scan', 'ambiguous-create', 'unknown-stage', 'missing-tab-value'])('retains opening custody without a missing-tab report for %s', async scenario => {
+    const input = { id: firstId, conversationId: null };
+    const h = await worker([input], undefined, { inputOpenings: { [firstId]: {
+      tab: ['ambiguous-create', 'missing-tab-value'].includes(scenario) ? null : 7,
+      stage: scenario === 'ambiguous-create' ? 'opening' : scenario === 'unknown-stage' ? 'unknown' : 'ready'
+    } } });
+    if (scenario === 'existing-unmarked') h.tabs.push({ id: 7, url: 'https://example.com/' });
+    if (scenario === 'alternate-marker') h.tabs.push({ id: 8, url: `https://chatgpt.com/?cos-input=${firstId}` });
+    if (scenario === 'unreadable-scan') {
+      const query = h.query.getMockImplementation()!;
+      let allTabScans = 0;
+      h.query.mockImplementation(async (...args: any[]) => {
+        // The first all-tab scan belongs to ordinary window layout; refuse the
+        // later absence check without failing unrelated maintenance first.
+        if (args[0] && Object.keys(args[0]).length === 0 && ++allTabScans === 2) throw new Error('tab scan unavailable');
+        return query();
+      });
+    }
+    await h.maintain();
+    expect(h.fetch.mock.calls.some(([url]) => new URL(url).pathname === '/input/opening-unavailable')).toBe(false);
+    expect(h.create).not.toHaveBeenCalled();
+    expect(h.sendMessage.mock.calls.some(([, message]) => message.type === 'clf-desktop-input')).toBe(false);
   });
   it('spends input opening authority before creation and permits a new explicit operation', async () => {
     const inputs = [{ id: firstId, conversationId: null }];

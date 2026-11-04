@@ -45,7 +45,8 @@ import {
 } from '../sandbox.js';
 import { currentWorkspace, forgetMissingWorkspace, learnWorkspace, setCurrentWorkspace } from '../workspace.js';
 import { lookupWorkerWorkspace, validateWorkerWorkspaceLease } from '../worktrees/index.js';
-import { getSessionProject } from '../projects.js';
+import { getSessionProject, sessionSecretsShieldOff } from '../projects.js';
+import { shieldToolResult } from '../secrets-shield.js';
 import { firstTaskRoot, resolveLinkedSkillAlias } from '../skill-access.js';
 import { isUserSkillVirtualPath, resolveUserSkillPath } from '../user-skills.js';
 import { ExecError } from '../exec.js';
@@ -84,7 +85,8 @@ import {
   releaseQuiescentRun,
   retiredWorkerForConversation,
   stageQueuedWorkerRevivals,
-  swarmRunning
+  swarmRunning,
+  isReviewerConversation
 } from '../agents.js';
 import type { SurfaceId } from './surfaces.js';
 import { noteServedRequest } from '../connector-identity.js';
@@ -108,6 +110,8 @@ import {
   awaitFreshCallOrigin,
   evidenceWindow,
   freshCallOrigin,
+  captureRecordingContext,
+  recordingContextCurrent,
   recordAgentMessage,
   recordProgress,
   recordToolCall
@@ -246,6 +250,8 @@ export interface ToolContext {
    * ever added to. Defaults to the live answer when the caller does not track it.
    */
   exposedFind?: boolean;
+  /** Monotone native Linux tool exposure for one MCP endpoint; execution uses the live opt-in. */
+  exposedLinuxDesktop?: boolean;
 }
 
 export type ToolContent =
@@ -448,6 +454,7 @@ function setCallerConversation(context: CallContext, conversationId: string | nu
   context.caller.conversationId = conversationId;
   const exact = conversationId ? requestCorrelation(context.caller.requestId) : null;
   context.caller.sessionId = exact?.conversationId === conversationId ? exact.sessionId : null;
+  context.caller.providerSessionAnchor = exact?.conversationId === conversationId ? exact.providerSessionAnchor : undefined;
 }
 
 /** The only SDK handler context field this layer consumes; request identity comes from ingress ALS. */
@@ -499,9 +506,37 @@ function noteTransportIdentity(transportKey: string | null): void {
 }
 
 /** Deliver bounded completed output after all other appendices have spent their text budget. */
+/**
+ * #1797: a tool's own output as ChatGPT should receive it, with credentials masked.
+ *
+ * Off only when Settings turns it off for everyone or this chat's project turns it off. The
+ * project is looked up only once something was found, so ordinary output costs one quick test.
+ * A project that cannot be read keeps the shield on. The log names what was hidden, never the value.
+ */
+async function shieldOutput(context: CallContext, name: string, result: ToolResult): Promise<ToolResult> {
+  if (getConfig().ui.secretsShield === false) return result;
+  const shielded = shieldToolResult(result);
+  if (!shielded.masked.length) return result;
+  const counts = new Map<string, number>();
+  for (const kind of shielded.masked) counts.set(kind, (counts.get(kind) ?? 0) + 1);
+  const what = [...counts].map(([kind, count]) => `${count} ${kind}${count > 1 ? 's' : ''}`).join(', ');
+  const sessionId = context.caller.sessionId;
+  const projectOff = sessionId ? await sessionSecretsShieldOff(sessionId).catch(error => {
+    logWarn(`secrets shield: could not read this chat's project (${error instanceof Error ? error.message : String(error)}); masking anyway`);
+    return false;
+  }) : false;
+  if (projectOff) {
+    logInfo(`secrets shield: off for this chat's project; the ${name} result went out with ${what} unmasked`);
+    return result;
+  }
+  logInfo(`secrets shield: hid ${what} in the ${name} result`);
+  return shielded.result;
+}
+
 async function withBackgroundExecRecovery(
   context: CallContext,
-  result: ToolResult
+  result: ToolResult,
+  name: string
 ): Promise<ToolResult> {
   const { publication, caller } = context;
   if (!publication || !caller.requestId) return result;
@@ -514,13 +549,9 @@ async function withBackgroundExecRecovery(
   // The page is the priority. Running-terminal reminders can wait for a later response.
   const text = output ?? backgroundExecRecoveryNotices(principal, publication).join('\n');
   if (!text) return result;
-  return {
-    ...result,
-    content: [
-      ...result.content,
-      { type: 'text', text: `\n--- Background command results ---\n${text}` }
-    ]
-  };
+  // A background command's output is tool output too.
+  const recovered = await shieldOutput(context, `${name} background command`, ok(`\n--- Background command results ---\n${text}`));
+  return { ...result, content: [...result.content, ...recovered.content] };
 }
 
 /**
@@ -539,9 +570,19 @@ function withUnattributedNotice(
   conversationId: string | null | undefined,
   result: ToolResult,
   requestId: string | null,
-  allowUnattributed: boolean
+  allowUnattributed: boolean,
+  provisional = false
 ): ToolResult {
   if (conversationId) return result;
+  const requestOwnershipNotice =
+    'This request id owns its workspace, update_plan, terminals and agents/subagents. Use the process and run ids returned to this request; later exact proof attaches that state to its chat. ';
+  if (provisional) return { ...result, content: [...result.content, { type: 'text', text:
+    '\n--- Recording context ---\n' +
+    'Exact caller identity is not available. The recorder may provisionally place this operation in the only observed running chat, ' +
+    'pending exact request evidence. This does not grant access to that chat’s workspace, messages, workers or terminals. ' +
+    'Continue using enabled self-contained tools with their existing permissions. Do not repeat a completed operation to repair attribution. ' +
+    requestOwnershipNotice
+  }] };
   const eta = unattributedRepairEta(Date.now(), requestId);
   const recovery = eta === null ? '' : `The next attribution recovery check is in about ${eta}s. `;
   return {
@@ -556,7 +597,7 @@ function withUnattributedNotice(
             'Unattributed does not switch on Read-only mode or disable tools. Continue using every enabled tool, ' +
             'including apply_patch, exec_command, Desktop and Plugins; their existing permissions still apply. ' +
             (requestId
-              ? 'This request id owns its workspace, update_plan, terminals and agents/subagents. Use the process and run ids returned to this request; later exact proof attaches that state to its chat. '
+              ? requestOwnershipNotice
               : 'This call has no request id, so request-owned plans and worker families cannot be created until a request id or exact chat proof is available. ') +
             'A refusal about a particular process, worker or chat target applies only to that operation, not to file edits or other tools. ' +
             'Report the actual tool result; do not claim mutation or terminal tools are unavailable because of this notice, and never replay successful work. ' +
@@ -646,6 +687,7 @@ export async function dispatch(
   // those gaps describes a machine that has not finished changing. The counter therefore
   // opens with the request and closes with it.
   const context: CallContext = {
+    recordingContext: parent?.recordingContext ?? (inboundProviderRequest() && requestId ? captureRecordingContext(Date.now()) : null),
     publication: parent?.publication ?? inboundPublication() ?? { completedAt: null, failed: false },
     startedAt: Date.now(),
     activity: summarizeRunningCall(name, args, emptyEvidence()),
@@ -1006,7 +1048,7 @@ async function dispatchTracked(
     handlerRan = true;
     return run();
   };
-  const result = await runInCallContext(context, () =>
+  let result = await runInCallContext(context, () =>
       admissionRefusal
         ? Promise.resolve(fail(admissionRefusal))
         : compacting
@@ -1059,8 +1101,6 @@ async function dispatchTracked(
         : invokeHandler()
   );
   markTiming('handler');
-  // Nested exec children are counted under their own names, like direct calls.
-  noteToolCall(name, toolOutcome(result), Date.now() - callStartedAt);
   if (identityRefusals.has(result)) rememberIdentityRefusal(requestId, name);
   // Identity, once, from this call's own evidence — see callerConversation. `agents` has
   // already established its own inside the call and adopted it, and re-reading here would
@@ -1076,7 +1116,22 @@ async function dispatchTracked(
     ? await conversationAccessRefusal(context.caller.conversationId)
     : isChatBlocked(context.caller.conversationId) ? BLOCKED_CHAT_REFUSAL : null) ??
     workerConnectionProfileRefusal(context.caller);
-  const deliveryFenced = Boolean(conversationPolicyRefusal) || compacting || supersededConversation || Boolean(silentCeilingWorker) ||
+  const currentProviderProof = context.caller.providerSessionAnchor ? requestCorrelation(requestId) : null;
+  const providerIdentityChanged = !!context.caller.providerSessionAnchor &&
+    (!currentProviderProof || currentProviderProof.conversationId !== context.caller.conversationId || currentProviderProof.sessionId !== context.caller.sessionId);
+  if (providerIdentityChanged) {
+    logWarn(`provider session delivery refused for request ${requestId}; caller proof changed while the operation ran`);
+    result = failIdentity('CALLER_IDENTITY_CHANGED: caller proof changed while this operation ran. Its result was withheld. ' +
+      'The operation may already have completed; do not repeat it to repair attribution.');
+    context.outcome = 'tool_internal_error';
+    context.evidence = emptyEvidence();
+    context.caller = { ...context.caller, conversationId: null, sessionId: null, runId: undefined };
+    context.agent = null;
+    rememberIdentityRefusal(requestId, name);
+  }
+  // Nested exec children are counted under their own names, like direct calls.
+  noteToolCall(name, toolOutcome(result), Date.now() - callStartedAt);
+  const deliveryFenced = providerIdentityChanged || Boolean(conversationPolicyRefusal) || compacting || supersededConversation || Boolean(silentCeilingWorker) ||
     Boolean(deliveryPolicyRefusal) ||
     compactingConversation(context.caller.conversationId) !== null || Boolean(context.caller.conversationId &&
       (await conversationAttachment(context.caller.conversationId, context.caller.sessionId ?? null)) === 'superseded');
@@ -1121,7 +1176,10 @@ async function dispatchTracked(
   // subtly earlier internal value that omits the worker report most likely to matter later.
   // The Plugins handler owns validation/redaction of external results. A dispatcher refusal
   // never visited that owner and therefore needs its own single redaction pass.
-  const baseResult = surface === 'plugins' && !handlerRan ? pluginManager.redactResult(result) as ToolResult : result;
+  // #1797: the tool's own output is masked once, on the outer call, before anything the app adds
+  // (inbox, notices, the user's own new messages) — those are not tool output.
+  const ownResult = surface === 'plugins' && !handlerRan ? pluginManager.redactResult(result) as ToolResult : result;
+  const baseResult = nested ? ownResult : await shieldOutput(context, name, ownResult);
   // A tool that reads nothing belonging to a chat (usage) answers before the page's evidence
   // for its request arrives; the attribution notice would only add noise to every such answer.
   const identityFree = IDENTITY_FREE_TOOLS.has(name);
@@ -1129,7 +1187,8 @@ async function dispatchTracked(
     context.caller.conversationId,
     deliveryFenced ? baseResult : withInbox(context.caller, context.agent, baseResult, isFinish),
     context.caller.requestId,
-    context.allowUnattributed === true
+    context.allowUnattributed === true,
+    recordingContextCurrent(context.recordingContext)
   );
   if (!nested && recoveredWorkerRole && !deliveryFenced) delivered = {
     ...delivered,
@@ -1153,7 +1212,7 @@ async function dispatchTracked(
     delivered = { ...delivered, content: [...delivered.content, ...attachments] };
   }
   if (!nested && handlerRan && !deliveryFenced) {
-    delivered = await withBackgroundExecRecovery(context, delivered);
+    delivered = await withBackgroundExecRecovery(context, delivered, name);
   }
   if (!nested) delivered = await withIdentityRecoveredNotice(context, delivered);
   if (surface === 'plugins' && delivered.content.length > baseResult.content.length) {
@@ -1184,6 +1243,7 @@ async function dispatchTracked(
   // while ChatGPT still sees the call running; the answer waits for it below, bounded.
   const closeHold = !nested && context.caller.conversationId ? openCallHold(context.caller.conversationId) : null;
   const recording = recordToolCall({
+    recordingContext: context.recordingContext,
     nested,
     tool: name,
     args: surface === 'plugins' ? pluginManager.redact(args) : args,
@@ -1199,6 +1259,7 @@ async function dispatchTracked(
     requestId: context.caller.requestId,
     conversationId: context.caller.conversationId,
     sessionId: context.caller.sessionId ?? null,
+    ...(context.caller.providerSessionAnchor ? { providerSessionAnchor: context.caller.providerSessionAnchor } : {}),
     endsActivity: isFinish && !result.isError
   });
   // Exact request-id identity needs no browser wait, so make its durable session append part
@@ -1525,8 +1586,10 @@ export function createRegistrar(server: McpServer | null, ctx: ToolContext, surf
         return entry ? entry.run(args) : fail('UNKNOWN_TOOL: this tool is not available on this connector.');
       }, parent);
     },
-    register(name, config, handler) {
+    register(name, config, unchecked) {
       names.push(name);
+      const readOnly = config.annotations?.readOnlyHint === true;
+      const handler: typeof unchecked = async args => reviewerRefusal(name, readOnly, args) ?? unchecked(args);
       handlers.set(name, { description: config.description, run: async args => {
         const parsed = await config.inputSchema.safeParseAsync(args);
         if (parsed.success) return handler(parsed.data);
@@ -1578,6 +1641,28 @@ export function createRegistrar(server: McpServer | null, ctx: ToolContext, surf
       );
     }
   };
+}
+
+/** What the Goal step reviewer may run besides read-only tools: commands, to read diffs and run tests. */
+const REVIEWER_TOOLS = new Set(['exec_command', 'write_stdin']);
+/** The agents actions a reviewer keeps: seeing its run and finishing with its report, never starting or waking a worker. */
+const REVIEWER_AGENT_ACTIONS = new Set(['status', 'finish']);
+
+/**
+ * The Goal step reviewer reviews; it does not author (#1832, Haz's review on #1879). In its own
+ * chat, a tool not marked read-only is refused before it runs, and so is every agents action but
+ * status and finish, so it can't have another worker write the Goal's files. Commands stay: it
+ * reads diffs and runs tests with them. They are not read-only, and the Settings row and AGENTS.md
+ * say so rather than promising it. A call whose chat is not known is not a reviewer's.
+ */
+export function reviewerRefusal(name: string, readOnly: boolean, args?: unknown): ToolResult | null {
+  if (readOnly || REVIEWER_TOOLS.has(name) || !isReviewerConversation(currentCall()?.caller.conversationId)) return null;
+  const action = name === 'agents' && args && typeof args === 'object' ? (args as { action?: unknown }).action : undefined;
+  if (name === 'agents' && typeof action === 'string' && REVIEWER_AGENT_ACTIONS.has(action)) return null;
+  const what = name === 'agents' ? `agents${typeof action === 'string' ? ` action=${action}` : ''}` : name;
+  logInfo(`goal review: ${what} refused in the reviewer's chat, which reviews and does not change files or start workers`);
+  return fail(`TOOL_DISABLED: ${what} is not available to the Goal step reviewer: it reviews the step and may run commands such as tests, ` +
+    'but it does not change files or start or message workers. Report what should change instead; the Goal chat makes the changes.');
 }
 
 // ------------------------------------------------------------------ formatters

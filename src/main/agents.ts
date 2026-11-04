@@ -58,6 +58,13 @@ const MAX_INBOX_OFFER_CHARS = 32_000;
 export const MAX_BATCH_MESSAGES = 16;
 const MAX_TASK_CHARS = 4000;
 /**
+ * A Goal step reviewer's brief or next-step message (#1832), at most. It carries the step's net
+ * diffs, so it is written by the app and never by a model, and it is far from a ChatGPT message's own limit.
+ */
+export const REVIEW_TEXT_CHARS = 26_000;
+/** How long a working reviewer holds its Goal chat's next step, at most. A maximum, not a delay. */
+export const REVIEW_MAX_MS = 10 * 60_000;
+/**
  * A sleeping worker may satisfy an exact repeated spawn only while the original spawn result
  * could realistically still be the result being retried. Beyond this window the same task is
  * new intent: history is persistent now, so lifetime sleeper matching would make it impossible
@@ -120,12 +127,58 @@ export class AgentError extends Error {}
 
 /** Raised at every `agents` action reached from a conversation outside the active run. */
 export class AgentsBusyError extends AgentError {
-  constructor() {
+  constructor(message?: string) {
     super(
-      'AGENTS_BUSY: no agent family belongs to this conversation. Other primes and their workers are isolated. ' +
+      message ?? 'AGENTS_BUSY: no agent family belongs to this conversation. Other primes and their workers are isolated. ' +
         'Call agents action=spawn to create workers owned by this chat.'
     );
   }
+}
+
+/**
+ * AGENTS_BUSY for a caller known only by this call's request id (#1841). A run started without a
+ * chat belongs to the one request that started it, and a client such as Codex sends every tool
+ * call as a new request: advice to spawn again would only start more workers nobody can reach.
+ */
+export class NoChatError extends AgentsBusyError {
+  constructor() {
+    super(
+      'AGENTS_NO_CHAT: this call came without a ChatGPT chat the app could identify, only as a request of its own ' +
+        '(a client such as Codex sends every tool call as a new request). A sub-agent run belongs to the chat, or the ' +
+        'single request, that started it, so this call cannot reach a run started by another call. Do not call agents ' +
+        'action=spawn again: a new run would be just as unreachable. Sub-agents work from a ChatGPT chat in the browser; ' +
+        'if this is one, the app may identify it in a moment.'
+    );
+  }
+}
+
+/** Whether the caller is known only by this call's request id: no chat, no local owner. */
+function requestOnlyCaller(caller: Caller): boolean {
+  return !caller.conversationId && !caller.localOwnerId && Boolean(caller.requestId);
+}
+
+/**
+ * What a new prime is told about who can reach its run. A run started without a chat answers only
+ * to the request that started it (#1841), so the model is told not to wait for results that a
+ * later, separate request could never collect.
+ */
+export function primeOwnerSentence(caller: Caller, runId: string): string {
+  const exact = exactCaller(caller);
+  if (exact.conversationId) return `This conversation is now the prime agent of run ${runId}. `;
+  if (!requestOnlyCaller(exact)) return `This request is now the prime agent of run ${runId}. `;
+  return `This request is now the prime agent of run ${runId}. It came without a ChatGPT chat the app could identify, ` +
+    'so only later tool calls of this same request can reach the run. A call that arrives as a new request (a client ' +
+    'such as Codex sends every tool call as one) cannot reach it, and its results will not arrive there. ';
+}
+
+/** Whether a caller is known only by its own request id: no chat the app could identify, no local owner. */
+export function isRequestOnlyCaller(caller: Caller): boolean {
+  return requestOnlyCaller(exactCaller(caller));
+}
+
+/** The refusal for a caller outside every family it named or could own. */
+function busyFor(caller: Caller): AgentsBusyError {
+  return requestOnlyCaller(exactCaller(caller)) ? new NoChatError() : new AgentsBusyError();
 }
 
 /**
@@ -850,7 +903,7 @@ function selectedFamily(input: Caller, includeUnpublished = false): Family | nul
 function requireFamilySelection(caller: Caller): void {
   requireMatchingSetupProfile(caller);
   const owned = familiesForCaller(caller, true);
-  if (caller.runId && !owned.some(owner => answersTo(owner, caller.runId!))) throw new AgentsBusyError();
+  if (caller.runId && !owned.some(owner => answersTo(owner, caller.runId!))) throw busyFor(caller);
   if (!caller.runId && owned.length > 1) {
     throw new AgentError('RUN_SELECTION_REQUIRED: this caller owns several worker fleets. Use agents action=status and select the intended run_id; worker names are local to each fleet. No agent operation was performed.');
   }
@@ -1271,7 +1324,7 @@ export function statusForCaller(caller: Caller): CallerSwarmStatus {
   requireEnabled();
   if (!hasCallerIdentity(caller)) throw new IdentityLostError();
   requireMatchingSetupProfile(caller);
-  if (caller.runId && !selectedFamily(caller)) throw new AgentsBusyError();
+  if (caller.runId && !selectedFamily(caller)) throw busyFor(caller);
   if (run) {
     const member = resolve(caller);
     if (member) {
@@ -1361,7 +1414,8 @@ function requireMember(caller: Caller): Agent {
   const run = runForCaller(caller);
   requireEnabled();
   if (!hasCallerIdentity(caller)) throw new IdentityLostError();
-  if (!run && runs.size > 0) throw new AgentsBusyError();
+  if (!run && runs.size > 0) throw busyFor(caller);
+  if (!run && requestOnlyCaller(caller)) throw new NoChatError();
   if (!run) {
     throw new AgentError(
       `No sub-agent run is active in ${liveConnectorName('core')}. ` +
@@ -1369,7 +1423,7 @@ function requireMember(caller: Caller): Agent {
     );
   }
   const agent = resolve(caller);
-  if (!agent) throw new AgentsBusyError();
+  if (!agent) throw busyFor(caller);
   return agent;
 }
 
@@ -1383,7 +1437,8 @@ export function identify(caller: Caller): AgentInfo {
   const dormant = dormantRunForCaller(caller);
   const prime = dormant?.agents.get(PRIME_ID);
   if (prime) return { ...prime.info };
-  if (runs.size > 0) throw new AgentsBusyError();
+  if (runs.size > 0) throw busyFor(caller);
+  if (requestOnlyCaller(caller)) throw new NoChatError();
   throw new AgentError(
     'No sub-agent run or worker history belongs to this conversation. Call agents action=spawn to start one.'
   );
@@ -1520,10 +1575,6 @@ function globalFreeWorkerSlots(): number {
  * resolves no run and is never busy: unknown ownership must not be able to block a chat
  * that has no workers to wait for.
  */
-function familyWorkersBusy(conversationId: string | null | undefined): boolean {
-  return workingWorkers(runForConversation(conversationId)).length > 0;
-}
-
 /**
  * Whether this chat's automatic next step is deliberately waiting for its own workers.
  *
@@ -1538,7 +1589,37 @@ function familyWorkersBusy(conversationId: string | null | undefined): boolean {
  * the user through the same `goalWaitFor` reason.
  */
 export function waitingForSubAgents(conversationId: string | null | undefined): boolean {
-  return getConfig().multiAgent.waitForSubAgents === true && familyWorkersBusy(conversationId);
+  const working = workingWorkers(runForConversation(conversationId));
+  // The Goal step reviewer (#1832) holds by itself, whatever the setting, but only within its own limit.
+  if (working.some(agent => reviewerHolding(agent))) return true;
+  return getConfig().multiAgent.waitForSubAgents === true && working.some(agent => agent.info.reviewer !== true);
+}
+
+/** Until when this chat's working Goal step reviewer holds its next step (#1832), or null when none does. */
+export function reviewerHoldUntil(conversationId: string | null | undefined, now = Date.now()): number | null {
+  const holding = workingWorkers(runForConversation(conversationId)).filter(agent => reviewerHolding(agent, now));
+  return holding.length ? Math.max(...holding.map(agent => agent.info.reviewAskedAt! + REVIEW_MAX_MS)) : null;
+}
+
+function reviewerHolding(agent: Agent, now = Date.now()): boolean {
+  return agent.info.reviewer === true && typeof agent.info.reviewAskedAt === 'number' && now - agent.info.reviewAskedAt < REVIEW_MAX_MS;
+}
+
+/** Whether this conversation is a Goal step reviewer's own chat, in any family, live or parked (#1832). */
+export function isReviewerConversation(conversationId: string | null | undefined): boolean {
+  if (!conversationId) return false;
+  return allFamilies().some(owner => [...owner.agents.values()].some(member =>
+    member.info.reviewer === true && member.info.conversationId === conversationId));
+}
+
+/** This Goal chat's step reviewer, live or parked; the newest when there were several (#1832). */
+export function reviewerFor(conversationId: string | null | undefined): AgentInfo | null {
+  if (!conversationId) return null;
+  const found = allFamilies().filter(owner => owner.primeConversationId === conversationId)
+    .flatMap(owner => [...owner.agents.values()].filter(member => member.info.reviewer === true && !unpublishedAgents.has(member)))
+    .sort((a, b) => b.info.createdAt - a.info.createdAt);
+  const usable = found.find(member => member.info.state !== 'finished' && member.info.state !== 'failed') ?? found[0];
+  return usable ? { ...usable.info } : null;
 }
 
 function recount(agent: Agent): void {
@@ -1688,7 +1769,8 @@ export function hasRetiredWorkerLeases(): boolean {
 // -------------------------------------------------------------------- spawn
 
 export interface SpawnInput {
-  workers: ReadonlyArray<{ label?: string; task: string; model?: string | null; reasoning_effort?: string | null }>;
+  /** `reviewer` only from the app's Goal step reviewer (#1832); the agents tool cannot set it. */
+  workers: ReadonlyArray<{ label?: string; task: string; model?: string | null; reasoning_effort?: string | null; reviewer?: boolean }>;
   /**
    * What every worker in this spawn needs to know, written once.
    *
@@ -2093,8 +2175,8 @@ export function spawn(input: SpawnInput, options: SpawnOptions = {}): SpawnResul
   const planned = input.workers.map((worker, index) => {
     const task = worker.task.trim();
     if (!task) throw new AgentError(`Worker ${index + 1} has no task. Every worker needs one.`);
-    if (task.length > MAX_TASK_CHARS) throw new AgentError(`Worker ${index + 1}'s task is too long`);
-    const label = worker.label?.trim() ?? '';
+    if (task.length > (worker.reviewer ? REVIEW_TEXT_CHARS : MAX_TASK_CHARS)) throw new AgentError(`Worker ${index + 1}'s task is too long`);
+    const label = worker.label?.trim() || (worker.reviewer ? 'Reviewer' : '');
     if (label.length > MAX_LABEL_CHARS) {
       throw new AgentError(`Worker ${index + 1}'s label is too long (limit ${MAX_LABEL_CHARS} characters)`);
     }
@@ -2108,7 +2190,7 @@ export function spawn(input: SpawnInput, options: SpawnOptions = {}): SpawnResul
     // the browser types, the repeated-spawn match, the status table, the snapshot — then
     // sees the same single string a worker actually receives, with no second field to keep
     // in step and no way for the two halves to be delivered apart.
-    return { label, task: briefFor(context, task), model, reasoningEffort };
+    return { label, task: briefFor(context, task), model, reasoningEffort, reviewer: worker.reviewer === true };
   });
 
   const conversationId = input.caller.conversationId ?? null;
@@ -2129,7 +2211,7 @@ export function spawn(input: SpawnInput, options: SpawnOptions = {}): SpawnResul
           'agent a message instead and let it decide.'
       );
     }
-    if (!ownsPrime(input.caller, run)) throw new AgentsBusyError();
+    if (!ownsPrime(input.caller, run)) throw busyFor(input.caller);
     if (run.transfer) throw new AgentError("PRIME_TRANSFER_IN_PROGRESS: this prime is being compacted/resumed.");
   }
 
@@ -2137,7 +2219,7 @@ export function spawn(input: SpawnInput, options: SpawnOptions = {}): SpawnResul
       retiredManagedWorkerConversations.has(conversationId))) {
     throw new AgentError('WORKTREE_OWNER_UNAVAILABLE: retired worker conversations cannot create new prime runs or workers.');
   }
-  if (input.caller.runId && !run && !dormantRunForCaller(input.caller)) throw new AgentsBusyError();
+  if (input.caller.runId && !run && !dormantRunForCaller(input.caller)) throw busyFor(input.caller);
   const becamePrime = run === null;
   let resumedDormant: DormantRun | null = null;
   let createdFreshRun = false;
@@ -2233,6 +2315,7 @@ export function spawn(input: SpawnInput, options: SpawnOptions = {}): SpawnResul
     const id = ids[index] as string;
     const agent = makeWorker(id, worker.label || id, worker.task, worker.model, worker.reasoningEffort);
     agent.info.workerAllocationRunId = activeRun.runId;
+    if (worker.reviewer) { agent.info.reviewer = true; agent.info.reviewAskedAt = Date.now(); }
     activeRun.agents.set(id, agent);
     stampOwner(activeRun);
     // A worker starts in the folder the prime was working in, so its first call can use the
@@ -2546,7 +2629,9 @@ export function stagePrimeMessage(
  */
 export function stageMessages(
   caller: Caller,
-  items: ReadonlyArray<{ to: string; text: string; label?: string }>
+  items: ReadonlyArray<{ to: string; text: string; label?: string }>,
+  /** `review`: the app's next-step brief to its Goal step reviewer (#1832), which may be long. */
+  options: { review?: boolean } = {}
 ): StagedAgentMessages {
   caller = exactCaller(caller);
   requireFamilySelection(caller);
@@ -2569,7 +2654,7 @@ export function stageMessages(
     }
   }
   try {
-    return stageMessagesActive(caller, items, resumedDormant);
+    return stageMessagesActive(caller, items, resumedDormant, options.review === true);
   } catch (error) {
     if (resumedDormant) parkRun(run, 'a dormant-owner message was rejected before any worker was woken');
     throw error;
@@ -2579,7 +2664,8 @@ export function stageMessages(
 function stageMessagesActive(
   caller: Caller,
   items: ReadonlyArray<{ to: string; text: string; label?: string }>,
-  resumedDormant: boolean
+  resumedDormant: boolean,
+  review = false
 ): StagedAgentMessages {
   const run = runForCaller(caller);
   const from = requireMember(caller);
@@ -2607,11 +2693,12 @@ function stageMessagesActive(
     const where = items.length > 1 ? ` (message ${index + 1} of ${items.length})` : '';
     const trimmed = item.text?.trim() ?? '';
     if (!trimmed) throw new AgentError(`The message is empty${where}`);
-    if (trimmed.length > MAX_MESSAGE_CHARS) {
-      throw new AgentError(`Message is too long (limit ${MAX_MESSAGE_CHARS} characters)${where}`);
-    }
     const toId = item.to?.trim() ?? '';
     const to = toId ? run?.agents.get(toId) : undefined;
+    const limit = review && to?.info.reviewer === true ? REVIEW_TEXT_CHARS : MAX_MESSAGE_CHARS;
+    if (trimmed.length > limit) {
+      throw new AgentError(`Message is too long (limit ${limit} characters)${where}`);
+    }
     if (!to) {
       throw new AgentError(`Unknown agent "${toId}"${where}. Call agents action=status to see who exists.`);
     }
@@ -2714,6 +2801,8 @@ function stageMessagesActive(
       settled = true;
       if (!run || !runProjectionStillOwned(run)) return;
       for (const { message } of planned) unpublishedMessages.delete(message);
+      // The app's next-step brief starts the reviewer's own limit again (#1832).
+      if (review) for (const { to } of planned) if (to.info.reviewer === true) to.info.reviewAskedAt = Date.now();
       for (const recipient of recipients) recount(recipient);
       // No new durable fact: the exact queue entries were already in the snapshot that crossed
       // the acceptance barrier. This only publishes them to live inbox readers and the UI.
@@ -3018,7 +3107,8 @@ function finishTarget(caller: Caller): Agent {
   // A dormant worker may only be here as a retry of a finish that already stopped it. Never
   // treat an unexpected dormant worker call as authority to resume or mutate its history.
   if (dormant?.info.role === 'worker' && hasStopped(dormant.info.state)) return dormant;
-  if (runs.size > 0) throw new AgentsBusyError();
+  if (runs.size > 0) throw busyFor(caller);
+  if (!dormant && requestOnlyCaller(caller)) throw new NoChatError();
   if (!dormant) throw new AgentError('No sub-agent run or worker history belongs to this conversation.');
   if (dormant.info.role !== 'worker') {
     throw new AgentError(

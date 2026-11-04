@@ -5,10 +5,11 @@
  *   - HTTP `x-request-id` on the MCP request (normalised at ingress), and
  *   - `message.metadata.request_id` on the connector request in the page model.
  *
- * Nothing else is ownership evidence. In particular, tool names, timestamps, rendered
- * connector rows, the active tab and "the only chat generating" never enter this registry.
+ * The host's documented openai/session metadata can extend one native proof to later
+ * requests, scoped by Setup, connector surface and subject. Its keys are learned only
+ * from native proof; tool names, timestamps, active tabs and generation guesses never bind them.
  *
- * Once that exact join has been proved it is permanent. `request_id` names one ChatGPT
+ * Once a native join has been proved it is permanent. `request_id` names one ChatGPT
  * workflow, and the MCP side may keep issuing calls after the page that originally exposed the
  * id has been reloaded, compacted or closed. Expiring the join after ten minutes was the live
  * 1.8.1 bug: the same still-running request went from correctly attributed to Unattributed
@@ -25,7 +26,7 @@
  */
 
 import { readDurable, writeDurableNow, writeDurableSnapshotSoon } from '../durable.js';
-import { logWarn } from '../logger.js';
+import { logInfo, logWarn } from '../logger.js';
 import { indexedSessions, readRecentEvents } from './store.js';
 import { attachRequestPlan, reconcileRequestPlans } from './request-plans.js';
 import { reconcileAgentRequestOwners } from '../agents.js';
@@ -38,22 +39,35 @@ export interface RequestCorrelation {
   messageId: string;
   tool: string;
   observedAt: number;
+  /** Hashes of host conversation metadata learned only from this native page proof. */
+  providerSessionKeys?: string[];
+  /** A provider-session proof retains the actual native request that established it. */
+  providerSessionAnchor?: string;
+  providerSessionKey?: string;
 }
 
 const MAX_CORRELATIONS = 50_000;
 const CORRELATIONS_STATE = 'request-correlations';
 /**
  * 5 stores owners and nothing else; 6 also records that browser acknowledgements wait for
- * the snapshot, allowing startup to trust it without replaying canonical history.
+ * the snapshot, allowing startup to trust it without replaying canonical history. Version 7
+ * retains hashed provider-session bindings and the native anchor of derived request owners.
  *
  * Versions 3 and 4 wrapped each row in a sticky `conflicted` flag, so a row could exist purely
  * to record that its id was unusable. Those rows say nothing this registry can act on any more:
  * read the owner out of the wrapper when one is there, and let a forgotten id be proved again
  * by exact evidence or by the recorded history reconciled below.
  */
-const CORRELATIONS_STATE_VERSION = 6;
+const CORRELATIONS_STATE_VERSION = 7;
 
 const byRequest = new Map<string, RequestCorrelation>();
+// Derived indexes, never independent ownership: every binding points to a native proof.
+const byProviderSession = new Map<string, string | null>();
+const pendingProviderSessions = new Map<string, { requestId: string; keys: Set<string> }>();
+const uncommittedProviderRequests = new Set<string>();
+const MAX_PENDING_PROVIDER_REQUESTS = 2_000;
+const MAX_PROVIDER_KEYS_PER_REQUEST = 16;
+const PROVIDER_KEY = /^[a-f0-9]{64}$/;
 const waiters = new Map<string, Set<() => void>>();
 // `ownership.ts` subscribes while the existing correlation -> agents -> kernel -> ownership
 // module cycle is still being instantiated. A top-level `const` is in its TDZ at that moment.
@@ -72,6 +86,7 @@ const evidenceWindowStarts = new Map<string, number>();
 const MAX_EVIDENCE_WINDOWS = 2_000;
 let restored = false;
 let restoring: Promise<void> | null = null;
+let providerAdmission: Promise<unknown> = Promise.resolve();
 
 interface PersistedCorrelations {
   version: number;
@@ -80,10 +95,23 @@ interface PersistedCorrelations {
   entries: RequestCorrelation[];
 }
 
-function wake(requestId: string): void {
-  const held = waiters.get(requestId);
+const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+/**
+ * The key a request id is joined on. ChatGPT sometimes sends a tool call's request id with another
+ * UUID version digit than the page's message holds (live, #1752: the page had 93ff44d2-cfea-4f32-…,
+ * the calls came as 93ff44d2-cfea-9f32-…), and every such call went unattributed. The other 31 hex
+ * digits are random, so they still name exactly one request. Any other id is joined as written.
+ */
+function joinKey(requestId: string): string {
+  // Prefixed apart, so an exact-match id can never share a key with a UUID spelled like it.
+  return UUID.test(requestId) ? `uuid:${requestId.slice(0, 14)}${requestId.slice(15)}`.toLowerCase() : `id:${requestId}`;
+}
+
+/** Wakes the waiters of one key (see joinKey). */
+function wake(key: string): void {
+  const held = waiters.get(key);
   if (!held) return;
-  waiters.delete(requestId);
+  waiters.delete(key);
   for (const resolve of held) resolve();
 }
 
@@ -91,7 +119,11 @@ function trim(): void {
   while (byRequest.size > MAX_CORRELATIONS) {
     const first = byRequest.keys().next().value as string | undefined;
     if (!first) break;
+    const evicted = byRequest.get(first);
     byRequest.delete(first);
+    for (const providerKey of evicted?.providerSessionKeys ?? []) {
+      if (byProviderSession.get(providerKey) === first) byProviderSession.delete(providerKey);
+    }
     wake(first);
   }
 }
@@ -100,7 +132,8 @@ function snapshot(): PersistedCorrelations {
   return {
     version: CORRELATIONS_STATE_VERSION,
     complete: true,
-    entries: [...byRequest.values()].map((owner) => ({ ...owner }))
+    entries: [...byRequest.values()].map((owner) => ({ ...owner,
+      ...(owner.providerSessionKeys ? { providerSessionKeys: [...owner.providerSessionKeys] } : {}) }))
   };
 }
 
@@ -156,6 +189,11 @@ function validCorrelation(value: unknown): value is RequestCorrelation {
     typeof item.messageId === 'string' && item.messageId.length > 0 && item.messageId.length <= 300 &&
     typeof item.tool === 'string' && item.tool.length <= 100 &&
     typeof item.observedAt === 'number' && Number.isFinite(item.observedAt)
+    && (item.providerSessionKeys === undefined || Array.isArray(item.providerSessionKeys) &&
+      item.providerSessionKeys.length <= MAX_PROVIDER_KEYS_PER_REQUEST && item.providerSessionKeys.every(key => typeof key === 'string' && PROVIDER_KEY.test(key)))
+    && (item.providerSessionAnchor === undefined && item.providerSessionKey === undefined ||
+      typeof item.providerSessionAnchor === 'string' && item.providerSessionAnchor.length > 0 && item.providerSessionAnchor.length <= 200 &&
+      typeof item.providerSessionKey === 'string' && PROVIDER_KEY.test(item.providerSessionKey) && item.providerSessionKeys === undefined)
   );
 }
 
@@ -168,7 +206,19 @@ function validCorrelation(value: unknown): value is RequestCorrelation {
  */
 function storedOwner(raw: unknown): RequestCorrelation | null {
   if (!raw || typeof raw !== 'object') return null;
-  const value = 'value' in (raw as Record<string, unknown>) ? (raw as { value: unknown }).value : raw;
+  let value = 'value' in (raw as Record<string, unknown>) ? (raw as { value: unknown }).value : raw;
+  if (value && typeof value === 'object') {
+    const candidate = { ...value } as Partial<RequestCorrelation>;
+    // Damaged auxiliary bindings must not discard independently valid native ownership.
+    // A damaged derivation, in contrast, must never be reinterpreted as native proof.
+    if (candidate.providerSessionAnchor === undefined && candidate.providerSessionKey === undefined &&
+      candidate.providerSessionKeys !== undefined && (!Array.isArray(candidate.providerSessionKeys) ||
+        candidate.providerSessionKeys.length > MAX_PROVIDER_KEYS_PER_REQUEST ||
+        !candidate.providerSessionKeys.every(key => typeof key === 'string' && PROVIDER_KEY.test(key)))) {
+      delete candidate.providerSessionKeys;
+    }
+    value = candidate;
+  }
   return validCorrelation(value) ? { ...value } : null;
 }
 
@@ -185,12 +235,22 @@ function storedOwner(raw: unknown): RequestCorrelation | null {
  * request into the newer epoch.
  */
 function merge(input: RequestCorrelation): 'stored' | 'same' | 'refused' {
-  const previous = byRequest.get(input.requestId);
+  const key = joinKey(input.requestId);
+  const previous = byRequest.get(key);
+  // Native request evidence supersedes a provider-session derivation. Preserve its key
+  // as an independently observed binding so a contradictory owner disables that alias.
+  if (previous?.providerSessionAnchor && !input.providerSessionAnchor) {
+    byRequest.set(key, { ...input, providerSessionKeys:
+      [...new Set([...(input.providerSessionKeys ?? []), previous.providerSessionKey!])].slice(0, MAX_PROVIDER_KEYS_PER_REQUEST) });
+    evidenceWindowStarts.delete(key);
+    wake(key);
+    return 'stored';
+  }
   if (!previous) {
-    byRequest.set(input.requestId, { ...input });
-    evidenceWindowStarts.delete(input.requestId);
+    byRequest.set(key, { ...input });
+    evidenceWindowStarts.delete(key);
     trim();
-    wake(input.requestId);
+    if (!uncommittedProviderRequests.has(key) || !input.providerSessionAnchor) wake(key);
     return 'stored';
   }
 
@@ -203,8 +263,8 @@ function merge(input: RequestCorrelation): 'stored' | 'same' | 'refused' {
     // trim() uses insertion order as the bounded registry's freshness order. Updating the
     // timestamp without moving this key left a live, repeatedly observed old request at the
     // eviction head, so enough newer ids could discard it while genuinely stale ids stayed.
-    byRequest.delete(input.requestId);
-    byRequest.set(input.requestId, previous);
+    byRequest.delete(key);
+    byRequest.set(key, previous);
   }
   return 'same';
 }
@@ -236,7 +296,7 @@ async function restoreRequestCorrelationsOnce(): Promise<void> {
 
   const saved = await readDurable<PersistedCorrelations>(CORRELATIONS_STATE);
   let loaded = false;
-  const complete = saved?.version === CORRELATIONS_STATE_VERSION && saved.complete === true &&
+  const complete = (saved?.version === 6 || saved?.version === CORRELATIONS_STATE_VERSION) && saved.complete === true &&
     Array.isArray(saved.entries) && saved.entries.every((raw) => storedOwner(raw) !== null);
   if (saved && saved.version >= 3 && saved.version <= CORRELATIONS_STATE_VERSION && Array.isArray(saved.entries)) {
     for (const raw of saved.entries.slice(-MAX_CORRELATIONS)) {
@@ -246,6 +306,7 @@ async function restoreRequestCorrelationsOnce(): Promise<void> {
       loaded = true;
     }
     trim();
+    for (const owner of byRequest.values()) if (!owner.providerSessionAnchor) indexProviderOwner(owner);
   }
 
   // Version 6 is committed before the browser receives correlation confirmation. It is the
@@ -283,7 +344,7 @@ async function restoreRequestCorrelationsOnce(): Promise<void> {
     })) {
       if (event.kind !== 'tool_call') continue;
       const call = event.call;
-      if (call.attributionMethod !== 'request_id' || !call.requestId || !call.conversationId) continue;
+      if (call.attributionMethod !== 'request_id' || call.providerSessionAnchor || !call.requestId || !call.conversationId) continue;
       merge({
         requestId: call.requestId,
         conversationId: call.conversationId,
@@ -337,8 +398,13 @@ export function observeRequestCorrelations(
 ): Array<'stored' | 'same' | 'refused'> {
   let changed = false;
   const results = inputs.map((input) => {
-    const previousObservedAt = byRequest.get(input.requestId)?.observedAt;
+    const previousObservedAt = byRequest.get(joinKey(input.requestId))?.observedAt;
     const result = merge(input);
+    const owner = byRequest.get(joinKey(input.requestId));
+    if (result !== 'refused' && owner && !owner.providerSessionAnchor) {
+      if (learnProviderKeys(owner)) changed = true;
+      indexProviderOwner(owner);
+    }
     // A same-owner observation can still advance durable freshness/order. Persist that too so
     // an app restart cannot resurrect the pre-refresh eviction order. A refusal changes nothing
     // and therefore writes nothing.
@@ -354,12 +420,13 @@ export function observeRequestCorrelations(
     const requestId = inputs[index]!.requestId;
     if (attaching.has(requestId)) continue;
     attaching.add(requestId);
-    const owner = byRequest.get(requestId);
+    const owner = byRequest.get(joinKey(requestId));
     if (!owner) continue;
     if (results[index] === 'stored') publishCorrelation(owner);
     void attachRequestPlan(owner).catch(error => {
       logWarn(`request plan attachment failed for ${requestId}: ${error instanceof Error ? error.message : String(error)}`);
     });
+    if (!owner.providerSessionAnchor) for (const providerKey of owner.providerSessionKeys ?? []) publishProviderRequests(providerKey);
   }
   if (attaching.size) void reconcileAgentRequestOwners().catch(error => {
     logWarn(`request worker ownership reconciliation failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -370,9 +437,131 @@ export function observeRequestCorrelations(
 /** Exact request-id lookup. An id no page has proved yet resolves to null. */
 export function requestCorrelation(requestId: string | null | undefined): RequestCorrelation | null {
   if (!requestId) return null;
-  const held = byRequest.get(requestId);
-  return held ? { ...held } : null;
+  const held = byRequest.get(joinKey(requestId));
+  if (held?.providerSessionAnchor) {
+    if (uncommittedProviderRequests.has(joinKey(requestId))) return null;
+    const anchor = byRequest.get(joinKey(held.providerSessionAnchor));
+    const indexed = byProviderSession.get(held.providerSessionKey!);
+    const owner = indexed ? byRequest.get(indexed) : null;
+    if (!anchor || anchor.providerSessionAnchor || !owner || owner.providerSessionAnchor ||
+      anchor.sessionId !== held.sessionId || anchor.conversationId !== held.conversationId ||
+      owner.sessionId !== held.sessionId || owner.conversationId !== held.conversationId ||
+      !anchor.providerSessionKeys?.includes(held.providerSessionKey!)) return null;
+  }
+  return held ? { ...held, ...(held.providerSessionKeys ? { providerSessionKeys: [...held.providerSessionKeys] } : {}) } : null;
 }
+
+function indexProviderOwner(owner: RequestCorrelation): void {
+  for (const key of owner.providerSessionKeys ?? []) {
+    const previousKey = byProviderSession.get(key);
+    const previous = previousKey ? byRequest.get(previousKey) : undefined;
+    if (previousKey === null) continue;
+    if (previous && (previous.conversationId !== owner.conversationId || previous.sessionId !== owner.sessionId)) {
+      byProviderSession.set(key, null);
+      logWarn(`provider session binding ignored: conflicting native owners for ${key.slice(0, 16)}; dispatch uses existing request identity`);
+    } else {
+      byProviderSession.set(key, joinKey(owner.requestId));
+      if (previousKey === undefined) logInfo(`provider session correlation established ${key.slice(0, 16)} -> conversation ${owner.conversationId}; native request ${owner.requestId}`);
+    }
+  }
+  while (byProviderSession.size > MAX_CORRELATIONS) byProviderSession.delete(byProviderSession.keys().next().value!);
+}
+
+function learnProviderKeys(owner: RequestCorrelation): boolean {
+  const keys = new Set(owner.providerSessionKeys ?? []);
+  const before = keys.size;
+  for (const key of pendingProviderSessions.get(joinKey(owner.requestId))?.keys ?? []) {
+    if (keys.size < MAX_PROVIDER_KEYS_PER_REQUEST) keys.add(key);
+  }
+  if (keys.size === before) return false;
+  owner.providerSessionKeys = [...keys];
+  return true;
+}
+
+/** Register one validated host conversation reference before dispatch. New aliases are
+ * learned only from native request proof; an unknown request cannot teach another alias.
+ * 'refused' rejects only this binding, never tool dispatch or independent native proof. */
+export function observeProviderSessionRequest(requestId: string, providerKey: string): Promise<'known' | 'unbound' | 'refused'> {
+  if (!requestId || requestId.length > 200 || !PROVIDER_KEY.test(providerKey)) return Promise.resolve('unbound');
+  const direct = byRequest.get(joinKey(requestId));
+  // Native ownership is independent of provider storage. Reusing an already learned
+  // key changes no bookkeeping and must not wait for another chat's durable commit.
+  if (direct && !direct.providerSessionAnchor && direct.providerSessionKeys?.includes(providerKey)) return Promise.resolve('known');
+  const work = providerAdmission.then(() => observeProviderSessionRequestNow(requestId, providerKey));
+  providerAdmission = work.catch(() => undefined);
+  return work;
+}
+
+async function observeProviderSessionRequestNow(requestId: string, providerKey: string): Promise<'known' | 'unbound' | 'refused'> {
+  const key = joinKey(requestId);
+  const candidates = pendingProviderSessions.get(key) ?? { requestId, keys: new Set<string>() };
+  const alreadyObserved = candidates.keys.has(providerKey);
+  if (candidates.keys.size < MAX_PROVIDER_KEYS_PER_REQUEST) candidates.keys.add(providerKey);
+  pendingProviderSessions.delete(key);
+  pendingProviderSessions.set(key, candidates);
+  while (pendingProviderSessions.size > MAX_PENDING_PROVIDER_REQUESTS) pendingProviderSessions.delete(pendingProviderSessions.keys().next().value!);
+  const direct = byRequest.get(key);
+  if (direct && !direct.providerSessionAnchor) {
+    if (learnProviderKeys(direct)) {
+      indexProviderOwner(direct);
+      await commitRequestCorrelations();
+      publishProviderRequests(providerKey);
+    }
+    return 'known';
+  }
+  const anchorKey = byProviderSession.get(providerKey);
+  const anchor = anchorKey ? byRequest.get(anchorKey) : undefined;
+  if (!anchor || anchor.providerSessionAnchor) return anchorKey === null ? 'refused' : 'unbound';
+  if (direct && (direct.sessionId !== anchor.sessionId || direct.conversationId !== anchor.conversationId)) {
+    if (!alreadyObserved) logWarn(`provider session binding ignored for request ${requestId}; existing request owner disagrees with native anchor; dispatch uses existing request identity`);
+    return 'refused';
+  }
+  if (!direct) {
+    const { providerSessionKeys: _keys, ...proof } = anchor;
+    const derived = { ...proof, requestId, observedAt: Date.now(),
+      providerSessionAnchor: anchor.requestId, providerSessionKey: providerKey };
+    // Keep this owner unreadable and its waiters asleep until the durable commit. Native
+    // evidence may replace it during disk IO and always wins at publication.
+    uncommittedProviderRequests.add(key);
+    merge(derived);
+    const installed = byRequest.get(key);
+    try {
+      await commitRequestCorrelations();
+    } catch (error) {
+      if (byRequest.get(key) === installed) byRequest.delete(key);
+      persist();
+      throw error;
+    } finally {
+      uncommittedProviderRequests.delete(key);
+    }
+    const current = byRequest.get(key);
+    const latestAnchorKey = byProviderSession.get(providerKey);
+    const latestAnchor = latestAnchorKey ? byRequest.get(latestAnchorKey) : undefined;
+    if (!latestAnchor || latestAnchor.sessionId !== anchor.sessionId || latestAnchor.conversationId !== anchor.conversationId) { wake(key); return 'refused'; }
+    if (current !== installed) { wake(key); return current?.sessionId === anchor.sessionId && current?.conversationId === anchor.conversationId ? 'known' : 'refused'; }
+    wake(key);
+    publishCorrelation(derived);
+    void attachRequestPlan(derived).catch(error => {
+      logWarn(`request plan attachment failed for ${requestId}: ${error instanceof Error ? error.message : String(error)}`);
+    });
+    void reconcileAgentRequestOwners().catch(error => {
+      logWarn(`request worker ownership reconciliation failed: ${error instanceof Error ? error.message : String(error)}`);
+    });
+    logInfo(`request attribution: ${requestId} -> conversation ${derived.conversationId}; verified provider session anchored by ${anchor.requestId}`);
+  }
+  return 'known';
+}
+
+function publishProviderRequests(providerKey: string): void {
+  const anchorKey = byProviderSession.get(providerKey);
+  if (!anchorKey) return;
+  for (const [requestKey, candidate] of pendingProviderSessions) {
+    if (!candidate.keys.has(providerKey) || byRequest.has(requestKey)) continue;
+    void observeProviderSessionRequest(candidate.requestId, providerKey).catch(error =>
+      logWarn(`provider session correlation could not be committed: ${error instanceof Error ? error.message : String(error)}`));
+  }
+}
+
 
 /**
  * Waits only for this exact id. Late Fiber evidence is allowed; no other request or page
@@ -384,9 +573,10 @@ export async function awaitRequestCorrelation(requestId: string | null | undefin
   if (immediate || timeoutMs <= 0) return immediate;
 
   const now = performance.now();
-  const startedAt = evidenceWindowStarts.get(requestId) ?? now;
-  if (!evidenceWindowStarts.has(requestId)) {
-    evidenceWindowStarts.set(requestId, startedAt);
+  const key = joinKey(requestId);
+  const startedAt = evidenceWindowStarts.get(key) ?? now;
+  if (!evidenceWindowStarts.has(key)) {
+    evidenceWindowStarts.set(key, startedAt);
     if (evidenceWindowStarts.size > MAX_EVIDENCE_WINDOWS) {
       evidenceWindowStarts.delete(evidenceWindowStarts.keys().next().value!);
     }
@@ -396,12 +586,12 @@ export async function awaitRequestCorrelation(requestId: string | null | undefin
 
   let timer: NodeJS.Timeout | null = null;
   await new Promise<void>((resolve) => {
-    const set = waiters.get(requestId) ?? new Set<() => void>();
+    const set = waiters.get(key) ?? new Set<() => void>();
     set.add(resolve);
-    waiters.set(requestId, set);
+    waiters.set(key, set);
     timer = setTimeout(() => {
       set.delete(resolve);
-      if (set.size === 0) waiters.delete(requestId);
+      if (set.size === 0) waiters.delete(key);
       resolve();
     }, remainingMs);
     timer.unref?.();
@@ -413,8 +603,12 @@ export async function awaitRequestCorrelation(requestId: string | null | undefin
 /** A conversation being closed cannot invalidate an already issued request. */
 export function resetCorrelationRegistryForTests(): void {
   byRequest.clear();
+  byProviderSession.clear();
+  pendingProviderSessions.clear();
+  uncommittedProviderRequests.clear();
+  providerAdmission = Promise.resolve();
   evidenceWindowStarts.clear();
   restored = false;
   restoring = null;
-  for (const requestId of [...waiters.keys()]) wake(requestId);
+  for (const key of [...waiters.keys()]) wake(key);
 }

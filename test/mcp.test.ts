@@ -20,7 +20,7 @@ import { promises as fs } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import sharp from 'sharp';
-import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as identity from '../src/main/connector-identity.js';
 import { connectorName } from '../src/shared/connector-names.js';
 import { effectiveCapabilities, defaultConfig, getConfig } from '../src/main/config.js';
@@ -50,7 +50,7 @@ import { resetWorkspaces, setWorkspaceFor } from '../src/main/workspace.js';
 import { DEFAULT_CAPABILITIES, type Capabilities, type Root } from '../src/shared/types.js';
 import { foldProgress, type ToolOutcome } from '../src/shared/session.js';
 import { emptyEvidence, noteExec, noteOutcome, runInCallContext, type CallContext } from '../src/main/mcp/call-context.js';
-import { observeRequestCorrelation } from '../src/main/session/correlation.js';
+import { observeRequestCorrelation, requestCorrelation } from '../src/main/session/correlation.js';
 import { WINDOWS_COMPUTER_METHODS, WINDOWS_COMPUTER_READ_METHODS } from '../src/shared/windows-computer.js';
 import { BROWSER_TOOLS, BROWSER_READ_TOOLS } from '../src/shared/browser-control.js';
 import { resetBlockedChatsForTests, setChatBlocked } from '../src/main/session/blocked-chats.js';
@@ -302,6 +302,7 @@ beforeAll(async () => {
 });
 
 afterAll(async () => {
+  vi.unstubAllEnvs();
   if (endpoint) await endpoint.stop();
   // Every live exec test uses UnifiedExecProcessManager. The old teardown still stopped the
   // retired connector-native process manager, which meant it looked like this suite protected
@@ -312,6 +313,11 @@ afterAll(async () => {
 
 beforeEach(async () => {
   if (endpoint) await endpoint.stop();
+  // The usage tool reads Codex's and Claude Code's own logs. Without this it read the real home
+  // folders, which on a busy developer machine took past the 30 s test timeout (2026-10-31, twice).
+  // Per test, because a test that calls vi.unstubAllEnvs() would otherwise drop it for the rest.
+  vi.stubEnv('CODEX_HOME', path.join(base, 'no-codex'));
+  vi.stubEnv('CLAUDE_CONFIG_DIR', path.join(base, 'no-claude'));
   resetWorkspaces();
   ctx.caps = withCaps({});
   ctx.readOnly = true;
@@ -635,6 +641,255 @@ describe('endpoint hardening', () => {
 // ---------------------------------------------------------------------------
 
 describe('surface boundaries', () => {
+  it('dispatches a known native request while another chat waits for its provider commit', async () => {
+    const durable = await import('../src/main/durable.js');
+    durable.initDurableStore(path.join(base, 'fast-native-admission'));
+    const send = (requestId: string, provider: string) => rawPost(endpoint.urls.core, JSON.stringify({
+      jsonrpc: '2.0', id: nextId++, method: 'tools/call', params: {
+        name: 'read', arguments: { paths: ['/workspace/notes.txt'] }, _meta: {
+          'openai/session': provider, 'openai/subject': 'provider-user'
+        }
+      }
+    }), { 'x-request-id': requestId });
+    for (const suffix of ['a', 'b']) {
+      const session = await createSession({ conversationId: `fast-http-${suffix}` });
+      observeRequestCorrelation({ requestId: `fast-http-native-${suffix}`, conversationId: `fast-http-${suffix}`, sessionId: session.id,
+        messageId: `fast-http-message-${suffix}`, tool: '', observedAt: Date.now() });
+      expect((await send(`fast-http-native-${suffix}`, `fast-http-provider-${suffix}`)).status).toBe(200);
+    }
+    const write = durable.writeDurableNow;
+    let entered!: () => void, release!: () => void;
+    const paused = new Promise<void>(resolve => { entered = resolve; });
+    const resume = new Promise<void>(resolve => { release = resolve; });
+    const commit = vi.spyOn(durable, 'writeDurableNow').mockImplementationOnce(async (name, value) => {
+      entered(); await resume; return write(name, value);
+    });
+    const slow = send('fast-http-derived-a', 'fast-http-provider-a');
+    let fast: Promise<RawResponse> | undefined;
+    try {
+      await paused;
+      let response: RawResponse | undefined;
+      fast = send('fast-http-native-b', 'fast-http-provider-b').then(value => { response = value; return value; });
+      await vi.waitFor(() => expect(response).toBeDefined(), { timeout: 10_000 });
+      expect(response!.status).toBe(200);
+      const reply = { body: decode(response!) };
+      expect(failed(reply)).toBe(false);
+      expect(textOf(reply)).toContain('note line 1');
+      expect(commit).toHaveBeenCalledTimes(1);
+      expect(requestCorrelation('fast-http-derived-a')).toBeNull();
+      expect(requestCorrelation('fast-http-native-b')?.conversationId).toBe('fast-http-b');
+    } finally {
+      release();
+      await Promise.all([slow, fast]);
+      commit.mockRestore();
+      await durable.flushDurable();
+      durable.resetDurableForTests();
+    }
+    expect(requestCorrelation('fast-http-derived-a')?.providerSessionAnchor).toBe('fast-http-native-a');
+  });
+
+  it.each(['unbound', 'native', 'late-native'] as const)(
+    'dispatches a %s request when the provider-session commit fails without publishing derived ownership', async identity => {
+      const durable = await import('../src/main/durable.js');
+      const logger = await import('../src/main/logger.js');
+      const prefix = `provider-commit-failure-${identity}`;
+      const requestId = `${prefix}-request`;
+      const source = await createSession({ conversationId: `${prefix}-source` });
+      const native = identity === 'late-native'
+        ? await createSession({ conversationId: `${prefix}-native` }) : source;
+      durable.initDurableStore(path.join(base, prefix));
+      const prove = (id: string, session = source) => observeRequestCorrelation({
+        requestId: id, conversationId: session.conversationId!, sessionId: session.id,
+        messageId: `message-${id}`, tool: '', observedAt: Date.now()
+      });
+      const send = (id: string) => rawPost(endpoint.urls.core, JSON.stringify({
+        jsonrpc: '2.0', id: nextId++, method: 'tools/call', params: {
+          name: 'read', arguments: { paths: ['/workspace/notes.txt'] }, _meta: {
+            'openai/session': prefix, 'openai/subject': 'provider-user'
+          }
+        }
+      }), { 'x-request-id': id });
+      let commit: ReturnType<typeof vi.spyOn> | undefined;
+      const warning = vi.spyOn(logger, 'logWarn');
+      try {
+        prove(`${prefix}-anchor`);
+        expect((await send(`${prefix}-anchor`)).status).toBe(200);
+        if (identity === 'native') prove(requestId);
+        commit = vi.spyOn(durable, 'writeDurableNow').mockImplementationOnce(async () => {
+          if (identity === 'late-native') prove(requestId, native);
+          throw Object.assign(new Error('disk full'), { code: 'ENOSPC' });
+        });
+        const response = await send(requestId);
+        expect(commit).toHaveBeenCalledWith('request-correlations', expect.anything());
+        expect(response.status).toBe(200);
+        const reply = { body: decode(response) };
+        expect(failed(reply)).toBe(false);
+        expect(textOf(reply)).toContain('note line 1');
+        expect(warning).toHaveBeenCalledWith(
+          `MCP provider session binding ignored surface=core request=${requestId}; durable correlation unavailable; dispatch uses existing request identity`);
+        if (identity === 'unbound') expect(requestCorrelation(requestId)).toBeNull();
+        else expect(requestCorrelation(requestId)).toMatchObject({
+          conversationId: native.conversationId, sessionId: native.id
+        });
+        expect(requestCorrelation(requestId)?.providerSessionAnchor).toBeUndefined();
+        await durable.flushDurable();
+        const saved = await durable.readDurable<{ entries: Array<{ requestId: string; providerSessionAnchor?: string }> }>('request-correlations');
+        expect(saved?.entries.some(row => row.requestId === requestId && row.providerSessionAnchor)).toBe(false);
+      } finally {
+        commit?.mockRestore();
+        warning.mockRestore();
+        await durable.flushDurable();
+        durable.resetDurableForTests();
+      }
+    }
+  );
+
+  it('dispatches calls with a conflicting provider key without deriving ownership, including after restart', async () => {
+    const correlation = await import('../src/main/session/correlation.js');
+    const durable = await import('../src/main/durable.js');
+    const { getLog } = await import('../src/main/logger.js');
+    durable.initDurableStore(path.join(base, 'conflicting-provider'));
+    const chats = ['conflicting-provider-a', 'conflicting-provider-b'];
+    const anchors = ['conflicting-native-a', 'conflicting-native-b'];
+    const sessions = await Promise.all(chats.map(conversationId => createSession({ conversationId })));
+    const send = (requestId: string) => rawPost(endpoint.urls.core, JSON.stringify({
+      jsonrpc: '2.0', id: nextId++, method: 'tools/call', params: {
+        name: 'read', arguments: { paths: ['/workspace/notes.txt'] }, _meta: {
+          'openai/session': 'shared-conflicting-provider', 'openai/subject': 'provider-user'
+        }
+      }
+    }), { 'x-request-id': requestId });
+    const expectRead = async (requestId: string) => {
+      const response = await send(requestId);
+      expect(response.status).toBe(200);
+      const reply = { body: decode(response) };
+      expect(failed(reply)).toBe(false);
+      expect(textOf(reply)).toContain('note line 1');
+    };
+    try {
+      for (const [index, requestId] of anchors.entries()) {
+        observeRequestCorrelation({ requestId, conversationId: chats[index]!, sessionId: sessions[index]!.id,
+          messageId: `message-${requestId}`, tool: '', observedAt: Date.now() });
+      }
+      await expectRead(anchors[0]!);
+      await expectRead('conflicting-derived-before');
+      expect(requestCorrelation('conflicting-derived-before')?.providerSessionAnchor).toBe(anchors[0]);
+      const before = getLog().length;
+      await expectRead(anchors[1]!);
+      for (const requestId of ['conflicting-derived-before', 'conflicting-unknown', 'conflicting-unknown-again']) {
+        await expectRead(requestId);
+        expect(requestCorrelation(requestId)).toBeNull();
+      }
+      const warnings = getLog().slice(before).filter(row => /provider session.*conflict/i.test(row.message));
+      expect(warnings).toHaveLength(1);
+
+      await durable.flushDurable();
+      correlation.resetCorrelationRegistryForTests();
+      await correlation.restoreRequestCorrelations();
+      await expectRead('conflicting-after-restart');
+      expect(requestCorrelation('conflicting-after-restart')).toBeNull();
+      for (const [index, requestId] of anchors.entries()) {
+        await expectRead(requestId);
+        expect(requestCorrelation(requestId)).toMatchObject({ conversationId: chats[index], sessionId: sessions[index]!.id });
+        expect(requestCorrelation(requestId)?.providerSessionAnchor).toBeUndefined();
+      }
+      // Ignoring provider metadata must not bypass the native owner's ordinary guards.
+      setChatBlocked(chats[1]!, true);
+      try {
+        const blocked = { body: decode(await send(anchors[1]!)) };
+        expect(failed(blocked)).toBe(true);
+        expect(textOf(blocked)).toMatch(/blocked/i);
+        expect(textOf(blocked)).not.toContain('note line 1');
+      } finally { setChatBlocked(chats[1]!, false); }
+    } finally {
+      await durable.flushDurable();
+      durable.resetDurableForTests();
+    }
+  });
+
+  it('dispatches with native ownership when it contradicts the provider anchor during admission', async () => {
+    const durable = await import('../src/main/durable.js');
+    const source = await createSession({ conversationId: 'provider-race-a' });
+    const native = await createSession({ conversationId: 'provider-race-b' });
+    const send = (requestId: string) => rawPost(endpoint.urls.core, JSON.stringify({
+      jsonrpc: '2.0', id: nextId++, method: 'tools/call', params: {
+        name: 'read', arguments: { paths: ['/workspace/notes.txt'] }, _meta: {
+          'openai/session': 'provider-race', 'openai/subject': 'provider-user'
+        }
+      }
+    }), { 'x-request-id': requestId });
+    observeRequestCorrelation({ requestId: 'provider-race-anchor', conversationId: 'provider-race-a', sessionId: source.id,
+      messageId: 'provider-race-message-a', tool: '', observedAt: Date.now() });
+    await send('provider-race-anchor');
+    let entered!: () => void, release!: () => void;
+    const paused = new Promise<void>(resolve => { entered = resolve; });
+    const resume = new Promise<void>(resolve => { release = resolve; });
+    const write = durable.writeDurableNow;
+    const commit = vi.spyOn(durable, 'writeDurableNow').mockImplementationOnce(async (name, value) => {
+      entered(); await resume; return write(name, value);
+    });
+    const pending = send('provider-race-request');
+    try {
+      await paused;
+      expect(requestCorrelation('provider-race-request')).toBeNull();
+      observeRequestCorrelation({ requestId: 'provider-race-request', conversationId: 'provider-race-b', sessionId: native.id,
+        messageId: 'provider-race-message-b', tool: '', observedAt: Date.now() });
+      release();
+      const response = await pending;
+      expect(response.status).toBe(200);
+      const reply = { body: decode(response) };
+      expect(failed(reply)).toBe(false);
+      expect(textOf(reply)).toContain('note line 1');
+      expect(requestCorrelation('provider-race-request')).toMatchObject({ conversationId: 'provider-race-b', sessionId: native.id });
+      expect(requestCorrelation('provider-race-request')?.providerSessionAnchor).toBeUndefined();
+      expect((await readRecentEvents(native.id, 20)).some(event => event.kind === 'tool_call' &&
+        event.call.requestId === 'provider-race-request')).toBe(true);
+      expect((await readRecentEvents(source.id, 20)).some(event => event.kind === 'tool_call' &&
+        event.call.requestId === 'provider-race-request')).toBe(false);
+    } finally {
+      release();
+      await pending;
+      commit.mockRestore();
+    }
+  });
+
+  it('drains an accepted request while its provider-session admission is waiting on storage', async () => {
+    const correlation = await import('../src/main/session/correlation.js');
+    const { getLog } = await import('../src/main/logger.js');
+    let entered!: () => void, release!: () => void;
+    const paused = new Promise<void>(resolve => { entered = resolve; });
+    const resume = new Promise<void>(resolve => { release = resolve; });
+    vi.spyOn(correlation, 'observeProviderSessionRequest').mockImplementationOnce(async () => {
+      entered(); await resume; return 'unbound';
+    });
+    const request = rawPost(endpoint.urls.core, JSON.stringify({ jsonrpc: '2.0', id: nextId++, method: 'tools/call',
+      params: { name: 'missing_diagnostic_tool', arguments: {}, _meta: {
+        'openai/session': 'drain-provider', 'openai/subject': 'drain-subject'
+      } } }), { 'x-request-id': 'drain-provider-request' }).catch(() => ({ status: 0, headers: {}, text: '' }));
+    await paused;
+    const before = getLog().length;
+    const stopped = endpoint.stop();
+    try {
+      expect(getLog().slice(before).some(row => row.message === 'server stopping: draining 1 accepted response(s)')).toBe(true);
+    } finally { release(); await stopped; }
+    expect((await request).status).toBe(200);
+  });
+
+  it.each(['core', 'desktop', 'plugins'] as const)('resolves a hidden %s request through its independently proven provider session', async surface => {
+    const source = await createSession({ conversationId: `provider-${surface}` });
+    const anchor = `native-provider-${surface}`, hidden = `hidden-provider-${surface}`;
+    observeRequestCorrelation({ requestId: anchor, conversationId: `provider-${surface}`, sessionId: source.id,
+      messageId: `native-message-${surface}`, tool: '', observedAt: Date.now() });
+    const send = (requestId: string) => rawPost(endpoint.urls[surface], JSON.stringify({ jsonrpc: '2.0', id: nextId++, method: 'tools/call',
+      params: { name: 'missing_diagnostic_tool', arguments: {}, _meta: {
+        'openai/session': `provider-token-${surface}`, 'openai/subject': 'provider-user'
+      } } }), { 'x-request-id': requestId });
+    await send(anchor);
+    await send(hidden);
+    expect(requestCorrelation(hidden)).toMatchObject({ conversationId: `provider-${surface}`, sessionId: source.id,
+      providerSessionAnchor: anchor });
+  });
+
   /** Turns everything on, so each surface advertises the most it ever can. */
   const everything = (): void => {
     ctx.caps = allCaps();
@@ -938,6 +1193,8 @@ describe('surface boundaries', () => {
 
   it('answers usage without the identity notice, which only matters for chat-bound work', async () => {
     everything();
+    // Never the developer's own logs (CodeRabbit on #1964).
+    expect(process.env['CODEX_HOME']).toBe(path.join(base, 'no-codex'));
     // usage reads nothing that belongs to a chat. It answers before the page's evidence for its
     // request arrives, so it always looked unattributed, and the notice reached the model each time.
     const usage = JSON.stringify((await core('tools/call', { name: 'usage', arguments: {} })).body.result?.content);
@@ -1117,7 +1374,7 @@ describe('2025-era clients', () => {
     // The requested upstream collaboration prose replaces the old minimal tool preamble.
     expect(instructions).toContain('User authorization and preferences persist across turns.');
     expect(instructions).toContain(
-      'Current Core authority (informational; live guards decide): ' +
+      'Enabled in Core: ' +
       'browse=on search=on read=on metadata=on create=off edit=off move=off delete=off command=on; ' +
       'read-only=off; plans=off; workers=off.'
     );
@@ -1498,6 +1755,26 @@ describe('capability gating', () => {
 });
 
 describe('desktop capabilities', () => {
+  // These cases are about permissions, and their calls carry no chat: the person's opt-in for
+  // desktop control without a known chat lets them reach the permission checks.
+  beforeEach(() => { getConfig().ui.desktopUnattributed = true; });
+  afterEach(() => { delete getConfig().ui.desktopUnattributed; });
+
+  it.skipIf(!IS_WINDOWS && process.platform !== 'darwin')('refuses desktop control for a call without a known chat unless the person allowed it (2026-10-30)', async () => {
+    ctx.readOnly = false;
+    ctx.caps = withCaps({ screen: true, control: true });
+    await desktop('tools/list');
+    delete getConfig().ui.desktopUnattributed;
+    const refused = await desktop('tools/call', {
+      name: IS_WINDOWS ? 'click' : 'computer',
+      arguments: IS_WINDOWS ? { window: { app: 'fixture.exe', id: 1 }, x: 5, y: 5 } : { actions: [{ type: 'click', x: 5, y: 5 }] }
+    });
+    expect(refused.body.result?.isError).toBe(true);
+    expect(textOf(refused)).toContain('DESKTOP_IDENTITY_REQUIRED');
+    // The browser tools on the same connector keep their own rules.
+    expect(toolNames(await desktop('tools/list'))).toEqual(expect.arrayContaining([...BROWSER_READ_TOOLS]));
+  });
+
   it('advertises nothing until a desktop permission is turned on', async () => {
     ctx.readOnly = false;
     expect(toolNames(await desktop('tools/list'))).toEqual([]);
@@ -3446,6 +3723,42 @@ describe('exec_command and write_stdin', () => {
 });
 
 describe('agent-maintained plans over MCP', () => {
+  it('preserves Block enforcement after provider-session identity is recovered', async () => {
+    ctx.sessionTools = true;
+    const source = await createSession({ conversationId: 'blocked-provider-plan' });
+    const anchor = 'blocked-provider-anchor';
+    observeRequestCorrelation({ requestId: anchor, conversationId: 'blocked-provider-plan', sessionId: source.id,
+      messageId: 'blocked-provider-message', tool: '', observedAt: Date.now() });
+    const send = (requestId: string) => rawPost(endpoint.urls.core, JSON.stringify({ jsonrpc: '2.0', id: nextId++, method: 'tools/call', params: {
+      name: 'update_plan', arguments: { plan: [] }, _meta: { 'openai/session': 'blocked-provider-token', 'openai/subject': 'provider-user' }
+    } }), { 'x-request-id': requestId });
+    await send(anchor);
+    await setChatBlocked('blocked-provider-plan', true);
+    try {
+      const refused = decode(await send('blocked-provider-hidden'));
+      expect(refused.result.isError).toBe(true);
+      expect(requestCorrelation('blocked-provider-hidden')?.conversationId).toBe('blocked-provider-plan');
+      expect(refused.result.content.map((part: { text?: string }) => part.text ?? '').join('\n')).toMatch(/blocked/i);
+    } finally { await setChatBlocked('blocked-provider-plan', false); }
+  });
+
+  it('completes the visible plan when a later request carries the same proven provider conversation', async () => {
+    ctx.sessionTools = true;
+    const source = await createSession({ conversationId: 'provider-plan-http' });
+    observeRequestCorrelation({ requestId: 'provider-plan-anchor', conversationId: 'provider-plan-http',
+      sessionId: source.id, messageId: 'provider-plan-message', tool: '', observedAt: Date.now() });
+    const send = (requestId: string, status: 'in_progress' | 'completed') => rawPost(endpoint.urls.core,
+      JSON.stringify({ jsonrpc: '2.0', id: nextId++, method: 'tools/call', params: {
+        name: 'update_plan', arguments: { plan: [{ step: 'Check provider identity', status }] },
+        _meta: { 'openai/session': 'opaque-provider-conversation', 'openai/subject': 'opaque-provider-user' }
+      } }), { 'x-request-id': requestId });
+    expect(decode(await send('provider-plan-anchor', 'in_progress')).result.isError).not.toBe(true);
+    const completed = decode(await send('provider-plan-hidden', 'completed'));
+    expect(completed.result.isError).not.toBe(true);
+    expect((await readSessionPlan(source.id))?.plan[0]?.status).toBe('completed');
+    expect(completed.result.content.map((part: { text?: string }) => part.text ?? '').join('\n')).not.toContain('Exact caller identity is not available');
+  });
+
   it('uses exact request proof without workers, refuses foreign targets and retired chats', async () => {
     ctx.sessionTools = true;
     ctx.agentTools = false;
