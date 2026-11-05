@@ -61,6 +61,7 @@ public static class Clf {
     Add(308, 308, 100, POPUP, NOACTIVATE, "Xaml_WindowedPopupClass", 50, 5); // embedded app's owned popup
     Add(309, 309, 0, POPUP, NOACTIVATE, "Xaml_WindowedPopupClass", 50, 5);   // embedded app's unowned popup
     Add(310, 310, 100, DIALOG, 0, "#32770", 50, 5);             // embedded app's activatable owned dialog
+    Add(311, 311, 100, POPUP, 0x8, "TopmostPopup", 50, 5);      // embedded app's activatable owned topmost popup
     Add(400, 400, 0, FRAME, 0, "HostFrame", 40, 4);              // unrelated new top-level host
     Add(130, 400, 0, CHILD, 0, "AppWindow", 10, 1);             // A target reparented into foreign host
     Add(401, 400, 0, CHILD, 0, "HostChild", 40, 4);             // foreign host's own receiver
@@ -141,6 +142,9 @@ Expect-Hit 100 306 $true 'SAME_ROOT_FOREIGN_CHILD_REJECTED'
 Expect-Hit 100 308 $true 'EMBEDDED_PROCESS_OWNED_POPUP_REJECTED'
 Expect-Hit 100 309 $false 'EMBEDDED_PROCESS_UNOWNED_POPUP_ACCEPTED'
 Expect-Hit 100 310 $false 'EMBEDDED_PROCESS_ACTIVATABLE_DIALOG_ACCEPTED'
+# Another process's captionless topmost popup can take focus; only the target's own process
+# keeps that toolkit-popup allowance.
+Expect-Hit 100 311 $false 'EMBEDDED_PROCESS_ACTIVATABLE_TOPMOST_POPUP_ACCEPTED'
 Expect-Hit 100 402 $false 'DIFFERENT_ROOT_FOREIGN_CHILD_ACCEPTED'
 Expect-Hit 130 400 $false 'REPARENTED_TARGET_FOREIGN_ROOT_ACCEPTED'
 Expect-Hit 130 401 $false 'REPARENTED_TARGET_FOREIGN_CHILD_ACCEPTED'
@@ -423,6 +427,7 @@ function Assert-InputOwner($target,$owner,$targetApp,$ownerApp) {
   if ([Clf]::InNativeCallback) { throw 'STALE_WINDOW: owner changed after cursor movement' }
 }
 function Assert-Focused($id) { }
+function Assert-InputRootOwner([int64]$id) { }
 function Write-UiaStage($marker) { }
 function Get-RequestedClickCount($request) { return 1 }
 ` + hit + action + String.raw`
@@ -444,6 +449,53 @@ Write-Output 'OCCLUSION_FAILS_CLOSED_BEFORE_POINTER_DOWN'
       const result = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', script], { encoding: 'utf8', windowsHide: true, timeout: 20_000 });
       expect(result.status, result.stderr + result.stdout).toBe(0);
       expect(result.stdout).toContain('OCCLUSION_FAILS_CLOSED_BEFORE_POINTER_DOWN');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('needs the foreign input root owner proof before an indexed click focuses a popup', () => {
+    const rootOwner = 'function Assert-InputRootOwner([int64]$id) {' +
+      HELPER_SCRIPT.split('function Assert-InputRootOwner([int64]$id) {')[1]?.split('function Assert-PhysicalHit(')[0];
+    const action = 'function Act-UiElement($request) {' + HELPER_SCRIPT.split('function Act-UiElement($request) {')[1]?.split('function Find-UiElements($request) {')[0];
+    expect(rootOwner).toContain('ForeignInputRoot');
+    const source = String.raw`
+$ErrorActionPreference = 'Stop'
+Add-Type -TypeDefinition @"
+public static class Clf {
+  public static int Clicks=0;
+  public static long ForeignInputRoot(long handle) { return 900; }
+  public static void Click(int x, int y, string button, int times, long target, System.Action afterMove) { afterMove(); Clicks++; }
+}
+"@
+$script:UiActionNames=@('invoke')
+$current=[pscustomobject]@{ IsEnabled=$true; Name='Popup item'; BoundingRectangle=[pscustomobject]@{ X=10; Y=10; Width=10; Height=10 } }
+$script:element=[pscustomobject]@{ Current=$current }
+$script:focuses=@()
+function Resolve-UiElement($window,$snapshotId,$runtimeKey) { return $script:element }
+function Assert-InputOwner($target,$owner,$targetApp,$ownerApp) { }
+function Assert-PhysicalHit([int64]$id, [int]$x, [int]$y) { }
+function Assert-Focused($id) { $script:focuses += $id }
+function Write-UiaStage($marker) { }
+function Get-RequestedClickCount($request) { return 1 }
+` + rootOwner + action + String.raw`
+# A directly observed popup whose activation owner 900 is another process: no proof, no focus.
+$script:ExpectedOwnerWindow = 0; $script:ExpectedOwnerStartTime = ''
+try { $null=Act-UiElement @{ id=77; snapshotId=1; runtimeKey='popup'; action='click'; button='right'; count=1 }; throw 'UNEXPECTED_CLICK' } catch {
+  if ($_.Exception.Message -notmatch '^STALE_WINDOW:') { throw }
+}
+if ($script:focuses.Count -ne 0 -or [Clf]::Clicks -ne 0) { throw 'FOREIGN_INPUT_ROOT_FOCUSED_BY_INDEXED_CLICK' }
+# With that owner's proof, the same click proceeds.
+$script:ExpectedOwnerWindow = 900; $script:ExpectedOwnerStartTime = '133000000000000202'
+$null=Act-UiElement @{ id=77; snapshotId=1; runtimeKey='popup'; action='click'; button='right'; count=1; ownerWindow=900 }
+if (($script:focuses -join ',') -ne '77,77' -or [Clf]::Clicks -ne 1) { throw 'PROVEN_OWNER_INDEXED_CLICK_REFUSED' }
+Write-Output 'FOREIGN_INPUT_ROOT_NEEDS_OWNER_PROOF'
+`;
+    const dir = mkdtempSync(path.join(tmpdir(), 'cos-hit-guard-'));
+    try {
+      const script = path.join(dir, 'foreign-root.ps1');
+      writeFileSync(script, source, 'utf8');
+      const result = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', script], { encoding: 'utf8', windowsHide: true, timeout: 20_000 });
+      expect(result.status, result.stderr + result.stdout).toBe(0);
+      expect(result.stdout).toContain('FOREIGN_INPUT_ROOT_NEEDS_OWNER_PROOF');
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
   it('preserves the native uncertainty code through the standalone UI action transport catch', () => {

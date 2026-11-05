@@ -514,10 +514,15 @@ public static class Clf {
   static bool IsTransientPopup(IntPtr window) {
     int style = GetWindowLong(window, -16);
     int exStyle = GetWindowLong(window, -20);
-    if ((exStyle & 0x08000000) != 0 || IsMenu(window) || (style & 0x40000000) != 0) return true;
+    if (NeverActivates(window)) return true;
     // A plain borderless WS_POPUP can be an activatable app window whose pixels
     // were not observed. Require a toolwindow/topmost popup hint as well.
     return (exStyle & 0x88) != 0 && (style & unchecked((int)0x80000000)) != 0 && (style & 0x00C00000) != 0x00C00000;
+  }
+
+  // Proven not to take activation: no-activate popups, #32768 menus, desktop-child lists.
+  static bool NeverActivates(IntPtr window) {
+    return (GetWindowLong(window, -20) & 0x08000000) != 0 || IsMenu(window) || (GetWindowLong(window, -16) & 0x40000000) != 0;
   }
 
   static bool EmbeddedProcess(IntPtr root, uint process) {
@@ -554,8 +559,11 @@ public static class Clf {
     uint receiverProcess, targetProcess;
     uint receiverThread = GetWindowThreadProcessId(receiverRoot, out receiverProcess);
     uint targetThread = GetWindowThreadProcessId(targetRoot, out targetProcess);
-    if (receiverProcess == 0 || (receiverProcess != targetProcess && !EmbeddedProcess(targetRoot, receiverProcess)) ||
-        !IsTransientPopup(receiverRoot) || InputRoot(targetRoot) != targetRoot) return false;
+    // The captionless topmost/toolwindow hint is enough only for the target's own process; a
+    // popup of an embedded process must provably never take activation.
+    bool embedded = receiverProcess != targetProcess;
+    if (receiverProcess == 0 || (embedded && !EmbeddedProcess(targetRoot, receiverProcess)) ||
+        !(embedded ? NeverActivates(receiverRoot) : IsTransientPopup(receiverRoot)) || InputRoot(targetRoot) != targetRoot) return false;
     if (OwnedBy(receiverRoot, targetRoot)) return true;
     if (GetWindow(receiverRoot, 4) != IntPtr.Zero || receiverThread != targetThread) return false;
     if (!IsMenu(receiverRoot)) return true;
@@ -1061,12 +1069,16 @@ function Act-UiElement($request) {
       # UIA resolution/metadata can run arbitrary provider code and recycle the HWND.
       # Verify the actual process incarnation before *any* fallback focus side effect.
       Assert-InputOwner $id $request.ownerWindow $request.targetApp $request.ownerApp
+      # Focusing a no-activate popup reaches its input root; a root in another process needs
+      # the owner's proof first, as for coordinate input and keys.
+      Assert-InputRootOwner $id
       Assert-Focused $id
       Assert-InputOwner $id $request.ownerWindow $request.targetApp $request.ownerApp
       $r = $element.Current.BoundingRectangle
       if ($r.Width -le 0 -or $r.Height -le 0) { throw "UI_ELEMENT_OFFSCREEN: the referenced element has no clickable bounds" }
       Assert-InputOwner $id $request.ownerWindow $request.targetApp $request.ownerApp
       # Bounds reads can also switch foreground. Revalidate before pointer-down.
+      Assert-InputRootOwner $id
       Assert-Focused $id
       Assert-InputOwner $id $request.ownerWindow $request.targetApp $request.ownerApp
       $px = [int][Math]::Round($r.X + $r.Width / 2)
