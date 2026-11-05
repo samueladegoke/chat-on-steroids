@@ -22,7 +22,7 @@ const fake = vi.hoisted(() => {
   const requests: Array<Record<string, any>> = [];
   const children: Array<Transport> = [];
   const clipboard = { writeText: vi.fn(async (_text: string) => {}), readText: vi.fn(async () => '') };
-  const overrides = { focusFailure: false, geometry: false, semanticOnly: false, cursorFailure: false, popupIdentitySwap: false, popupParentFence: false, popupParentSwap: false, popupParentNativeReject: false, parentChanged: false };
+  const overrides = { focusFailure: false, geometry: false, semanticOnly: false, cursorFailure: false, popupIdentitySwap: false, popupParentFence: false, popupParentSwap: false, popupParentNativeReject: false, popupParentUnproven: false, parentChanged: false };
   class Transport extends Emitter {
     readonly pid = 9000 + children.length;
     exitCode: number | null = null;
@@ -101,6 +101,10 @@ const fake = vi.hoisted(() => {
           window: { ...window, processStartTime: '133000000000000505' },
           relatedWindows: [{ ...window, id: 43, processStartTime: '133000000000000101' }]
         });
+      }
+      if (overrides.popupParentUnproven && request.op === 'snapshot' && request.id === 77) {
+        // The parent row has an app identity but no process start time.
+        Object.assign(reply, { relatedWindows: [{ ...window, id: 43, processStartTime: '133000000000000101' }] });
       }
       if (overrides.popupParentNativeReject && request.op === 'capture' && request.id === 43) {
         Object.assign(reply, { ok: false, error_code: 'STALE_FRAME',
@@ -183,6 +187,7 @@ describe.each(['stdio', 'addon'] as const)('Desktop reply provenance (%s)', (tra
     fake.overrides.popupParentFence = false;
     fake.overrides.popupParentSwap = false;
     fake.overrides.popupParentNativeReject = false;
+    fake.overrides.popupParentUnproven = false;
     fake.overrides.parentChanged = false;
     Object.defineProperty(process, 'platform', { ...platform, value: transport === 'addon' ? 'darwin' : 'linux' });
     vi.stubEnv('COS_MACOS_DESKTOP_HELPER', '');
@@ -257,6 +262,19 @@ describe.each(['stdio', 'addon'] as const)('Desktop reply provenance (%s)', (tra
     });
     await expect(computer.act([{ type: 'move', x: 10, y: 10 }], { frameId: published.frameId }))
       .resolves.toBeTruthy();
+  });
+
+  it.runIf(transport === 'stdio')('keeps the main observation when the parent has no process incarnation to tie a popup to', async () => {
+    Object.defineProperty(process, 'platform', { ...platform, value: 'win32' });
+    fake.overrides.popupParentUnproven = true;
+    const state = await computer.getWindowState({ window: 77, includeRelated: true });
+    expect(state.screenshot).toBeTruthy();
+    expect(state.related).toEqual([expect.objectContaining({
+      screenshot: null, error: 'STALE_FRAME: related popup parent process incarnation is unavailable'
+    })]);
+    // No popup pixels are captured, so there is nothing to tie to the parent afterwards.
+    expect(fake.requests.some((request) => request.op === 'capture' && request.id === 43)).toBe(false);
+    expect(fake.requests.some((request) => request.op === 'identity' && request.id === 77)).toBe(false);
   });
 
   it.runIf(transport === 'stdio')('never downgrades native parent-replacement errors to an optional popup failure', async () => {

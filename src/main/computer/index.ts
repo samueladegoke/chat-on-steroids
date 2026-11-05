@@ -1387,8 +1387,15 @@ export async function getWindowState(opts: {
         : { window: window.id, snapshotId: null, elements: [] as UiElementInfo[], accessibility: undefined };
       const related: Array<{ window: WindowInfo; screenshot: Screenshot | null; error?: string }> = [];
       if (process.platform === 'win32' && opts.includeRelated && !screenshotUnavailable && Array.isArray(reply['relatedWindows'])) {
+        // Without the parent's process incarnation no popup capture can be tied to it. Keep the
+        // main observation and list its popups without pixels instead of failing all of it.
+        const parentProven = hasIncarnation(window);
         for (const relatedWindow of (reply['relatedWindows'] as WindowInfo[]).slice(0, 3)) {
           if (!Number.isSafeInteger(relatedWindow.id) || relatedWindow.id <= 0 || relatedWindow.id === window.id) continue;
+          if (includeScreenshot && !parentProven) {
+            related.push({ window: relatedWindow, screenshot: null, error: 'STALE_FRAME: related popup parent process incarnation is unavailable' });
+            continue;
+          }
           // A rejected optional popup capture is not part of the published observation.
           // In particular, screenshotLocked already remembers its frame before we compare
           // its process incarnation with the earlier popup enumeration.
@@ -1424,7 +1431,8 @@ export async function getWindowState(opts: {
             related.push({ window: relatedWindow, screenshot: null, error: (err instanceof Error ? err.message : String(err)).slice(0, 500) });
           }
         }
-        if (related.length > 0 && includeScreenshot) {
+        // Popup pixels are captured after the main reply; only then can the parent have changed in between.
+        if (includeScreenshot && related.some((entry) => entry.screenshot)) {
           const proof = await runHelper({ op: 'identity', id: window.id },
             { generation: generationOfReply(reply), code: 'STALE_FRAME' });
           const parentNow = proof['window'] as WindowInfo | null;

@@ -347,6 +347,25 @@ $result = Handle-Request ('{"op":"act","targetWindow":42,"ownerWindow":77,"expec
 if ($result.ok -ne $true -or ($script:focuses -join ',') -ne '42' -or [Clf]::TestCalls -eq 0) {
   throw ('PROVEN_POPUP_OWNER_REFUSED: ' + ($result | ConvertTo-Json -Compress))
 }
+# Screenshot coordinates focus the frame's window first, which reaches the same foreign root.
+function Assert-CoordinateFrame($frame, [bool]$noFocus = $false) { if (-not $noFocus) { Assert-Focused ([int64]$frame.window) } }
+foreach ($json in @(
+  '{"op":"act","targetWindow":42,"frame":{"id":1,"window":42},"actions":[{"type":"click","x":10,"y":20}]}',
+  '{"op":"act","frame":{"id":1,"window":42},"actions":[{"type":"click","x":10,"y":20}]}')) {
+  $script:focuses = @()
+  [Clf]::TestReset(0)
+  $result = Handle-Request ($json | ConvertFrom-Json)
+  if ($result.ok -ne $false -or $result.error_code -ne 'STALE_WINDOW' -or $script:focuses.Count -ne 0 -or [Clf]::TestCalls -ne 0) {
+    throw ('FOREIGN_INPUT_ROOT_FOCUSED_BY_FRAME: ' + $json)
+  }
+}
+$script:focuses = @()
+[Clf]::TestReset(0)
+$result = Handle-Request ('{"op":"act","targetWindow":42,"ownerWindow":77,"expectedOwnerProcessStartTime":"133000000000000202","frame":{"id":1,"window":42},"actions":[{"type":"click","x":10,"y":20}]}' | ConvertFrom-Json)
+if ($result.ok -ne $true -or ($script:focuses -join ',') -ne '42' -or [Clf]::TestCalls -eq 0) {
+  throw ('PROVEN_POPUP_OWNER_FRAME_REFUSED: ' + ($result | ConvertTo-Json -Compress))
+}
+function Assert-CoordinateFrame($frame, [bool]$noFocus = $false) { }
 [Clf]::TestForeignRoot = 0
 # Owner identity must be checked before and after a distinct popup capture,
 # even if its HWND still appears related and its process matches its old row.

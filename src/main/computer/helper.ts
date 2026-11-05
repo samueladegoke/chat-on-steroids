@@ -1621,6 +1621,11 @@ function Handle-Request($request) {
           # Assert-CoordinateFrame owns activation; non-coordinate input keeps its
           # established focus path.
           $frameCoordinates = $request.frame -and $a.type -in @('move','click','double_click','scroll','drag')
+          # Assert-CoordinateFrame focuses the frame's window, which for a no-activate popup is
+          # its input root. A root in another process needs the owner's proof before that focus.
+          if ($frameCoordinates -and $request.frame.window) {
+            Assert-InputRootOwner ([int64]$request.frame.window)
+          }
           if ($request.targetWindow -and $a.type -in @('move','click','double_click','scroll','drag','type','keypress') -and -not $frameCoordinates) {
             Assert-InputRootOwner ([int64]$request.targetWindow)
             Assert-Focused ([int64]$request.targetWindow)
