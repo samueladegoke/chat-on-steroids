@@ -146,13 +146,20 @@ public static class OwnedGuiApp {
   [STAThread] public static void Main(string[] args) {
     Application.EnableVisualStyles();
     using (var form = new Form { Text = "CoS owned GUI launch fixture", Width = 250, Height = 110, StartPosition = FormStartPosition.Manual, Left = 60, Top = 60 }) {
-      var timer = new Timer { Interval = 2000 };
-      timer.Tick += (sender, eventArgs) => { timer.Stop(); form.Close(); };
+      // Stay open until the test has checked the window, with a bounded fallback for cleanup.
+      var timer = new Timer { Interval = 50 };
+      var shownAt = DateTime.UtcNow;
+      string done = null;
+      timer.Tick += (sender, eventArgs) => {
+        if ((done != null && File.Exists(done)) || DateTime.UtcNow - shownAt > TimeSpan.FromSeconds(15)) { timer.Stop(); form.Close(); }
+      };
       form.Shown += (sender, eventArgs) => {
         var marker = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "gui-" + Process.GetCurrentProcess().Id + ".txt");
         var staged = marker + ".pending";
         File.WriteAllText(staged, args.Length.ToString());
         File.Move(staged, marker);
+        done = marker + ".done";
+        shownAt = DateTime.UtcNow;
         timer.Start();
       };
       Application.Run(form);
@@ -170,6 +177,7 @@ try {
   if (!(Test-Path -LiteralPath $marker) -or [IO.File]::ReadAllText($marker) -ne '0') { throw 'GUI fixture did not start with zero arguments' }
   $child.Refresh()
   if (![string]::Equals($child.Path,$executable,[StringComparison]::OrdinalIgnoreCase) -or $child.MainWindowHandle -eq 0) { throw 'Exact GUI executable did not create its own window' }
+  [IO.File]::WriteAllText($marker+'.done','')
   $exited=$child.WaitForExit(5000)
   if (!$exited) { throw 'Owned GUI fixture did not exit within its bounded deadline' }
 } finally {

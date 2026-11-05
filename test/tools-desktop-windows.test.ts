@@ -225,6 +225,7 @@ describe('Windows Desktop public registrar', () => {
     });
     expect(failure.content[0].text).toContain('fresh helper');
     expect(failure.content[0].text).toContain('Do not repeat');
+    expect(failure.structuredContent.error.recovery).toContain("The semantic input's completion is unknown");
     expect(native.apis[0].perform_secondary_action).toHaveBeenCalledOnce();
     expect(native.apis[0].get_window_state).not.toHaveBeenCalled();
   });
@@ -267,6 +268,8 @@ describe('Windows Desktop public registrar', () => {
     expect(failure.content[0].text).toContain('get_window_state({ window, include_text:false })');
     expect(failure.content[0].text).toContain('list_windows');
     expect(failure.structuredContent.error.recovery).not.toContain('temporarily disable accessibility for that exact crashed provider identity');
+    // A crashed observation sent no input, so it must not suggest an earlier input may have applied.
+    expect(failure.structuredContent.error.recovery).not.toContain('completion is unknown');
     expect(native.apis[0].get_window_state).toHaveBeenCalledExactlyOnceWith({ window, include_text: true });
     expect(native.apis[0].activate_window).not.toHaveBeenCalled();
   });
