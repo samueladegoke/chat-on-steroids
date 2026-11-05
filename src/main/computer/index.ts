@@ -386,7 +386,8 @@ function windowsUiaCrashUnavailable(error: unknown): { code: string; message: st
   // crash recovery. Only the private error subclass minted after helper exit/retirement does.
   if (!(error instanceof UiaProcessCrashError)) return null;
   const message = error.message;
-  const stage = /access violation at ([A-Za-z0-9_.-]+)/i.exec(message)?.[1];
+  // The stage name ends before the sentence's closing period.
+  const stage = /access violation at ([A-Za-z0-9_.-]*[A-Za-z0-9_-])/i.exec(message)?.[1];
   return {
     code: 'UIA_PROCESS_CRASH',
     message: (
@@ -1306,6 +1307,8 @@ export async function getWindowState(opts: {
               throw new ComputerError('STALE_WINDOW: window identity changed during UIA breaker observation.');
             }
             forcedUiUnavailable = { code: 'UIA_PROCESS_CRASH', message: breaker.message };
+            const crashedSeconds = Math.round((Date.now() - breaker.until + WINDOWS_UIA_CRASH_BREAKER_MS) / 1000);
+            logInfo(`desktop uia: skipped UI Automation for window ${opts.window} because its provider crashed the helper ${crashedSeconds} s ago`);
           } else {
             windowsUiaCrashBreakers.delete(opts.window);
             recoveryWindowsIdentity = windowsWindowIdentity(candidateWindow as WindowInfo);
@@ -1353,6 +1356,7 @@ export async function getWindowState(opts: {
           }
           forcedUiUnavailable = crash;
           rememberWindowsUiaCrash(safeWindow as WindowInfo, crash);
+          logWarn(`desktop uia: retried window ${opts.window} once without UI Automation because ${crash.message.split('. ')[0]}`);
         }
       }
       const value = reply['window'];

@@ -186,6 +186,7 @@ vi.mock('../src/main/exec.js', () => ({
 vi.mock('../src/main/logger.js', () => ({ logInfo: vi.fn(), logWarn: vi.fn() }));
 
 import { act, getWindowState, listDesktopApps } from '../src/main/computer/index.js';
+import { logInfo, logWarn } from '../src/main/logger.js';
 
 describe.runIf(process.platform === 'win32')('Windows UIA access-violation recovery', () => {
   it('retires the corrupted helper, retries UI-free once, circuit-breaks the exact identity, and re-enables UIA for a replacement process', async () => {
@@ -211,16 +212,22 @@ describe.runIf(process.platform === 'win32')('Windows UIA access-violation recov
       elements: [],
       uiUnavailable: {
         code: 'UIA_PROCESS_CRASH',
-        message: expect.stringContaining('uia.find.traversal')
+        message: expect.stringContaining('crashed during uia.find.traversal. The window')
       }
     });
     expect(fake.requests.slice(beforeCrashRequests).map(({ childIndex, includeUi }) => [childIndex, includeUi])).toEqual([
       [0, true],
       [1, false]
     ]);
+    expect(logWarn).toHaveBeenCalledWith(
+      'desktop uia: retried window 77 once without UI Automation because Windows UI Automation crashed during uia.find.traversal'
+    );
 
     const second = await getWindowState({ window: 77, includeScreenshot: false, includeUi: true });
     expect(second.uiUnavailable?.code).toBe('UIA_PROCESS_CRASH');
+    expect(logInfo).toHaveBeenCalledWith(expect.stringMatching(
+      /^desktop uia: skipped UI Automation for window 77 because its provider crashed the helper \d+ s ago$/
+    ));
     expect(fake.children).toHaveLength(2);
     expect(fake.requests.at(-1)).toMatchObject({ childIndex: 1, op: 'snapshot', includeUi: false });
     expect(fake.requests.filter((request) => request.id === 77 && request.includeUi === true)).toHaveLength(1);
