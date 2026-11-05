@@ -1312,6 +1312,7 @@ export async function getWindowState(opts: {
           } else {
             windowsUiaCrashBreakers.delete(opts.window);
             recoveryWindowsIdentity = windowsWindowIdentity(candidateWindow as WindowInfo);
+            logInfo(`desktop uia: cleared the crash breaker for window ${opts.window} because another process instance owns it now`);
           }
         }
       }
@@ -1331,7 +1332,10 @@ export async function getWindowState(opts: {
           // cannot prove it is the same process. Fail closed instead of publishing a
           // replacement owner's pixels/window under the crashed provider's receipt.
           if (opts.window === undefined || requestedWindowsIdentity === null ||
-              !/^\d{8,20}$/.test(requestedWindowsIdentity.split('\u001f').at(-1) ?? '')) throw error;
+              !/^\d{8,20}$/.test(requestedWindowsIdentity.split('\u001f').at(-1) ?? '')) {
+            logWarn(`desktop uia: no UI-free retry for ${opts.window === undefined ? 'the foreground window' : `window ${opts.window}`} because its process instance was never observed`);
+            throw error;
+          }
 
           // The corrupted helper has already exited/been retired. Start a fresh generation and
           // retry this observation exactly once without UIA. This preserves truthful pixels and

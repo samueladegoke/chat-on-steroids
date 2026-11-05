@@ -243,6 +243,9 @@ describe.runIf(process.platform === 'win32')('Windows UIA access-violation recov
       elements: [{ name: 'Recovered button' }]
     });
     expect(fake.requests.slice(-2).map(({ includeUi }) => includeUi)).toEqual([false, true]);
+    expect(logInfo).toHaveBeenCalledWith(
+      'desktop uia: cleared the crash breaker for window 77 because another process instance owns it now'
+    );
 
     const actRequestsBeforeCrash = fake.requests.filter((request) => request.op === 'act').length;
     fake.state.crashNextAct = true;
@@ -296,6 +299,9 @@ describe.runIf(process.platform === 'win32')('Windows UIA access-violation recov
     expect(fake.requests.slice(beforeUnseeded)).toEqual([
       expect.objectContaining({ op: 'snapshot', id: 70, includeUi: true })
     ]);
+    expect(logWarn).toHaveBeenCalledWith(
+      'desktop uia: no UI-free retry for window 70 because its process instance was never observed'
+    );
 
     // An implicit foreground lookup is even less stable: the new helper could
     // pick an entirely different foreground owner during UI-free recovery.
@@ -307,6 +313,9 @@ describe.runIf(process.platform === 'win32')('Windows UIA access-violation recov
     expect(fake.requests.slice(beforeForeground)).toEqual([
       expect.objectContaining({ op: 'snapshot', includeUi: true })
     ]);
+    expect(logWarn).toHaveBeenCalledWith(
+      'desktop uia: no UI-free retry for the foreground window because its process instance was never observed'
+    );
   });
   it('recovers read-only when a newly discovered HWND owner crashes after breaker replacement', async () => {
     // Use real list-apps to pin A, then plant its breaker with a native-helper crash.
